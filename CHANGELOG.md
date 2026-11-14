@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.7.1 — 2026-11-14
+
+- Reuse number formatters and status text nodes; update live status separately from history metadata, without repeating identical DOM writes.
+- Refresh an already loaded range once per cycle and keep unchanged cached results without rebuilding charts/tables. Initial cold loads still show quick totals first.
+- Release hidden canvas backing stores and chart handlers, restore the current view immediately on return, and reuse unchanged canvas dimensions.
+- Coalesce browser snapshot persistence into idle time instead of writing synchronously in the response/render task.
+
 ## 0.7.0 — 2026-11-14
 
 - Unified overview for Windows application, Clash/Mihomo and harness histories, with time filters, peaks and connection drill-down.

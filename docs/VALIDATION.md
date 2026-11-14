@@ -8,6 +8,24 @@ Browser checks also covered failed/unreadable history responses, stale responses
 
 The public installer supports fresh installations. It is reviewed and syntax-checked, but has not been used to reinstall over the author's running setup. The package build, native helper and desktop compilation are checked separately. Upgrade/migration and multi-user isolation are not established by those checks.
 
+## 0.7.1 continuous-view performance checks
+
+The same isolated Microsoft Edge setup profiled 0.7.0 and 0.7.1 against the same local service with actual collected records. A 130-second natural refresh observation produced these measurements:
+
+| Measurement | 0.7.0 | 0.7.1 |
+| --- | ---: | ---: |
+| DOM mutation records | 929 | 217 |
+| Overview rebuilds | 6 | 2 |
+| Header renders | 43 | 6 |
+| Main-thread task time | 125.0 ms | 77.9 ms |
+| Layout time | 15.1 ms | 6.2 ms |
+
+In a separate repeated-status phase, 120 identical header updates triggered 120 layouts before the change and none after it. Twenty application-view renders took 61.4 ms before and 16.5 ms after; twenty proxy-view renders took 64.9 ms before and 21.1 ms after. These timings describe the measured JavaScript render functions on this machine, not whole-browser responsiveness or a guarantee for other hardware. The isolated browser did not reproduce the user's intermittent whole-browser slowdown.
+
+Focused checks confirmed that an unchanged cached result retains its chart model and list nodes, a complete range uses one history request per refresh, and unchanged status updates make no DOM writes. Background/foreground checks covered the overview, application detail, proxy detail and harness views: canvas backing stores shrink to 1×1 and handlers detach in the background; charts and keyboard interactions recover on return. Repeated same-size drawing retains the correct canvas transform. Existing range/recovery checks and the 160-cycle refresh/scroll test also passed on 0.7.1. The source suite again completed 155 cases with 153 passing and two administrator-only ETW cases skipped; the Windows package built with verified offline dependencies.
+
+A separate 15-minute natural-refresh run used actual history without forced garbage collection or artificial rapid refreshes. Thirty samples recorded a JS heap of 1.60–3.29 MiB, 464–465 live page elements, zero observed long tasks above 50 ms, no page errors and no queued history requests. The browser naturally reclaimed old nodes and heap during the run; background pause, canvas release and return also passed. This is a short controlled observation, not a multi-day endurance result or a measurement of the user's original browser session. After a two-file viewer hot update, the installed 0.7.1 passed actual-data overview/drill-down, proxy, harness, legacy-link and narrow-screen checks. Both collector processes remained running through that update; this does not establish a general suite upgrade or fresh-install validation.
+
 Original upstream validation notes follow for provenance; their claims apply to the upstream baseline.
 
 # Validation records

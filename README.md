@@ -64,6 +64,6 @@ npm run audit:publication
 
 Windows 原生助手可单独构建：`powershell.exe -NoProfile -ExecutionPolicy Bypass -File scripts/build-native.ps1`。构建过程会执行助手自检。
 
-0.7.0 的性能改动包括请求取消、工作线程超时恢复、有界缓存、历史汇总、可见区域画布、后台暂停和应用列表分页。验证范围及限制见 [docs/VALIDATION.md](docs/VALIDATION.md)。
+性能改动包括请求取消、工作线程超时恢复、有界缓存、历史汇总、可见区域画布、后台暂停和应用列表分页。0.7.1 进一步减少长时间打开时的重复请求和界面重建，复用数字格式器，并在后台释放图表画布及事件。验证范围及限制见 [docs/VALIDATION.md](docs/VALIDATION.md)。
 
 仓库仅包含源码、合成测试和文档。真实数据库、域名访问记录、个人截图、配置密钥、运行日志和编译产物不随源码发布。请保留 [LICENSE](LICENSE)、[NOTICE.md](NOTICE.md) 及分发包中的第三方许可文件。

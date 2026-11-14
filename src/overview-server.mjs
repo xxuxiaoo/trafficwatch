@@ -168,7 +168,7 @@ const server = http.createServer(async (req, res) => {
   try {
     const url = new URL(req.url, `http://${host}`);
     if (req.method === 'GET' && url.pathname === '/api/health')
-      return json(200, { app: 'trafficwatch-overview', version: '0.7.0', collectorPid: process.pid, readOnly: true,
+      return json(200, { app: 'trafficwatch-overview', version: '0.7.1', collectorPid: process.pid, readOnly: true,
         performance: { quick: quickReader.stats(), history: fullReader.stats(), cachedQueries: cache.size } });
     if (url.pathname.startsWith('/api/')) {
       if (req.headers['x-codex-flow'] !== '1') return json(403, { error: 'local_header_required' });

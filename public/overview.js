@@ -18,7 +18,8 @@ const evidenceNames = {
 };
 let view = 'overview';
 let range = 'today';
-let selectedDate = new Date().toLocaleDateString('sv-SE', { timeZone: 'Asia/Shanghai' });
+const calendarDate = (at = Date.now()) => new Date(at + 8 * 3600000).toISOString().slice(0, 10);
+let selectedDate = calendarDate();
 let data = null, monthData = null, apps = null;
 let refreshTimer = 0, refreshSequence = 0, detailSequence = 0, harnessSequence = 0;
 let activeAppDetail = null, activeLadderDetail = null, activeFamily = 'codex', harnessLoadedKey = '';
@@ -29,16 +30,26 @@ let preferences = readPreferences();
 let historyAbort, detailAbort, harnessAbort, liveAbort, refreshPromise, refreshKey = '', dataKey = '';
 let historyState = 'loading', historyError = '', monthLoadedAt = 0, appPage = 0, settingsInitialized = false;
 const snapshotCache = new Map();
-const queryKey = () => `${range}|${range === 'day' ? selectedDate : new Date().toLocaleDateString('sv-SE', { timeZone: 'Asia/Shanghai' })}`;
+const queryKey = () => `${range}|${range === 'day' ? selectedDate : calendarDate()}`;
 const isCancelled = (error) => error?.name === 'AbortError' || error?.message === 'request_cancelled';
 function hideChartTooltip() { if (chartTooltip) chartTooltip.hidden = true; }
+let snapshotWritePending = false;
 function saveSnapshot(key, value) {
   snapshotCache.delete(key); snapshotCache.set(key,value);
   while (snapshotCache.size > 6) snapshotCache.delete(snapshotCache.keys().next().value);
-  try {
-    const content = JSON.stringify([...snapshotCache]);
-    if (content.length < 1200000) localStorage.setItem('trafficwatch-snapshots-v7',content);
-  } catch { /* A full or disabled browser store never prevents live history. */ }
+  if (snapshotWritePending) return;
+  snapshotWritePending = true;
+  const write = () => {
+    snapshotWritePending = false;
+    try {
+      const content = JSON.stringify([...snapshotCache]);
+      if (content.length < 1200000) localStorage.setItem('trafficwatch-snapshots-v7',content);
+    } catch { /* A full or disabled browser store never prevents live history. */ }
+  };
+  // Storage serialization and synchronous disk-backed writes do not belong in
+  // the response/render task. Coalesce them when the main thread has idle time.
+  if ('requestIdleCallback' in window) requestIdleCallback(write, { timeout: 5000 });
+  else setTimeout(write, 1500);
 }
 try {
   for (const [key,value] of JSON.parse(localStorage.getItem('trafficwatch-snapshots-v7') || '[]').slice(-6)) {
@@ -59,13 +70,14 @@ function readPreferences() {
 function savePreferences() {
   try { localStorage.setItem('trafficwatch-unified-settings', JSON.stringify(preferences)); } catch { /* Browser storage is optional. */ }
 }
+const numberFormats = [0, 1, 2].map(maximumFractionDigits => new Intl.NumberFormat('zh-CN', { maximumFractionDigits }));
 function bytes(value, unit = '') {
   if (value === null || value === undefined || !Number.isFinite(Number(value))) return '—';
   let amount = Number(value), index = 0;
   const labels = ['B', 'KB', 'MB', 'GB', 'TB', 'PB'];
   while (Math.abs(amount) >= 1000 && index < labels.length - 1) { amount /= 1000; index++; }
   const digits = index === 0 ? 0 : amount >= 100 ? 1 : 2;
-  return `${amount.toLocaleString('zh-CN', { maximumFractionDigits: digits })} ${labels[index]}${unit}`;
+  return `${numberFormats[digits].format(amount)} ${labels[index]}${unit}`;
 }
 const total = (row) => Number(row?.up || 0) + Number(row?.down || 0);
 const timeFormat = new Intl.DateTimeFormat('zh-CN', {
@@ -93,6 +105,19 @@ function node(tag, text, className = '') {
   if (text !== undefined && text !== null) item.textContent = text;
   if (className) item.className = className;
   return item;
+}
+function setText(target, text) {
+  if (target.textContent !== text) target.textContent = text;
+}
+function setAttribute(target, name, value) {
+  if (target.getAttribute(name) !== value) target.setAttribute(name, value);
+}
+function releaseChart(canvas) {
+  canvas._dispose?.();
+  if (canvas.width !== 1) canvas.width = 1;
+  if (canvas.height !== 1) canvas.height = 1;
+  canvas._plotPoints = [];
+  canvas._chartModel = null;
 }
 function showToast(message) {
   $('toast').textContent = message;
@@ -136,9 +161,8 @@ function setView(next) {
   if (!Object.hasOwn(pageNames, next)) return;
   hideChartTooltip();
   for (const canvas of document.querySelectorAll('canvas')) {
-    canvas._dispose?.();
     // Hidden pages need no GPU backing store. Their data will redraw on entry.
-    if (canvas.closest('[data-view]')?.dataset.view !== next) { canvas.width = 1; canvas.height = 1; }
+    if (canvas.closest('[data-view]')?.dataset.view !== next) releaseChart(canvas);
   }
   view = next;
   history.replaceState(null, '', `#${view}`);
@@ -148,6 +172,7 @@ function setView(next) {
     else button.removeAttribute('aria-current');
   }
   $('pageTitle').textContent = view === 'overview' ? '流量总览' : pageNames[view];
+  renderHeader();
   if (view === 'overview') renderOverview();
   if (view === 'apps') renderApps();
   if (view === 'ladder') renderLadder();
@@ -163,23 +188,29 @@ function setSourceStatus(id, live, expected) {
     Number.isFinite(live.lastAt) && Date.now() >= live.lastAt && Date.now() - live.lastAt < (live.intervalMs || 1000) + 6000;
   const mismatch = live && live.capture?.active && live.capture.active !== expected;
   const label = fresh ? '正在采集' : mismatch ? '采集来源不符' : live ? '采集已断开' : '采集未连接';
-  target.className = `status-chip ${expected === 'mihomo' ? 'proxy-chip' : ''} ${fresh ? 'is-live' : 'is-offline'}`;
+  const className = `status-chip ${expected === 'mihomo' ? 'proxy-chip' : ''} ${fresh ? 'is-live' : 'is-offline'}`;
+  if (target.className !== className) target.className = className;
   const speed = expected === 'native' ? Number(live?.allUpRate || 0) + Number(live?.allDownRate || 0) : total(live?.routeRates?.proxy);
-  target.replaceChildren(node('i'), node('span', `${expected === 'native' ? '本机' : '梯子'} · ${fresh ? bytes(speed, '/s') : label}`));
-  target.title = fresh ? `最近采样 ${time(live.lastAt, true)}` : (live?.error || '当前显示历史记录');
+  if (!target.firstElementChild) target.append(node('i'), node('span'));
+  setText(target.lastElementChild, `${expected === 'native' ? '本机' : '梯子'} · ${fresh ? bytes(speed, '/s') : label}`);
+  setAttribute(target, 'title', fresh ? `最近采样 ${time(live.lastAt, true)}` : (live?.error || '当前显示历史记录'));
   return fresh;
 }
-function renderHeader() {
-  $('pageTitle').textContent = pageNames[view];
-  $('selectedDate').max = new Date().toLocaleDateString('sv-SE', { timeZone: 'Asia/Shanghai' });
+function renderLiveStatus() {
   const machineLive = setSourceStatus('machineStatus', livePacket ? livePacket.machine : data?.live?.machine, 'native');
   const clashLive = setSourceStatus('clashStatus', livePacket ? livePacket.clash : data?.live?.clash, 'mihomo');
-  $('sidebarCollectorDot').className = machineLive && clashLive ? 'is-live' : 'is-offline';
-  $('sidebarCollectorText').textContent = machineLive && clashLive ? '两路采集均在运行' : '历史可看 · 部分采集未运行';
-  $('rangeSummary').textContent = `${rangeLabel()} · ${historyState === 'loading' ? '正在更新' : historyState === 'error' ? '更新失败，保留上次记录' : '汇总刷新'} ${data?.generatedAt ? time(data.generatedAt, true) : '—'}`;
-  $('updatedAt').textContent = data?.generatedAt ? `最近更新 ${time(data.generatedAt, true)}` : '等待本机数据';
-  $('historyStatus').textContent = historyState === 'loading' ? (dataKey === queryKey() ? '正在更新统计…' : '正在读取所选时间…') : historyState === 'error' ? `更新未完成：${historyError}` : `${rangeLabel()} · ${data?.generatedAt ? time(data.generatedAt) + ' 更新' : '等待记录'}`;
-  $('refreshButton').setAttribute('aria-busy', String(historyState === 'loading'));
+  const status = machineLive && clashLive ? 'is-live' : 'is-offline';
+  if ($('sidebarCollectorDot').className !== status) $('sidebarCollectorDot').className = status;
+  setText($('sidebarCollectorText'), machineLive && clashLive ? '两路采集均在运行' : '历史可看 · 部分采集未运行');
+  setAttribute($('selectedDate'), 'max', calendarDate());
+}
+function renderHeader() {
+  setText($('pageTitle'), pageNames[view]);
+  renderLiveStatus();
+  setText($('rangeSummary'), `${rangeLabel()} · ${historyState === 'loading' ? '正在更新' : historyState === 'error' ? '更新失败，保留上次记录' : '汇总刷新'} ${data?.generatedAt ? time(data.generatedAt, true) : '—'}`);
+  setText($('updatedAt'), data?.generatedAt ? `最近更新 ${time(data.generatedAt, true)}` : '等待本机数据');
+  setText($('historyStatus'), historyState === 'loading' ? (dataKey === queryKey() ? '正在更新统计…' : '正在读取所选时间…') : historyState === 'error' ? `更新未完成：${historyError}` : `${rangeLabel()} · ${data?.generatedAt ? time(data.generatedAt) + ' 更新' : '等待记录'}`);
+  setAttribute($('refreshButton'), 'aria-busy', String(historyState === 'loading'));
 }
 function renderTotals(target, row, onSelect) {
   target.replaceChildren();
@@ -279,8 +310,10 @@ function drawChart(canvas, series, onSelect, options = {}) {
   const height = Math.max(120, canvas.clientHeight || 210), innerHeight = height - pad.top - pad.bottom;
   const innerWidth = logicalWidth - pad.left - pad.right, slotWidth = innerWidth / points.length;
   const dpr = Math.min(2, window.devicePixelRatio || 1);
-  canvas.width = Math.round(width * dpr); canvas.height = Math.round(height * dpr);
-  const ctx = canvas.getContext('2d'); ctx.scale(dpr, dpr);
+  const backingWidth = Math.round(width * dpr), backingHeight = Math.round(height * dpr);
+  if (canvas.width !== backingWidth) canvas.width = backingWidth;
+  if (canvas.height !== backingHeight) canvas.height = backingHeight;
+  const ctx = canvas.getContext('2d'); ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
   const maximum = Math.max(0, ...points.flatMap((point) => point.values.map((value) => value.value || 0)));
   const rawStep = maximum / 3, magnitude = 10 ** Math.floor(Math.log10(rawStep || 1));
   const step = [1, 2, 2.5, 5, 10].find((value) => value * magnitude >= rawStep) * magnitude;
@@ -434,13 +467,17 @@ function drawChart(canvas, series, onSelect, options = {}) {
     else if (event.key === 'Escape') hideTooltip();
   };
   wrap.onscroll = () => { if (document.activeElement !== canvas) hideTooltip(); if (!scrollFrame) scrollFrame = requestAnimationFrame(() => {scrollFrame=0;draw();}); };
-  canvas._dispose = () => { cancelAnimationFrame(hoverFrame); cancelAnimationFrame(scrollFrame); marker.hidden = true; };
+  canvas._dispose = () => {
+    hideTooltip(); cancelAnimationFrame(scrollFrame);
+    canvas.onmousemove = canvas.onmouseleave = canvas.onblur = canvas.onclick = canvas.onkeydown = null;
+    wrap.onscroll = null;
+    canvas._dispose = null;
+  };
   canvas.removeAttribute('title'); draw();
 }
 function renderOverview() {
   if (!data?.machine || !data?.clash) return;
   const machine = data.machine, clash = data.clash;
-  renderHeader();
   $('overviewMachine').textContent = machine.available ? bytes(total(machine.totals)) : '不可用';
   $('overviewMachineDirections').textContent = `↑ ${bytes(machine.totals?.up)}　↓ ${bytes(machine.totals?.down)}`;
   $('overviewProxy').textContent = clash.available ? bytes(total(clash.groups?.proxy)) : '不可用';
@@ -543,7 +580,7 @@ function renderBudgetStrip() {
 }
 function notifyLimit(name, limit, used) {
   if (!preferences.notificationsEnabled || !('Notification' in window) || Notification.permission !== 'granted') return;
-  const key = `trafficwatch-limit-${new Date().toLocaleDateString('sv-SE', { timeZone: 'Asia/Shanghai' })}-${name}`;
+  const key = `trafficwatch-limit-${calendarDate()}-${name}`;
   try {
     if (localStorage.getItem(key)) return;
     new Notification('TrafficWatch 用量参考线', { body: `${name}已达到参考上限：${bytes(used)} / ${bytes(limit)}。` });
@@ -555,7 +592,6 @@ function renderApps() {
     if(data) {$('appRows').replaceChildren();const tr=node('tr'),td=node('td','本机历史暂不可读，点击刷新可重试。','empty-state');td.colSpan=7;tr.append(td);$('appRows').append(tr);}
     return;
   }
-  renderHeader();
   $('appListTable').hidden = Boolean(activeAppDetail);
   $('appListPager').hidden = Boolean(activeAppDetail);
   $('backToApps').hidden = !activeAppDetail;
@@ -661,7 +697,6 @@ function renderLadder() {
     if(data) {$('routeSummary').replaceChildren(node('p','梯子历史暂不可读，点击刷新可重试。','empty-state'));for(const id of ['ladderProcessRows','ladderDomainRows','ladderNodeRows'])$(id).replaceChildren(node('p','等待历史记录…','empty-state'));$('ladderChart').width=1;$('ladderChart').height=1;}
     return;
   }
-  renderHeader();
   renderTotals($('routeSummary'), { ...data.clash.groups, unassigned: data.clash.unassigned }, (route) => {
     $('routeFilter').value = route;
     activeLadderDetail = null; ladderDetailData = null; $('ladderDetail').hidden = true;
@@ -800,7 +835,6 @@ function peakFrom(rows) {
 }
 function renderInvestigation() {
   if (!data?.machine) return;
-  renderHeader();
   renderPeaks($('issueRows'), data.machine.peaks, 'machine');
   const unknown = (data.machine.allPrograms || []).filter((row) => row.family === 'unknown' || row.scope === 'unknown');
   renderCompactPrograms($('unknownRows'), unknown, 12, (row) => selectApp(row));
@@ -826,7 +860,6 @@ function renderInvestigation() {
 function renderSettings() {
   if (!data?.machine) return;
   settingsInitialized = true;
-  renderHeader();
   $('monthlyMachineLimit').value = preferences.monthlyMachineGb || '';
   $('monthlyProxyLimit').value = preferences.monthlyProxyGb || '';
   $('notificationsEnabled').checked = preferences.notificationsEnabled;
@@ -916,12 +949,22 @@ function renderCurrentView() {
   if (view === 'overview') renderOverview();
   else if (view === 'apps') renderApps();
   else if (view === 'ladder') renderLadder();
-  else if (view === 'harness') { renderHarnessTabs(); loadHarness(activeFamily); }
+  else if (view === 'harness') { renderHarnessTabs(); if (harnessResult?.[0] === activeFamily) renderHarness(...harnessResult); loadHarness(activeFamily); }
   else if (view === 'investigate') renderInvestigation();
   else if (view === 'settings' && !settingsInitialized) renderSettings();
 }
 function acceptOverview(next, key, quick) {
   const previous = dataKey === key ? data : null;
+  if (!quick && previous?.generatedAt && previous.generatedAt === next.generatedAt &&
+      previous.machine?.detailReady !== false && previous.clash?.detailReady !== false &&
+      next.machine?.available && next.clash?.available) {
+    // Cache hits and focus changes must not rebuild unchanged tables/canvases.
+    data = { ...previous, refreshing: next.refreshing };
+    document.querySelector('main').classList.remove('range-loading');
+    $('globalNotice').hidden = true;
+    renderHeader();
+    return;
+  }
   const merged = { ...next };
   const retained = [];
   for (const lane of ['machine','clash']) {
@@ -958,12 +1001,18 @@ function refresh(force = false) {
   const run = async () => {
     let quickOk = false;
     try {
-      try {
-        const quick = await api('/api/overview?' + params + '&quick=1' + (force ? '&fresh=1' : ''), { signal, timeoutMs:15000 });
-        if (current !== refreshSequence || signal.aborted) return;
-        acceptOverview(quick,key,true); quickOk = true;
-      } catch (error) { if(signal.aborted) return; }
-      const next = await api('/api/overview?' + params + (force ? '&fresh=1' : ''), { signal });
+      const hasCompleteRange = dataKey === key && data?.machine?.available && data?.clash?.available &&
+        data.machine.detailReady !== false && data.clash.detailReady !== false;
+      if (!hasCompleteRange) {
+        try {
+          const quick = await api('/api/overview?' + params + '&quick=1' + (force ? '&fresh=1' : ''), { signal, timeoutMs:15000 });
+          if (current !== refreshSequence || signal.aborted) return;
+          acceptOverview(quick,key,true); quickOk = true;
+        } catch (error) { if(signal.aborted) return; }
+      }
+      // A visible, already loaded range needs one update, rather than replaying
+      // cached quick/full responses and then rendering both a second time.
+      const next = await api('/api/overview?' + params + ((force || hasCompleteRange) ? '&fresh=1' : ''), { signal });
       if (current !== refreshSequence || signal.aborted) return;
       historyState = 'ready'; acceptOverview(next,key,false);
       if (next.machine?.available && next.clash?.available) saveSnapshot(key,data);
@@ -979,7 +1028,7 @@ function refresh(force = false) {
     } finally {
       if (current === refreshSequence) {
         refreshPromise = null; renderHeader();
-        if (!document.hidden) refreshTimer = setTimeout(()=>refresh(), data?.refreshing ? 5000 : range === 'day' && selectedDate < new Date().toLocaleDateString('sv-SE',{timeZone:'Asia/Shanghai'}) ? 300000 : 60000);
+        if (!document.hidden) refreshTimer = setTimeout(()=>refresh(), data?.refreshing ? 5000 : range === 'day' && selectedDate < calendarDate() ? 300000 : 60000);
       }
     }
   };
@@ -989,7 +1038,7 @@ async function refreshLive() {
   clearTimeout(liveTimer);
   if (document.hidden || liveAbort) return;
   const controller = liveAbort = new AbortController();
-  try { livePacket = (await api('/api/live', { signal:controller.signal, timeoutMs:3000 })).live; if(!controller.signal.aborted)renderHeader(); }
+  try { livePacket = (await api('/api/live', { signal:controller.signal, timeoutMs:3000 })).live; if(!controller.signal.aborted)renderLiveStatus(); }
   catch { if(!controller.signal.aborted){setSourceStatus('machineStatus',null,'native');setSourceStatus('clashStatus',null,'mihomo');} }
   finally { if(liveAbort===controller)liveAbort=null;if(!document.hidden)liveTimer=setTimeout(refreshLive,5000); }
 }
@@ -997,7 +1046,7 @@ function clearDetails() {
   detailAbort?.abort(); harnessAbort?.abort();
   detailSequence++; harnessSequence++; activeAppDetail = activeLadderDetail = appDetailData = ladderDetailData = harnessResult = null;
   detailHistory = []; harnessLoadedKey = ''; appPage = 0; $('appDetail').hidden = $('ladderDetail').hidden = true;
-  for(const canvas of document.querySelectorAll('canvas')){canvas._dispose?.();canvas.width=1;canvas.height=1;canvas._plotPoints=[];canvas._chartModel=null;}
+  for(const canvas of document.querySelectorAll('canvas')) releaseChart(canvas);
   hideChartTooltip();
 }
 async function exportAllConnections(lane, selection, result, button) {
@@ -1089,8 +1138,8 @@ $('notificationsEnabled').addEventListener('change', async (event) => {
 });
 document.addEventListener('visibilitychange', () => {
   clearTimeout(refreshTimer); clearTimeout(liveTimer); hideChartTooltip();
-  if(document.hidden){historyAbort?.abort();liveAbort?.abort();detailAbort?.abort();harnessAbort?.abort();refreshSequence++;refreshPromise=null;for(const canvas of document.querySelectorAll('canvas'))canvas._dispose?.();}
-  else{refreshLive();refresh();if(activeAppDetail&&!appDetailData)loadAppDetail(activeAppDetail);if(activeLadderDetail&&!ladderDetailData)loadLadderDetail(activeLadderDetail);if(view==='harness'){harnessLoadedKey='';loadHarness(activeFamily);}}
+  if(document.hidden){historyAbort?.abort();liveAbort?.abort();detailAbort?.abort();harnessAbort?.abort();refreshSequence++;refreshPromise=null;for(const canvas of document.querySelectorAll('canvas'))releaseChart(canvas);}
+  else{renderCurrentView();refreshLive();refresh();if(activeAppDetail&&!appDetailData)loadAppDetail(activeAppDetail);if(activeLadderDetail&&!ladderDetailData)loadLadderDetail(activeLadderDetail);if(view==='harness'){harnessLoadedKey='';loadHarness(activeFamily);}}
 });
 let resizeFrame;
 window.addEventListener('resize', () => {

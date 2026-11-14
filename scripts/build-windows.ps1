@@ -1,6 +1,7 @@
 param([string]$OutputFile,[string]$DependencyRoot)
 $ErrorActionPreference='Stop'
 $projectRoot=[IO.Path]::GetFullPath((Split-Path -Parent $PSScriptRoot))
+$projectVersion=(Get-Content -LiteralPath (Join-Path $projectRoot 'package.json') -Raw|ConvertFrom-Json).version
 $buildRoot=Join-Path $projectRoot '.build'
 $stageRoot=[IO.Path]::GetFullPath((Join-Path $buildRoot 'windows'))
 $stage=Join-Path $stageRoot 'TrafficWatch'
@@ -109,7 +110,7 @@ Copy-Item -LiteralPath (Join-Path $stage 'TrafficWatch-Tray.exe') -Destination (
 $exeConfig='<?xml version="1.0" encoding="utf-8"?><configuration><startup><supportedRuntime version="v4.0" sku=".NETFramework,Version=v4.8"/></startup></configuration>'
 foreach($name in @('TrafficWatch-Tray.exe','TrafficWatch-Control.exe','Codex-Netwatch.exe')){[IO.File]::WriteAllText((Join-Path $stage ($name+'.config')),$exeConfig,[Text.UTF8Encoding]::new($false))}
 $files=@(Get-ChildItem -LiteralPath $stage -File -Recurse|ForEach-Object {@{path=$_.FullName.Substring($stage.Length+1).Replace('\','/');sha256=(Get-FileHash -LiteralPath $_.FullName -Algorithm SHA256).Hash.ToLowerInvariant()}})
-@{version='0.7.0';files=$files}|ConvertTo-Json -Depth 5|Set-Content -LiteralPath (Join-Path $stage 'release-manifest.json') -Encoding UTF8
+@{version=$projectVersion;files=$files}|ConvertTo-Json -Depth 5|Set-Content -LiteralPath (Join-Path $stage 'release-manifest.json') -Encoding UTF8
 [IO.Directory]::CreateDirectory((Split-Path -Parent $OutputFile))|Out-Null
 $pending=$OutputFile+'.pending'
 if(Test-Path -LiteralPath $pending){Remove-Item -LiteralPath $pending -Force}

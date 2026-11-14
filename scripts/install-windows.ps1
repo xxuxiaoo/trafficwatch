@@ -18,7 +18,8 @@ $ClashConfigPath=[IO.Path]::GetFullPath($ClashConfigPath)
 if(-not(Test-Path -LiteralPath $ClashConfigPath -PathType Leaf)){throw 'Clash configuration not found. Start Clash Verge once or pass -ClashConfigPath with a local compatible controller configuration.'}
 $manifestPath=Join-Path $packageRoot 'release-manifest.json'
 $manifest=Get-Content -LiteralPath $manifestPath -Raw -Encoding UTF8|ConvertFrom-Json
-if($manifest.version -ne '0.7.0'){throw 'Build the reviewed TrafficWatch Windows package first.'}
+$packageVersion=(Get-Content -LiteralPath (Join-Path $packageRoot 'package.json') -Raw|ConvertFrom-Json).version
+if($manifest.version -ne $packageVersion -or $packageVersion -notmatch '^\d+\.\d+\.\d+$'){throw 'Build the reviewed TrafficWatch Windows package first.'}
 foreach($entry in $manifest.files){
   $source=[IO.Path]::GetFullPath((Join-Path $packageRoot $entry.path))
   if(-not $source.StartsWith($packageRoot+'\',[StringComparison]::OrdinalIgnoreCase)){throw 'Package manifest contains a path outside the package.'}
