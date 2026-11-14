@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.7.2 — 2026-11-14
+
+- Fix live-status text being written inside the status indicator when the page still uses the initial markup. Keep a dedicated text span and normalize older markup once without reintroducing repeated node replacement.
+
 ## 0.7.1 — 2026-11-14
 
 - Reuse number formatters and status text nodes; update live status separately from history metadata, without repeating identical DOM writes.

@@ -17,7 +17,7 @@ using System.Windows.Forms;
 [assembly: AssemblyDescription("Portable local dashboard, collector and system tray host")]
 [assembly: AssemblyCompany("TrafficWatch contributors; based on GloryPkqa/codex-netwatch")]
 [assembly: AssemblyProduct("TrafficWatch")]
-[assembly: AssemblyVersion("0.7.1.0")]
+[assembly: AssemblyVersion("0.7.2.0")]
 
 internal sealed class TrayOptions
 {

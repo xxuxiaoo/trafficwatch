@@ -191,7 +191,10 @@ function setSourceStatus(id, live, expected) {
   const className = `status-chip ${expected === 'mihomo' ? 'proxy-chip' : ''} ${fresh ? 'is-live' : 'is-offline'}`;
   if (target.className !== className) target.className = className;
   const speed = expected === 'native' ? Number(live?.allUpRate || 0) + Number(live?.allDownRate || 0) : total(live?.routeRates?.proxy);
-  if (!target.firstElementChild) target.append(node('i'), node('span'));
+  if (target.lastElementChild?.tagName !== 'SPAN') {
+    const indicator = node('i'); indicator.setAttribute('aria-hidden', 'true');
+    target.replaceChildren(indicator, node('span'));
+  }
   setText(target.lastElementChild, `${expected === 'native' ? '本机' : '梯子'} · ${fresh ? bytes(speed, '/s') : label}`);
   setAttribute(target, 'title', fresh ? `最近采样 ${time(live.lastAt, true)}` : (live?.error || '当前显示历史记录'));
   return fresh;

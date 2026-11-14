@@ -26,6 +26,10 @@ Focused checks confirmed that an unchanged cached result retains its chart model
 
 A separate 15-minute natural-refresh run used actual history without forced garbage collection or artificial rapid refreshes. Thirty samples recorded a JS heap of 1.60–3.29 MiB, 464–465 live page elements, zero observed long tasks above 50 ms, no page errors and no queued history requests. The browser naturally reclaimed old nodes and heap during the run; background pause, canvas release and return also passed. This is a short controlled observation, not a multi-day endurance result or a measurement of the user's original browser session. After a two-file viewer hot update, the installed 0.7.1 passed actual-data overview/drill-down, proxy, harness, legacy-link and narrow-screen checks. Both collector processes remained running through that update; this does not establish a general suite upgrade or fresh-install validation.
 
+## 0.7.2 live-status regression
+
+Browser checks exercised both the initial markup and older cached markup at widths of 390, 650, 900, 1150, 1440, 2048 and 2549 pixels. Status text stays outside the 5-pixel indicator, stale initial text is removed, online/offline transitions work, and 120 identical updates preserve the label node without DOM mutations. The same checks passed against the installed viewer. The update replaces the overview HTML, JavaScript and server version; the collectors continue running.
+
 Original upstream validation notes follow for provenance; their claims apply to the upstream baseline.
 
 # Validation records
