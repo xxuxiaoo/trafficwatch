@@ -1,0 +1,171 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <meta name="color-scheme" content="light" />
+    <title>流量总览 · TrafficWatch</title>
+    <link rel="icon" href="/icon.svg" type="image/svg+xml" />
+    <link rel="stylesheet" href="/overview.css" />
+    <script src="/overview.js" type="module"></script>
+  </head>
+  <body class="overview-page">
+    <div class="app-shell">
+      <aside class="sidebar">
+        <a class="brand" href="#overview" aria-label="流量总览">
+          <img src="/icon.svg" width="32" height="32" alt="" />
+          <span>TrafficWatch<small>本机流量观察</small></span>
+        </a>
+        <nav class="primary-nav" aria-label="流量视图">
+          <button type="button" data-view-button="overview" aria-current="page"><span>◫</span> 总览</button>
+          <button type="button" data-view-button="apps"><span>▦</span> 本机应用</button>
+          <button type="button" data-view-button="ladder"><span>⇄</span> 梯子流量</button>
+          <button type="button" data-view-button="harness"><span>⌘</span> Harness</button>
+          <button type="button" data-view-button="investigate"><span>⌁</span> 高峰与缺口</button>
+        </nav>
+        <div class="sidebar-bottom">
+          <div class="collector-mark"><i id="sidebarCollectorDot"></i><span id="sidebarCollectorText">正在检查采集状态</span></div>
+          <button type="button" class="settings-link" data-view-button="settings"><span>⚙</span> 设置与旧版备份</button>
+          <small>数据保存在本机</small>
+        </div>
+      </aside>
+
+      <div class="workspace">
+        <header class="topbar">
+          <div class="topbar-heading">
+            <p class="eyebrow">TRAFFIC / LOCAL</p>
+            <h1 id="pageTitle">流量总览</h1>
+          </div>
+          <div class="topbar-tools">
+            <span class="status-chip" id="machineStatus"><i></i> 本机检查中</span>
+            <span class="status-chip proxy-chip" id="clashStatus"><i></i> 梯子检查中</span>
+            <label class="sr-only" for="range">统计时间</label>
+            <select id="range" class="control-select">
+              <option value="today">今天</option>
+              <option value="24h">最近 24 小时</option>
+              <option value="7d">最近 7 天</option>
+              <option value="30d">最近 30 天</option>
+              <option value="all">全部记录</option>
+              <option value="day">选择日期</option>
+            </select>
+            <label class="sr-only" for="selectedDate">指定日期</label>
+            <input id="selectedDate" class="control-select date-select" type="date" hidden />
+            <button id="refreshButton" type="button" class="icon-button" title="立即刷新" aria-label="立即刷新">↻</button>
+          </div>
+        </header>
+
+        <main id="mainContent">
+          <div class="history-status-bar"><span id="historyStatus" role="status">正在读取本机历史…</span><span>实时采集状态显示在右上角</span></div>
+          <p id="globalNotice" class="warning-list has-warning" role="status" hidden></p>
+          <section class="page-view" data-view="overview">
+            <div class="view-heading">
+              <div><p class="eyebrow">快速掌握用量与变化</p><h2>流量总览</h2><p id="rangeSummary" class="muted">正在读取本机记录…</p></div>
+              <button type="button" class="text-button" data-view-button="investigate">查看高峰与采集缺口 <span aria-hidden="true">›</span></button>
+            </div>
+            <div class="metric-strip" aria-label="选定时段流量">
+              <section class="metric-cell machine-metric"><span>本机已观测</span><strong id="overviewMachine">—</strong><small id="overviewMachineDirections">↑ —　↓ —</small></section>
+              <section class="metric-cell proxy-metric"><span>梯子代理出口</span><strong id="overviewProxy">—</strong><small id="overviewProxyDirections">↑ —　↓ —</small></section>
+              <section class="metric-cell harness-metric"><span>Harness 应用</span><strong id="overviewHarness">—</strong><small id="overviewHarnessBreakdown">Codex / Claude Code / dsh</small></section>
+              <section class="metric-cell unknown-metric"><span>待识别或未归因</span><strong id="overviewUnknown">—</strong><small id="overviewUnknownNote">不会算进 Harness</small></section>
+            </div>
+            <p id="measurementNote" class="measurement-note"></p>
+            <section id="budgetStrip" class="budget-strip" hidden></section>
+            <section class="chart-section" aria-labelledby="overviewChartTitle">
+              <div class="section-heading"><div><h3 id="overviewChartTitle">各时段流量</h3><p>橙色上传、蓝色下载，柱高为合计；点击柱子定位应用与连接</p></div></div>
+              <div class="chart-wrap"><canvas id="overviewChart" aria-label="本机与代理流量柱状图；左右方向键选择时段，回车查看明细"></canvas></div>
+              <div id="chartTicks" class="chart-ticks"></div>
+            </section>
+            <div class="overview-columns">
+              <section class="data-section" aria-labelledby="peakTitle">
+                <div class="section-heading"><div><h3 id="peakTitle">用量最高的时段</h3><p>按 5 分钟窗口排序，选中后直接定位连接</p></div><button type="button" class="quiet-button" data-view-button="investigate">全部高峰</button></div>
+                <div id="peakRows" class="compact-list"><p class="empty-state">正在读取…</p></div>
+              </section>
+              <section class="data-section" aria-labelledby="topAppsTitle">
+                <div class="section-heading"><div><h3 id="topAppsTitle">最耗流量的应用</h3><p>按本机进程记录排序，点开查看去向</p></div><button type="button" class="quiet-button" data-view-button="apps">全部应用</button></div>
+                <div id="topProcessRows" class="compact-list"><p class="empty-state">正在读取…</p></div>
+              </section>
+            </div>
+            <section id="integritySummary" class="integrity-band" aria-label="采集完整性"></section>
+            <div id="overviewWarnings" class="warning-list" role="status"></div>
+          </section>
+
+          <section class="page-view" data-view="apps" hidden>
+            <div class="view-heading">
+              <div><p class="eyebrow">进程与目标地址</p><h2>本机全部应用</h2><p>按 Windows 网络事件记录；包含代理进程本身，进程间可能重复计数。</p></div>
+              <button id="exportApps" type="button" class="command-button">↓ 导出 CSV</button>
+            </div>
+            <div class="filter-bar">
+              <label class="search-field"><span>⌕</span><input id="appSearch" type="search" placeholder="搜索应用进程名" autocomplete="off" /></label>
+              <label>排序 <select id="appSort" class="control-select"><option value="total">总流量</option><option value="up">上传</option><option value="down">下载</option><option value="name">名称</option></select></label>
+              <span id="appCount" class="muted"></span>
+            </div>
+            <div id="detailFilterBar" class="detail-context"><label>开始 <input id="inspectFrom" type="datetime-local" step="60" /></label><label>结束（不含） <input id="inspectTo" type="datetime-local" step="60" /></label><button id="inspectRange" class="quiet-button" type="button">定位这个时段</button></div>
+            <button id="backToApps" class="quiet-button" type="button" hidden>返回全时段应用列表</button>
+            <div class="table-scroll" id="appListTable">
+              <table>
+                <thead><tr><th>应用进程</th><th>分类</th><th>上传</th><th>下载</th><th>合计</th><th>连接</th><th>最近活动</th></tr></thead>
+                <tbody id="appRows"><tr><td colspan="7" class="empty-state">正在读取…</td></tr></tbody>
+              </table>
+            </div>
+            <div id="appListPager" class="connection-pager"></div>
+            <section id="appDetail" class="detail-region" hidden>
+              <div class="section-heading detail-heading"><div><h3 id="appDetailTitle">应用明细</h3><p id="appDetailMeta" class="muted"></p></div><div class="detail-actions"><button id="detailBack" class="quiet-button" type="button" hidden>返回上一层</button><button id="copyEvidence" class="quiet-button" type="button">复制排查摘要</button><button id="exportAppDetail" type="button" class="quiet-button">导出全部明细 CSV</button></div></div>
+              <div class="detail-metrics" id="appDetailMetrics"></div>
+              <section><h4>这个筛选范围内的应用 <small class="muted">点击应用继续筛选，保留当前时段</small></h4><div id="detailProcessRows" class="compact-list"></div></section>
+              <div class="detail-grid"><section><h4>分钟 / 小时变化</h4><div class="chart-wrap short-chart"><canvas id="appDetailChart" aria-label="所选应用流量变化"></canvas></div></section><section><h4>访问目标</h4><div id="appDestinations" class="compact-list"></div></section></div>
+              <h4>连接记录 <small id="appConnectionCount" class="muted"></small></h4>
+              <div class="table-scroll"><table><thead><tr><th>最后活动</th><th>应用 / PID</th><th>目标</th><th>归因依据</th><th>上传</th><th>下载</th><th>合计</th></tr></thead><tbody id="appConnectionRows"></tbody></table></div>
+              <div id="appPager" class="connection-pager"></div>
+            </section>
+          </section>
+
+          <section class="page-view" data-view="ladder" hidden>
+            <div class="view-heading">
+              <div><p class="eyebrow">Clash / Mihomo 出口归因</p><h2>梯子流量</h2><p>只看有代理节点证据的连接；与本机应用统计分开，不要相加当账单。</p></div>
+              <button id="exportLadder" type="button" class="command-button">↓ 导出 CSV</button>
+            </div>
+            <div id="routeSummary" class="route-summary"></div>
+              <section class="chart-section"><div class="section-heading"><div><h3>各时段出口流量</h3><p>橙色上传、蓝色下载，柱高为合计；悬停看数值，点击查看连接</p></div><label>连接类型 <select id="routeFilter" class="control-select"><option value="proxy" selected>代理出口</option><option value="all">全部</option><option value="direct">DIRECT</option><option value="unknown">未知</option></select></label></div><div class="chart-wrap"><canvas id="ladderChart" aria-label="Clash 出口流量柱状图；左右方向键选择时段，回车查看明细"></canvas></div><div id="ladderTicks" class="chart-ticks"></div></section>
+            <div class="overview-columns">
+              <section class="data-section"><div class="section-heading"><div><h3>经由节点的应用</h3><p>按代理出口连接归因</p></div></div><div id="ladderProcessRows" class="compact-list"></div></section>
+              <section class="data-section"><div class="section-heading"><div><h3>代理目标</h3><p>节点流量可展开到域名或目标 IP</p></div></div><div id="ladderDomainRows" class="compact-list"></div><h4 class="subsection-title">出口节点</h4><div id="ladderNodeRows" class="compact-list"></div></section>
+            </div>
+            <section id="ladderDetail" class="detail-region" hidden><div class="section-heading detail-heading"><div><h3 id="ladderDetailTitle">连接明细</h3><p id="ladderDetailMeta" class="muted"></p></div><button id="exportLadderDetail" type="button" class="quiet-button">导出全部明细 CSV</button></div><div class="chart-wrap short-chart"><canvas id="ladderDetailChart" aria-label="代理连接流量分钟变化"></canvas></div><div class="table-scroll"><table><thead><tr><th>最后活动</th><th>应用</th><th>目标</th><th>出口节点</th><th>上传</th><th>下载</th><th>合计</th></tr></thead><tbody id="ladderConnectionRows"></tbody></table></div><div id="ladderPager" class="connection-pager"></div></section>
+            <p id="ladderAccountingNote" class="measurement-note"></p>
+          </section>
+
+          <section class="page-view" data-view="harness" hidden>
+            <div class="view-heading">
+              <div><p class="eyebrow">开发工具用量</p><h2>Harness 流量</h2><p>Codex 按已识别的子进程统计；Claude Code 与 dsh 使用精确进程名及其新采集到的子进程归属。</p></div>
+              <button type="button" class="text-button" data-view-button="settings">管理进程识别规则 <span aria-hidden="true">›</span></button>
+            </div>
+            <div id="harnessTabs" class="segmented-control" role="tablist" aria-label="Harness 应用"></div>
+            <section id="harnessPanel" class="harness-panel">
+              <div class="harness-overview"><div><span id="harnessSelectedName">Codex</span><strong id="harnessTotal">—</strong><small id="harnessDirections">↑ —　↓ —</small></div><div><span>其中通过梯子</span><strong id="harnessProxyTotal">—</strong><small id="harnessProxyShare">代理出口归因</small></div><div><span>本机记录中的占比</span><strong id="harnessShare">—</strong><small id="harnessPeak">峰值时段 —</small></div></div>
+              <div class="detail-grid"><section><div class="section-heading"><div><h3>流量变化</h3><p>全机进程记录与代理出口分开显示</p></div></div><div class="chart-wrap short-chart"><canvas id="harnessChart" aria-label="所选 Harness 应用流量变化"></canvas></div></section><section><h3>匹配到的进程</h3><div id="harnessProcessRows" class="compact-list"></div></section></div>
+              <div id="harnessNotice" class="warning-list"></div>
+            </section>
+          </section>
+
+          <section class="page-view" data-view="investigate" hidden>
+            <div class="view-heading"><div><p class="eyebrow">自行定位高消耗来源</p><h2>高峰与采集缺口</h2><p>高峰按机器观测时段排序；点开可继续追到进程、目标和归因证据。</p></div><button type="button" class="command-button" data-view-button="apps">打开进程列表</button></div>
+            <div class="investigation-grid"><section class="data-section"><div class="section-heading"><div><h3>5 分钟高峰</h3><p>以本机秒级累计样本为准</p></div></div><div id="issueRows" class="compact-list"></div></section><section class="data-section"><div class="section-heading"><div><h3>待识别流量</h3><p>连接缺少可靠进程证据时单独列出</p></div></div><div id="unknownRows" class="compact-list"></div></section></div>
+            <section class="data-section gap-section"><div class="section-heading"><div><h3>采集覆盖与缺口</h3><p>停止或重启期间没有补录；缺口不会伪装成零用量</p></div></div><div id="gapSummary" class="gap-summary"></div><div id="gapRows" class="gap-list"></div></section>
+          </section>
+
+          <section class="page-view" data-view="settings" hidden>
+            <div class="view-heading"><div><p class="eyebrow">本机偏好与恢复入口</p><h2>设置与旧版备份</h2><p>采集服务状态和历史保存由桌面控制台管理。</p></div></div>
+            <div class="settings-columns">
+              <section class="data-section"><div class="section-heading"><div><h3>Harness 进程识别</h3><p>按实际进程名精确匹配；已记录的直接进程会同步回填分组。</p></div></div><div class="alias-add"><label>已发现或手动输入<input id="aliasProcess" class="control-select" list="detectedProcesses" maxlength="128" placeholder="例如 dsh.exe" autocomplete="off" /><datalist id="detectedProcesses"></datalist></label><label>加入分组 <select id="aliasFamily" class="control-select"><option value="claude">Claude Code</option><option value="dsh">dsh</option></select></label><button id="addAlias" class="command-button" type="button">添加进程名</button></div><div id="aliasGroups" class="alias-groups"></div><p id="aliasStatus" class="muted" role="status"></p></section>
+              <section class="data-section"><div class="section-heading"><div><h3>旧版详细页面备份</h3><p>原有两个界面保留，可按原样打开；部署时会另存一份静态文件备份。</p></div></div><div class="legacy-links"><a href="http://127.0.0.1:43128/?legacy=1" target="_blank" rel="noopener">旧版全机流量详情 <span>↗</span></a><a href="http://127.0.0.1:43130/?legacy=1" target="_blank" rel="noopener">旧版 Clash 流量详情 <span>↗</span></a></div><p class="fine-print">常规入口统一跳转到本页。备份文件位于 TrafficWatch 安装目录的 backups 文件夹。</p></section>
+            </div>
+            <section class="data-section settings-limits"><div class="section-heading"><div><h3>用量参考线</h3><p>只比较本机记录的参考用量，不代表运营商或机场账单。</p></div></div><div class="limit-controls"><label>本月本机参考上限（GB）<input id="monthlyMachineLimit" type="number" min="0" step="0.1" inputmode="decimal" /></label><label>本月梯子参考上限（GB）<input id="monthlyProxyLimit" type="number" min="0" step="0.1" inputmode="decimal" /></label><button id="saveLimits" type="button" class="command-button">保存参考线</button><label class="notification-setting"><input id="notificationsEnabled" type="checkbox" /> 页面打开时达到参考线，发送本机提醒</label></div><p id="limitsStatus" class="muted" role="status"></p></section>
+            <details class="coverage-details"><summary>采集口径</summary><p>本机应用来自 Windows ETW 进程网络事件；Harness 在有进程树证据时会归入对应父进程。梯子流量来自 Mihomo / Clash 连接快照，并拆分代理、DIRECT 和未知出口。代理会造成应用本地连接与代理进程出站重复出现在本机视图，所以这些合计不相加，也不等于网卡或账单。</p><p>所有时间按北京时间显示。数据只包含采集期间实际保存的记录；覆盖率、采集缺口、未知进程和未归因差额会在页面内注明。</p></details>
+          </section>
+        </main>
+        <footer class="workspace-footer"><span>本机数据 · 无云端同步</span><span id="updatedAt">—</span></footer>
+      </div>
+    </div>
+    <div id="toast" class="toast" role="status" hidden></div>
+  </body>
+</html>

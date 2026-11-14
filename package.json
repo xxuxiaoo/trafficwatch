@@ -1,0 +1,31 @@
+{
+  "name": "trafficwatch",
+  "version": "0.7.0",
+  "private": true,
+  "description": "Windows traffic history for all observed applications, Clash/Mihomo proxy traffic and AI coding harnesses.",
+  "type": "module",
+  "engines": {
+    "node": ">=24.0.0"
+  },
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/xxuxiaoo/trafficwatch.git"
+  },
+  "homepage": "https://github.com/xxuxiaoo/trafficwatch",
+  "bugs": {
+    "url": "https://github.com/xxuxiaoo/trafficwatch/issues"
+  },
+  "scripts": {
+    "start": "node --disable-warning=ExperimentalWarning src/overview-server.mjs",
+    "collector": "node --disable-warning=ExperimentalWarning src/main.mjs",
+    "demo": "node --disable-warning=ExperimentalWarning src/main.mjs --demo",
+    "doctor": "node --disable-warning=ExperimentalWarning scripts/doctor.mjs",
+    "check": "node scripts/check.mjs",
+    "test": "node scripts/test.mjs",
+    "stability": "node --disable-warning=ExperimentalWarning scripts/stability.mjs",
+    "build:windows": "powershell.exe -NoProfile -ExecutionPolicy Bypass -File scripts/build-windows.ps1",
+    "package:source": "powershell.exe -NoProfile -ExecutionPolicy Bypass -File scripts/package-source.ps1",
+    "audit:publication": "node scripts/audit-publication.mjs"
+  }
+}

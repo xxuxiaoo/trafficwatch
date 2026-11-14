@@ -1,0 +1,56 @@
+name: Source checks
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+    inputs:
+      build_windows:
+        type: boolean
+        default: false
+        description: Build a Windows package with pinned official dependencies
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    strategy:
+      matrix:
+        os: [windows-latest, ubuntu-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+      - run: npm run check
+      - name: Build and self-test the Windows native helper
+        if: runner.os == 'Windows'
+        shell: powershell
+        run: powershell.exe -NoProfile -ExecutionPolicy Bypass -File scripts/build-native.ps1
+      - run: npm test
+      - run: npm run audit:publication
+  windows-package:
+    if: github.event_name == 'workflow_dispatch' && inputs.build_windows
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+      - name: Build Windows package
+        shell: powershell
+        run: powershell.exe -NoProfile -ExecutionPolicy Bypass -File scripts/build-windows.ps1
+      - uses: actions/upload-artifact@v4
+        with:
+          name: trafficwatch-windows-x64
+          path: |
+            .build/trafficwatch-windows-x64.zip
+            .build/SHA256SUMS.txt
+          if-no-files-found: error
+          retention-days: 7

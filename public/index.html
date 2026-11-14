@@ -1,0 +1,551 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Codex Netwatch · 本地流量监控</title>
+    <link rel="icon" href="/icon.svg" type="image/svg+xml" />
+    <link rel="stylesheet" href="/style.css" />
+    <script src="/app.js" type="module"></script>
+  </head>
+  <body>
+    <aside class="sidebar">
+      <a class="brand" href="#overview"
+        ><img src="/icon.svg" width="34" height="34" alt="" /><span
+          >codex<span class="brand-light">netwatch</span><small>LOCAL OBSERVABILITY</small></span
+        ></a
+      >
+      <div class="nav-label">工作空间</div>
+      <nav aria-label="主导航">
+        <a class="nav-link" href="/overview"><span>▰</span> 本机 / Clash 流量</a>
+        <a class="nav-link active" href="#overview"><span>◫</span> 流量总览</a>
+        <a class="nav-link" href="#history"><span>▦</span> 流量日历</a>
+        <a class="nav-link" href="#investigation"><span>!</span> 异常排查</a>
+        <a class="nav-link" href="#connections"><span>⇄</span> 连接与去向</a>
+        <a class="nav-link" href="#sessions"><span>◷</span> 会话活动</a>
+        <a class="nav-link" href="#reports"><span>▤</span> 日报与周报</a>
+        <a class="nav-link" href="#diagnostics"><span>⌁</span> 采集诊断</a>
+      </nav>
+      <div class="sidebar-bottom">
+        <span class="local-dot"></span> 数据只保存在本机
+        <p>无云端 · 无遥测 · 无外部资源</p>
+        <span class="version"
+          >v0.5.0 /
+          <a
+            class="version-link"
+            href="https://github.com/GloryPkqa/codex-netwatch"
+            target="_blank"
+            rel="noopener noreferrer"
+            aria-label="在 GitHub 查看项目"
+            >codex-netwatch ↗</a
+          ></span
+        >
+      </div>
+    </aside>
+    <main>
+      <header class="topbar">
+        <span>个人监控台 <span class="slash">/</span> <strong>Codex</strong></span>
+        <div class="top-actions">
+          <span id="captureBadge" class="small-muted"></span>
+          <button id="miniWindowButton" type="button" class="icon-button" hidden>迷你悬浮窗</button>
+          <label class="sr-only" for="language">界面语言</label>
+          <select id="language" class="language-select">
+            <option value="en" lang="en">English</option>
+            <option value="zh-CN" lang="zh-CN">中文</option>
+            <option value="auto">自动（系统）</option>
+          </select>
+          <span class="status-pill" id="statusPill"
+            ><i></i><span id="statusText">正在连接</span></span
+          ><button
+            class="icon-button"
+            id="setupButton"
+            aria-expanded="false"
+            aria-controls="setupGuide"
+          >
+            连接帮助</button
+          ><button class="icon-button" id="settingsButton" aria-label="打开监控设置">
+            ⚙ 设置
+          </button>
+        </div>
+      </header>
+      <section id="overview" class="page-heading">
+        <div>
+          <div class="eyebrow">KNOW WHERE YOUR BYTES GO</div>
+          <h1>流量，看得清。</h1>
+          <p>从进程到连接，找出 Codex 的网络开销。</p>
+        </div>
+        <div class="range-controls">
+          <label class="sr-only" for="range">统计时间范围</label
+          ><select id="range">
+            <option value="15m">最近 15 分钟</option>
+            <option value="1h" selected>最近 1 小时</option>
+            <option value="6h">最近 6 小时</option>
+            <option value="24h">最近 24 小时</option>
+            <option value="7d">最近 7 天</option>
+            <option value="30d">最近 30 天</option>
+            <option value="all">全部已记录</option>
+            <option value="custom">自定义时间…</option></select
+          ><button id="exportButton" class="button secondary">↓ 导出 CSV</button>
+        </div>
+      </section>
+      <div id="customRange" class="custom-range" hidden>
+        <label>开始 <input id="fromTime" type="datetime-local" /></label
+        ><label>结束 <input id="toTime" type="datetime-local" /></label
+        ><button id="applyRange" class="button">应用</button>
+      </div>
+      <div id="banner" class="banner" role="status" hidden></div>
+      <section id="setupGuide" class="panel setup-guide" aria-labelledby="setupTitle" hidden>
+        <div class="panel-heading">
+          <div>
+            <h2 id="setupTitle">开始监控</h2>
+            <p>Windows 原生采集 / Mihomo 兼容接口</p>
+          </div>
+          <button id="closeSetup" class="icon-button" type="button" aria-label="收起连接帮助">
+            ✕
+          </button>
+        </div>
+        <div class="setup-body">
+          <div class="setup-status" role="status">
+            <strong id="setupStatus"></strong>
+            <p id="setupHint"></p>
+          </div>
+          <ol class="setup-steps">
+            <li>
+              <strong>选择采集方式</strong>
+              <p>直连使用 Windows 原生采集，无需代理。在设置中授权采集助手；也可选择 Mihomo 兼容接口。</p>
+            </li>
+            <li>
+              <strong>连接本地控制接口</strong>
+              <p>
+                优先自动发现。手动配置时使用 external-controller 地址，不能填代理端口。密钥通过
+                MIHOMO_SECRET 提供。
+              </p>
+            </li>
+            <li>
+              <strong>让 Codex 产生新请求</strong>
+              <p>
+                保持程序运行，等待两次采样。只累计建立基线后的新增流量，其他程序不会计入 Codex。
+              </p>
+            </li>
+          </ol>
+          <details class="setup-config">
+            <summary>自动发现失败？查看手动配置</summary>
+            <p>
+              复制程序目录中的 config.example.json 为 config.local.json，按代理实际控制地址填写
+              controller，然后完整退出并重新启动程序。下面仅为示例。
+            </p>
+            <pre><code>{ "controller": "http://127.0.0.1:9090" }</code></pre>
+            <p>
+              需要授权时，在启动程序的环境中设置 MIHOMO_SECRET。不要把密钥写进截图、反馈或分享内容。
+            </p>
+          </details>
+          <div class="setup-actions">
+            <button id="retrySetup" type="button" class="button secondary small">刷新检查</button
+            ><a
+              href="https://github.com/GloryPkqa/codex-netwatch/blob/main/docs/CONFIGURATION.md"
+              target="_blank"
+              rel="noopener noreferrer"
+              >完整配置与排错 ↗</a
+            ><a href="#diagnostics" id="setupDiagnostics">查看采集诊断 ↓</a
+            ><span>采集器会自动重试，无需反复点击。</span>
+          </div>
+        </div>
+      </section>
+      <section class="metrics" aria-label="流量指标">
+        <article class="metric primary">
+          <div class="metric-label">Codex 已观测流量 <span class="tiny-tag">进程识别</span></div>
+          <div class="metric-value" id="totalBytes">—</div>
+          <div class="metric-foot">
+            <span>↑ <b id="upBytes">—</b></span
+            ><span>↓ <b id="downBytes">—</b></span>
+          </div>
+        </article>
+        <article class="metric">
+          <div class="metric-label">当前传输速度 <span class="live-indicator"></span></div>
+          <div class="metric-value" id="speed">—</div>
+          <div class="metric-foot">
+            <span>↑ <b id="upRate">—</b></span
+            ><span>↓ <b id="downRate">—</b></span>
+          </div>
+        </article>
+        <article class="metric">
+          <div class="metric-label">全部已观测进程流量 <span class="tiny-tag neutral">对照</span></div>
+          <div class="metric-value" id="allBytes">—</div>
+          <div class="metric-foot" id="share">等待采样</div>
+        </article>
+        <article class="metric">
+          <div class="metric-label">近期 Codex 连接</div>
+          <div class="metric-value" id="codexConnections">—</div>
+          <div class="metric-foot" id="unknownConnections">进程匹配准备中</div>
+        </article>
+      </section>
+      <section id="budgets" class="panel budget-panel" aria-labelledby="budgetHeading">
+        <div class="panel-heading">
+          <div><h2 id="budgetHeading">流量预算</h2><p id="budgetContext">每日与每月预算独立于上方时间筛选</p></div>
+          <button id="budgetSettingsButton" type="button" class="button secondary small">设置预算</button>
+        </div>
+        <div class="budget-grid">
+          <article class="budget-card" id="dayBudget">
+            <div class="budget-card-heading"><h3>今日</h3><span id="dayBudgetState" class="tiny-tag neutral">未设置预算</span></div>
+            <div id="dayBudgetAmount" class="budget-amount">—</div>
+            <progress id="dayBudgetProgress" max="100" value="0" aria-label="每日预算使用比例"></progress>
+            <p id="dayBudgetDetail" class="help"></p>
+          </article>
+          <article class="budget-card" id="monthBudget">
+            <div class="budget-card-heading"><h3>本月</h3><span id="monthBudgetState" class="tiny-tag neutral">未设置预算</span></div>
+            <div id="monthBudgetAmount" class="budget-amount">—</div>
+            <progress id="monthBudgetProgress" max="100" value="0" aria-label="每月预算使用比例"></progress>
+            <p id="monthBudgetDetail" class="help"></p>
+          </article>
+          <article class="budget-card budget-peaks">
+            <h3>近 24 小时高用量时段</h3><ol id="budgetPeaks"></ol>
+          </article>
+        </div>
+        <p id="budgetHistory" class="help"></p>
+        <p class="help">仅累计已采集的上传与下载；采集缺口不补算，也不是套餐账单。预算只提醒，不断网。每日汇总独立保存，清理详细历史不会减少预算累计。</p>
+      </section>
+      <section id="history" class="panel history-panel" aria-labelledby="historyHeading">
+        <div class="panel-heading history-heading">
+          <div><h2 id="historyHeading">流量日历</h2><p id="historyContext">每日汇总与同期对比</p></div>
+          <div class="history-controls">
+            <label class="sr-only" for="historyScope">日历与报告统计范围</label>
+            <select id="historyScope"><option value="codex">仅 Codex</option><option value="all" selected>全部已观测进程</option></select>
+            <div class="month-controls"><button id="previousMonth" type="button" class="icon-button" aria-label="上个月">‹</button><label class="sr-only" for="historyMonth">日历月份</label><input id="historyMonth" type="month" required /><button id="nextMonth" type="button" class="icon-button" aria-label="下个月">›</button></div>
+          </div>
+        </div>
+        <p id="historyStatus" class="history-status" role="status"></p>
+        <div class="history-layout">
+          <div class="calendar-wrap"><div id="calendarWeekdays" class="calendar-weekdays" aria-hidden="true"></div><div id="calendarDays" class="calendar-days" aria-label="每日已观测流量"></div><div class="calendar-legend"><span class="calendar-key unknown"></span><span>无记录</span><span class="calendar-key zero"></span><span>已观测为零</span><span class="calendar-key high"></span><span>较高用量</span></div></div>
+          <div><div id="calendarTotal" class="calendar-total"></div><div id="historyComparison" class="history-comparison"></div><p class="help">对比截至相同本地时刻的已观测量；详细记录不足时不显示变化比例。缺口不补算。</p></div>
+        </div>
+        <p class="history-footnote">点击日期查看下方日报。日历保留每日汇总，进程与小时明细受历史保留天数限制。</p>
+      </section>
+      <div class="split-grid">
+        <section class="panel trend-panel">
+          <div class="panel-heading">
+            <div>
+              <h2>传输趋势</h2>
+              <p>Codex 上传与下载 · <span id="rangeLabel">等待数据</span></p>
+            </div>
+            <div class="legend">
+              <span class="legend-up">上传</span><span class="legend-down">下载</span
+              ><span class="legend-all">全部进程</span>
+            </div>
+          </div>
+          <div class="chart-wrap">
+            <canvas id="chart" role="img" aria-label="流量速率趋势图"></canvas>
+            <div id="chartEmpty" class="chart-empty">
+              等待第一组采样<br /><small>已有连接会先建立基线，再累计新流量。</small>
+            </div>
+          </div>
+          <div class="chart-footer">
+            <span id="chartHint">悬停查看采样值</span><span>GB = 10⁹ 字节</span>
+          </div>
+        </section>
+        <section class="panel">
+          <div class="panel-heading">
+            <div>
+              <h2>流量去向</h2>
+              <p id="domainCaption">当前筛选范围内的目标地址</p>
+            </div>
+            <span class="small-muted">TOP 8</span>
+          </div>
+          <div id="domains" class="domains"><p class="empty">暂无已观测流量</p></div>
+        </section>
+      </div>
+      <section id="investigation" class="investigation">
+        <article class="panel">
+          <div class="panel-heading">
+            <div>
+              <h2>异常排查</h2>
+              <p>定位已观测的突发上传、下载和持续上传，不按会话猜测流量。</p>
+            </div>
+          </div>
+          <div class="coverage-context">
+            <span class="tiny-tag neutral">全部已观测连接</span
+            ><span>用于检查采集覆盖情况，包含其他程序，不是 Codex 专属用量。</span>
+          </div>
+          <p id="coverageSummary" class="coverage-summary">等待观测记录</p>
+          <p class="insight-note">
+            未识别占比仅针对已观测连接，不代表完整覆盖率；采集源总量与连接记录可能存在差额。
+          </p>
+          <p class="insight-note">
+            主要连接线索取自每次采样最多 20 条主要上传或下载连接；异常窗口总量包含全部已识别 Codex
+            字节。
+          </p>
+          <div class="table-scroll">
+            <table>
+              <thead>
+                <tr>
+                  <th>异常类型</th>
+                  <th>观测窗口</th>
+                  <th>主要观测连接</th>
+                  <th class="number">窗口字节</th>
+                </tr>
+              </thead>
+              <tbody id="anomalyRows"></tbody>
+            </table>
+          </div>
+        </article>
+        <div class="investigation-grid">
+          <article class="panel">
+            <div class="panel-heading">
+              <div>
+                <h2>采集缺口</h2>
+                <p>断线、休眠、重启和识别受限均会留下记录，缺口字节未知。</p>
+              </div>
+            </div>
+            <div id="gapRows" class="gap-list"></div>
+          </article>
+          <article class="panel">
+            <div class="panel-heading process-heading">
+              <div>
+                <h2 id="processTitle">Codex 进程流量排行</h2>
+                <p id="processCaption">
+                  仅显示已识别的 Codex 进程及子进程，按上传与下载合计排序，最多 8 项。
+                </p>
+              </div>
+              <label class="sr-only" for="processScope">排行统计范围</label>
+              <select id="processScope">
+                <option value="codex">仅 Codex</option>
+                <option value="all" selected>全部已观测进程</option>
+              </select>
+            </div>
+            <div class="table-scroll">
+              <table>
+                <thead>
+                  <tr>
+                    <th>进程</th>
+                    <th class="number">上传</th>
+                    <th class="number">下载</th>
+                  </tr>
+                </thead>
+                <tbody id="processRows"></tbody>
+              </table>
+            </div>
+          </article>
+        </div>
+      </section>
+      <section class="panel" id="connections">
+        <div class="panel-heading connection-heading">
+          <div>
+            <h2>连接与去向</h2>
+            <p>字节来自当前采集源，归属来自进程证据。原生模式显示目标 IP。</p>
+          </div>
+          <div class="filters">
+            <label class="sr-only" for="scope">进程筛选</label
+            ><select id="scope">
+              <option value="codex">Codex 进程</option>
+              <option value="unknown">待识别进程</option>
+              <option value="other">其他进程</option>
+              <option value="all" selected>全部连接</option></select
+            ><input id="search" placeholder="搜索地址或进程…" aria-label="搜索连接" />
+          </div>
+        </div>
+        <div class="table-scroll">
+          <table>
+            <thead>
+              <tr>
+                <th>目标地址</th>
+                <th>进程 / PID</th>
+                <th>识别证据</th>
+                <th class="number">上传</th>
+                <th class="number">下载</th>
+                <th class="number">合计</th>
+                <th>最近观测</th>
+              </tr>
+            </thead>
+            <tbody id="connectionRows"></tbody>
+          </table>
+        </div>
+        <div class="table-footer">
+          最多展示流量最大的 100 条连接 · CSV 最多 10,000 条 · 筛选仅影响连接与去向
+        </div>
+      </section>
+      <section class="panel" id="sessions">
+        <div class="panel-heading connection-heading">
+          <div>
+            <h2>会话活动 <span class="tiny-tag amber">时间关联 ≠ 字节归属</span></h2>
+            <p>用日志活动缩小排查范围。共享进程与连接时，无法精确分配各会话的 GB。</p>
+          </div>
+          <div class="filters">
+            <input id="sessionSearch" placeholder="搜索会话名称…" aria-label="搜索会话" /><select
+              id="sessionLimit"
+              aria-label="显示会话数量"
+            >
+              <option value="20">最近 20 个</option>
+              <option value="50">最近 50 个</option>
+              <option value="200">最近 200 个</option>
+            </select>
+          </div>
+        </div>
+        <div class="table-scroll">
+          <table>
+            <thead>
+              <tr>
+                <th>会话</th>
+                <th>模型</th>
+                <th class="number">日志累计 token</th>
+                <th class="number">监控期间 token 增量</th>
+                <th>最近日志活动</th>
+                <th>关联观察</th>
+              </tr>
+            </thead>
+            <tbody id="sessionRows"></tbody>
+          </table>
+        </div>
+        <div class="table-footer">
+          Token 读取最近日志计数，包含缓存输入；不换算 GB
+          或订阅额度。缺失计数显示「—」。监控期间增量为所有已记录时段，独立于上方网络时间筛选。
+        </div>
+      </section>
+      <section id="reports" class="panel report-panel" aria-labelledby="reportsHeading">
+        <div class="panel-heading history-heading">
+          <div><h2 id="reportsHeading">本地日报与周报</h2><p>记录用量、主要进程、高峰时段和采集缺口</p></div>
+          <div class="history-controls">
+            <label class="sr-only" for="reportKind">报告类型</label><select id="reportKind"><option value="day">日报</option><option value="week">周报</option></select>
+            <label class="sr-only" for="reportDate">报告日期</label><input id="reportDate" type="date" required />
+            <button id="refreshReport" type="button" class="button secondary small">刷新报告</button><button id="exportReport" type="button" class="button secondary small" disabled>↓ 导出报告</button>
+          </div>
+        </div>
+        <p id="reportStatus" class="history-status" role="status"></p><div id="reportPreview" class="report-preview"></div>
+        <p class="history-footnote">报告只在本机生成，包含进程名称与用量。导出的 HTML 可离线查看，也可用浏览器打印为 PDF。</p>
+      </section>
+      <section id="diagnostics" class="diagnostics-grid">
+        <article class="panel">
+          <div class="panel-heading">
+            <div>
+              <h2>采集诊断</h2>
+              <p>了解数据覆盖范围与监控状态</p>
+            </div>
+          </div>
+          <dl id="diagnosticList" class="diagnostic-list"></dl>
+        </article>
+        <article class="panel">
+          <div class="panel-heading">
+            <div>
+              <h2>流量提醒</h2>
+              <p>最近 60 秒 Codex 流量超过阈值时记录</p>
+            </div>
+            <button id="notifyButton" class="button secondary small">桌面提醒</button>
+          </div>
+          <div id="alerts" class="alerts"><p class="empty">暂时没有阈值提醒</p></div>
+        </article>
+      </section>
+      <div class="method-note">
+        <strong>统计口径</strong>
+        <p>
+          Windows 原生模式记录 TCP/UDP 进程网络事件（包括回环连接）；Mihomo 模式仅覆盖其控制器中的连接。同一时刻只使用一个来源，不叠加两者。统计不是 VPN 账单或网卡总流量；丢失事件、采样缺口与离线期间不补算。切换来源会标记缺口，历史可能包含不同统计口径。不会按域名或 token 猜测会话用量。
+        </p>
+      </div>
+      <footer class="footer">
+        <span
+          >CODEX NETWATCH <span class="footer-divider">/</span> LOCAL FIRST
+          <a
+            class="project-link"
+            href="https://github.com/GloryPkqa/codex-netwatch"
+            target="_blank"
+            rel="noopener noreferrer"
+            aria-label="在 GitHub 查看项目"
+            >@GloryPkqa ↗</a
+          ></span
+        ><span id="updatedAt">正在初始化</span>
+      </footer>
+    </main>
+    <dialog id="settingsDialog">
+      <form id="settingsForm">
+        <div class="dialog-heading">
+          <h2>监控设置</h2>
+          <button type="button" id="closeSettings" class="icon-button" aria-label="关闭">✕</button>
+        </div>
+        <label for="threshold">流量提醒阈值 <span>MB / 最近 60 秒</span></label
+        ><input id="threshold" type="number" min="0.1" max="1000000" step="0.1" required />
+        <p class="help">十进制 MB。阈值仅用于提醒，不会终止连接或会话。</p>
+        <section class="capture-settings" aria-labelledby="budgetSettingsHeading">
+          <h3 id="budgetSettingsHeading">每日与每月预算</h3>
+          <label for="budgetScope">预算统计范围</label>
+          <select id="budgetScope"><option value="codex">仅 Codex</option><option value="all">全部已观测进程</option></select>
+          <div class="budget-inputs">
+            <div><label for="dailyGB">每日预算（GB）</label><input id="dailyGB" type="number" min="0" max="1000000" step="0.001" required /></div>
+            <div><label for="monthlyGB">每月预算（GB）</label><input id="monthlyGB" type="number" min="0" max="1000000" step="0.001" required /></div>
+          </div>
+          <label for="budgetWarn">预警比例（%）</label><input id="budgetWarn" type="number" min="1" max="99" step="1" required />
+          <p class="help">0 表示关闭该预算。达到预警比例和 100% 时分别提醒一次；每天及每月 1 日按预算时区重新累计。</p>
+          <p id="budgetTimeZone" class="help"></p>
+          <label class="budget-notify"><input id="budgetDesktopNotify" type="checkbox" checked /><span>预算桌面提醒（托盘运行时有效）</span></label>
+        </section>
+        <label for="retentionDays">数据保留 <span>天</span></label>
+        <input id="retentionDays" type="number" min="0" max="365" step="1" required aria-describedby="retentionHelp" />
+        <p id="retentionHelp" class="help">0 表示无限保留，不自动删除历史；1–365 表示保留天数。缩短期限会删除较早数据，延长不会恢复已删除数据。</p>
+        <section class="capture-settings">
+          <label for="captureMode">流量采集方式</label>
+          <select id="captureMode">
+            <option value="auto">自动选择</option>
+            <option value="native">Windows 原生（无需代理）</option>
+            <option value="mihomo">Mihomo / Clash 兼容接口</option>
+          </select>
+          <p id="captureStatus" class="help" role="status"></p>
+          <p class="help">本机由系统开机任务启动采集器，无需登录。全机实例固定使用 Windows 原生采集，Clash 实例固定读取 Mihomo，两个来源独立保存。</p>
+          <button id="authorizeCapture" type="button" class="button secondary">授权原生采集</button>
+        </section>
+        <div class="settings-note">
+          接口地址、采样周期及子进程范围可在
+          <code>config.local.json</code> 中设置，修改后重启生效。接口密钥通过
+          <code>MIHOMO_SECRET</code> 环境变量提供。
+        </div>
+        <section id="desktopSettings" class="desktop-settings" hidden>
+          <div>
+            <strong id="startupLabel">开机自启</strong>
+            <p class="help">登录 Windows 后在托盘启动，不弹出面板。更改立即生效。</p>
+          </div>
+          <div class="startup-control">
+            <span id="startupState">自启关闭</span>
+            <button
+              id="startupToggle"
+              class="switch"
+              type="button"
+              role="switch"
+              aria-checked="false"
+              aria-labelledby="startupLabel"
+              disabled
+            >
+              <span></span>
+            </button>
+          </div>
+        </section>
+        <div class="dialog-actions"><button class="button" type="submit">保存设置</button></div>
+        <section class="update-settings" aria-labelledby="updateHeading">
+          <div class="update-heading"><h3 id="updateHeading">应用更新</h3><button id="checkUpdate" type="button" class="button secondary small">检查更新</button></div>
+          <p id="updateStatus" class="help" role="status">仅在点击检查更新时连接 GitHub，不上传监控数据。</p>
+          <p id="updateLastResult" class="help" role="status" hidden></p>
+          <pre id="updateNotes" class="update-notes" hidden></pre>
+          <div class="update-actions"><button id="installUpdate" type="button" class="button" hidden>下载并安装</button><a id="updateRelease" target="_blank" rel="noopener noreferrer" hidden>查看发行说明 ↗</a></div>
+          <p id="updateInstallHint" class="help" hidden>安装前校验下载文件并备份程序与本地数据，随后重启。更新期间采集会短暂中断。</p>
+        </section>
+        <div class="diagnostic-export">
+          <button id="diagnosticsButton" type="button" class="button secondary">
+            导出脱敏诊断
+          </button>
+          <p class="help">
+            不含密钥、路径、域名、进程名称或会话内容。仍含运行环境与汇总用量，分享前请检查。
+          </p>
+        </div>
+        <div class="stop-section">
+          <div>
+            <strong>停止后台采集</strong>
+            <p>关闭网页不会停止采集，点击此处才会退出程序。</p>
+          </div>
+          <button id="stopButton" type="button" class="button danger">停止监控</button>
+        </div>
+      </form>
+    </dialog>
+    <dialog id="correlationDialog">
+      <div class="dialog-heading">
+        <h2>会话关联观察</h2>
+        <button id="closeCorrelation" class="icon-button" aria-label="关闭">✕</button>
+      </div>
+      <div id="correlationContent"></div>
+    </dialog>
+    <div id="toast" class="toast" role="status" hidden></div>
+  </body>
+</html>

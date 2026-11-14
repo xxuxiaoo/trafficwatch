@@ -1,0 +1,30 @@
+{
+  "port": 43128,
+  "controller": "auto",
+  "captureMode": "native",
+  "codexHome": "",
+  "intervalMs": 1000,
+  "retentionDays": 0,
+  "alertMBPerMinute": 100,
+  "includeDescendants": true,
+  "preserveRouteMetadata": true,
+  "unifiedDashboard": true,
+  "harnessApps": {
+    "codex": [
+      "codex",
+      "codex.exe",
+      "codex-code-mode-host.exe",
+      "codex-computer-use-swift.exe"
+    ],
+    "claude": [
+      "claude.exe",
+      "claude-code.exe",
+      "claude"
+    ],
+    "dsh": [
+      "dsh.exe",
+      "dsh-cli.exe",
+      "dsh"
+    ]
+  }
+}

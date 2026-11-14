@@ -1,0 +1,46 @@
+# Local observations and credentials
+data/
+logs/
+backups/
+viewer-cache/
+test-output/
+config.local.json
+suite-settings.json
+.env
+.env.*
+!.env.example
+*.sqlite
+*.sqlite-*
+*.db
+*.db-*
+*.log
+*.jsonl
+*.csv
+*.tsv
+*.pcap
+*.pcapng
+*.etl
+*.dmp
+*.pem
+*.key
+*.pfx
+
+# Generated dependencies, packages and Windows binaries
+.build/
+dist/
+runtime/
+node_modules/
+*.exe
+*.dll
+*.ico
+*.zip
+*.nupkg
+*-verification.json
+*-result.json
+release-manifest.json
+
+# Editor files
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/

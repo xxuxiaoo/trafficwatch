@@ -1,0 +1,63 @@
+import { Worker } from 'node:worker_threads';
+
+// A timeout must stop the SQLite work as well as reject its HTTP promise.
+// At most one query executes per reader and abandoned requests leave the queue.
+export class HistoryReader {
+  constructor(workerData, { timeoutMs = 45000, maxQueue = 8, createWorker } = {}) {
+    this.workerData = workerData; this.timeoutMs = timeoutMs; this.maxQueue = maxQueue;
+    this.createWorker = createWorker || (() => new Worker(new URL('./overview-data.mjs', import.meta.url), { workerData, resourceLimits: { maxOldGenerationSizeMb: 192 } }));
+    this.queue = []; this.sequence = 0; this.restarts = 0; this.completed = 0; this.closed = false;
+  }
+  query(payload, { signal } = {}) {
+    if (this.closed || signal?.aborted) return Promise.reject(new Error('request_cancelled'));
+    const key = JSON.stringify(payload);
+    let task = [this.active, ...this.queue].find((item) => item?.key === key);
+    if (!task) {
+      if (this.queue.length >= this.maxQueue) return Promise.reject(new Error('history_busy'));
+      task = { key, payload, id: ++this.sequence, subscribers: new Set() }; this.queue.push(task);
+    }
+    return new Promise((resolve, reject) => {
+      const subscriber = { resolve, reject };
+      const abort = () => {
+        task.subscribers.delete(subscriber); reject(new Error('request_cancelled'));
+        if (!task.subscribers.size) {
+          this.queue = this.queue.filter((item) => item !== task);
+          if (task === this.active) this.finish(new Error('request_cancelled'), undefined, true);
+        }
+      };
+      subscriber.cleanup = () => signal?.removeEventListener('abort', abort);
+      task.subscribers.add(subscriber); signal?.addEventListener('abort', abort, { once: true }); this.pump();
+    });
+  }
+  pump() {
+    if (this.closed || this.active || this.restarting || !this.queue.length) return;
+    if (!this.worker) {
+      const worker = this.worker = this.createWorker();
+      worker.on('message', ({ id, data, error }) => {
+        if (this.worker === worker && id === this.active?.id) { this.completed++; this.finish(error ? new Error(error) : null, data); }
+      });
+      const failed = () => { if (this.worker === worker) this.finish(new Error('reader_unavailable'), undefined, true); };
+      worker.on('error', failed); worker.on('exit', failed);
+    }
+    this.active = this.queue.shift();
+    this.timer = setTimeout(() => this.finish(new Error('history_timeout'), undefined, true), this.timeoutMs);
+    this.worker.postMessage({ ...this.active.payload, id: this.active.id, now: Date.now() });
+  }
+  finish(error, data, replace = false) {
+    clearTimeout(this.timer);
+    const active = this.active; this.active = null;
+    if (active) for (const subscriber of active.subscribers) {
+      subscriber.cleanup(); error ? subscriber.reject(error) : subscriber.resolve(data);
+    }
+    if (replace && this.worker) {
+      const worker = this.worker; this.worker = null; this.restarting = true; this.restarts++;
+      Promise.resolve(worker.terminate()).finally(() => { this.restarting = false; this.pump(); });
+    } else this.pump();
+  }
+  stats() { return { active: Boolean(this.active), queued: this.queue.length, restarts: this.restarts, completed: this.completed }; }
+  close() {
+    this.closed = true;
+    for (const task of this.queue.splice(0)) for (const subscriber of task.subscribers) { subscriber.cleanup(); subscriber.reject(new Error('request_cancelled')); }
+    this.finish(new Error('request_cancelled'), undefined, true);
+  }
+}

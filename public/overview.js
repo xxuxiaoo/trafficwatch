@@ -1,0 +1,1111 @@
+const $ = (id) => document.getElementById(id);
+const pageNames = {
+  overview: '流量总览',
+  apps: '本机全部应用',
+  ladder: '梯子流量',
+  harness: 'Harness 用量',
+  investigate: '高峰与采集缺口',
+  settings: '设置与旧版备份',
+};
+const familyNames = { codex: 'Codex', claude: 'Claude Code', dsh: 'dsh', other: '其他应用', unknown: '待识别' };
+const evidenceNames = {
+  process: '进程信息',
+  descendant: '父子进程',
+  etw: 'Windows 网络事件',
+  etw_descendant: 'Windows 网络事件 · 子进程',
+  mihomo: 'Mihomo 进程信息',
+  none: '缺少进程证据',
+};
+let view = 'overview';
+let range = 'today';
+let selectedDate = new Date().toLocaleDateString('sv-SE', { timeZone: 'Asia/Shanghai' });
+let data = null, monthData = null, apps = null;
+let refreshTimer = 0, refreshSequence = 0, detailSequence = 0, harnessSequence = 0;
+let activeAppDetail = null, activeLadderDetail = null, activeFamily = 'codex', harnessLoadedKey = '';
+let appDetailData = null, ladderDetailData = null;
+let liveTimer = 0, livePacket = null, detailHistory = [], harnessResult = null;
+let harnessLoadedAt = 0;
+let preferences = readPreferences();
+let historyAbort, detailAbort, harnessAbort, liveAbort, refreshPromise, refreshKey = '', dataKey = '';
+let historyState = 'loading', historyError = '', monthLoadedAt = 0, appPage = 0, settingsInitialized = false;
+const snapshotCache = new Map();
+const queryKey = () => `${range}|${range === 'day' ? selectedDate : new Date().toLocaleDateString('sv-SE', { timeZone: 'Asia/Shanghai' })}`;
+const isCancelled = (error) => error?.name === 'AbortError' || error?.message === 'request_cancelled';
+function hideChartTooltip() { if (chartTooltip) chartTooltip.hidden = true; }
+function saveSnapshot(key, value) {
+  snapshotCache.delete(key); snapshotCache.set(key,value);
+  while (snapshotCache.size > 6) snapshotCache.delete(snapshotCache.keys().next().value);
+  try {
+    const content = JSON.stringify([...snapshotCache]);
+    if (content.length < 1200000) localStorage.setItem('trafficwatch-snapshots-v7',content);
+  } catch { /* A full or disabled browser store never prevents live history. */ }
+}
+try {
+  for (const [key,value] of JSON.parse(localStorage.getItem('trafficwatch-snapshots-v7') || '[]').slice(-6)) {
+    if (value?.machine?.range && value?.clash?.range) snapshotCache.set(key,value);
+  }
+} catch { /* Ignore a stale browser snapshot. */ }
+
+function readPreferences() {
+  try {
+    const value = JSON.parse(localStorage.getItem('trafficwatch-unified-settings') || '{}');
+    return {
+      monthlyMachineGb: Number(value.monthlyMachineGb) || 0,
+      monthlyProxyGb: Number(value.monthlyProxyGb) || 0,
+      notificationsEnabled: value.notificationsEnabled === true,
+    };
+  } catch { return { monthlyMachineGb: 0, monthlyProxyGb: 0, notificationsEnabled: false }; }
+}
+function savePreferences() {
+  try { localStorage.setItem('trafficwatch-unified-settings', JSON.stringify(preferences)); } catch { /* Browser storage is optional. */ }
+}
+function bytes(value, unit = '') {
+  if (value === null || value === undefined || !Number.isFinite(Number(value))) return '—';
+  let amount = Number(value), index = 0;
+  const labels = ['B', 'KB', 'MB', 'GB', 'TB', 'PB'];
+  while (Math.abs(amount) >= 1000 && index < labels.length - 1) { amount /= 1000; index++; }
+  const digits = index === 0 ? 0 : amount >= 100 ? 1 : 2;
+  return `${amount.toLocaleString('zh-CN', { maximumFractionDigits: digits })} ${labels[index]}${unit}`;
+}
+const total = (row) => Number(row?.up || 0) + Number(row?.down || 0);
+const timeFormat = new Intl.DateTimeFormat('zh-CN', {
+  timeZone: 'Asia/Shanghai', month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit', hour12: false,
+});
+const dateTimeFormat = new Intl.DateTimeFormat('zh-CN', {
+  timeZone: 'Asia/Shanghai', year: 'numeric', month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit', second: '2-digit', hour12: false,
+});
+function time(value, includeDate = false) {
+  if (!Number.isFinite(Number(value)) || Number(value) <= 0) return '无记录';
+  return (includeDate ? dateTimeFormat : timeFormat).format(Number(value));
+}
+function duration(ms) {
+  if (!Number.isFinite(Number(ms)) || ms < 0) return '—';
+  const minutes = Math.round(ms / 60000);
+  if (minutes < 60) return `${minutes} 分钟`;
+  const hours = Math.floor(minutes / 60), remainder = minutes % 60;
+  return remainder ? `${hours} 小时 ${remainder} 分` : `${hours} 小时`;
+}
+function percent(value) {
+  return Number.isFinite(value) ? `${value.toFixed(1)}%` : '—';
+}
+function node(tag, text, className = '') {
+  const item = document.createElement(tag);
+  if (text !== undefined && text !== null) item.textContent = text;
+  if (className) item.className = className;
+  return item;
+}
+function showToast(message) {
+  $('toast').textContent = message;
+  $('toast').hidden = false;
+  clearTimeout(showToast.timer);
+  showToast.timer = setTimeout(() => ($('toast').hidden = true), 4500);
+}
+function rangeParams() {
+  const params = new URLSearchParams({ range });
+  if (range === 'day') params.set('date', selectedDate);
+  return params;
+}
+async function api(url, options = {}) {
+  const response = await fetch(url, {
+    ...options,
+    signal: options.signal ? AbortSignal.any([options.signal, AbortSignal.timeout(options.timeoutMs || 55000)]) : AbortSignal.timeout(options.timeoutMs || 55000),
+    headers: { 'X-Codex-Flow': '1', ...(options.body ? { 'Content-Type': 'application/json' } : {}), ...options.headers },
+  });
+  if (!response.ok) {
+    const value = await response.json().catch(() => ({}));
+    const labels = { history_timeout: '历史查询超时，请重试', history_busy: '历史查询繁忙，请稍后重试', history_unavailable: '历史暂时不可读', invalid_range: '日期或时段无效' };
+    throw new Error(labels[value.error] || value.error || `本机服务响应 ${response.status}`);
+  }
+  return response.json();
+}
+function requestDetail(lane, filters = {}, options = {}) {
+  const params = rangeParams();
+  params.set('lane', lane);
+  for (const [key, value] of Object.entries(filters)) {
+    if (value !== undefined && value !== null && value !== '') params.set(key, String(value));
+  }
+  return api(`/api/detail?${params}`, options);
+}
+function rangeLabel() {
+  if (range === 'today') return '今天 · 北京时间';
+  if (range === 'day') return `${selectedDate} · 北京时间`;
+  if (range === 'all') return '全部已保留记录';
+  return `最近 ${range === '24h' ? '24 小时' : range === '7d' ? '7 天' : '30 天'}`;
+}
+function setView(next) {
+  if (!Object.hasOwn(pageNames, next)) return;
+  hideChartTooltip();
+  for (const canvas of document.querySelectorAll('canvas')) {
+    canvas._dispose?.();
+    // Hidden pages need no GPU backing store. Their data will redraw on entry.
+    if (canvas.closest('[data-view]')?.dataset.view !== next) { canvas.width = 1; canvas.height = 1; }
+  }
+  view = next;
+  history.replaceState(null, '', `#${view}`);
+  for (const section of document.querySelectorAll('[data-view]')) section.hidden = section.dataset.view !== view;
+  for (const button of document.querySelectorAll('[data-view-button]')) {
+    if (button.dataset.viewButton === view) button.setAttribute('aria-current', 'page');
+    else button.removeAttribute('aria-current');
+  }
+  $('pageTitle').textContent = view === 'overview' ? '流量总览' : pageNames[view];
+  if (view === 'overview') renderOverview();
+  if (view === 'apps') renderApps();
+  if (view === 'ladder') renderLadder();
+  if (view === 'harness') { renderHarnessTabs(); if (harnessResult?.[0] === activeFamily) renderHarness(...harnessResult); if (dataKey === queryKey()) loadHarness(activeFamily); }
+  if (view === 'investigate') renderInvestigation();
+  if (view === 'settings') renderSettings();
+}
+for (const button of document.querySelectorAll('[data-view-button]')) button.addEventListener('click', () => setView(button.dataset.viewButton));
+
+function setSourceStatus(id, live, expected) {
+  const target = $(id);
+  const fresh = live?.state === 'connected' && live.capture?.active === expected &&
+    Number.isFinite(live.lastAt) && Date.now() >= live.lastAt && Date.now() - live.lastAt < (live.intervalMs || 1000) + 6000;
+  const mismatch = live && live.capture?.active && live.capture.active !== expected;
+  const label = fresh ? '正在采集' : mismatch ? '采集来源不符' : live ? '采集已断开' : '采集未连接';
+  target.className = `status-chip ${expected === 'mihomo' ? 'proxy-chip' : ''} ${fresh ? 'is-live' : 'is-offline'}`;
+  const speed = expected === 'native' ? Number(live?.allUpRate || 0) + Number(live?.allDownRate || 0) : total(live?.routeRates?.proxy);
+  target.replaceChildren(node('i'), node('span', `${expected === 'native' ? '本机' : '梯子'} · ${fresh ? bytes(speed, '/s') : label}`));
+  target.title = fresh ? `最近采样 ${time(live.lastAt, true)}` : (live?.error || '当前显示历史记录');
+  return fresh;
+}
+function renderHeader() {
+  $('pageTitle').textContent = pageNames[view];
+  $('selectedDate').max = new Date().toLocaleDateString('sv-SE', { timeZone: 'Asia/Shanghai' });
+  const machineLive = setSourceStatus('machineStatus', livePacket ? livePacket.machine : data?.live?.machine, 'native');
+  const clashLive = setSourceStatus('clashStatus', livePacket ? livePacket.clash : data?.live?.clash, 'mihomo');
+  $('sidebarCollectorDot').className = machineLive && clashLive ? 'is-live' : 'is-offline';
+  $('sidebarCollectorText').textContent = machineLive && clashLive ? '两路采集均在运行' : '历史可看 · 部分采集未运行';
+  $('rangeSummary').textContent = `${rangeLabel()} · ${historyState === 'loading' ? '正在更新' : historyState === 'error' ? '更新失败，保留上次记录' : '汇总刷新'} ${data?.generatedAt ? time(data.generatedAt, true) : '—'}`;
+  $('updatedAt').textContent = data?.generatedAt ? `最近更新 ${time(data.generatedAt, true)}` : '等待本机数据';
+  $('historyStatus').textContent = historyState === 'loading' ? (dataKey === queryKey() ? '正在更新统计…' : '正在读取所选时间…') : historyState === 'error' ? `更新未完成：${historyError}` : `${rangeLabel()} · ${data?.generatedAt ? time(data.generatedAt) + ' 更新' : '等待记录'}`;
+  $('refreshButton').setAttribute('aria-busy', String(historyState === 'loading'));
+}
+function renderTotals(target, row, onSelect) {
+  target.replaceChildren();
+  const values = [
+    ['代理出口', row.proxy, 'proxy'],
+    ['DIRECT 直连', row.direct, 'direct'],
+    ['出口未知', row.unknown, 'unknown'],
+  ];
+  for (const [name, value, route] of values) {
+    const item = node('button', undefined, 'route-total'); item.type = 'button';
+    item.append(node('span', name), node('strong', bytes(total(value))));
+    item.addEventListener('click', () => onSelect?.(route));
+    target.append(item);
+  }
+  const unassigned = node('button', undefined, 'route-total unassigned-total'); unassigned.type = 'button';
+  unassigned.append(node('span', '未归因差额'), node('strong', bytes(total(row.unassigned))));
+  unassigned.addEventListener('click', () => showToast('这个差额没有对应连接证据，不能强行分配给应用或节点。'));
+  target.append(unassigned);
+}
+const clockFormat = new Intl.DateTimeFormat('zh-CN', { timeZone: 'Asia/Shanghai', hour: '2-digit', minute: '2-digit', hour12: false });
+const dayFormat = new Intl.DateTimeFormat('zh-CN', { timeZone: 'Asia/Shanghai', month: '2-digit', day: '2-digit' });
+const gapReasons = { collector_restart: '采集程序重启', initial_baseline: '首次采集基线', source_unavailable: '采集源未连接', collector_error: '采集异常', source_changed: '切换采集来源', observer_unavailable: '进程信息暂不可用', sampling_delay: '采样延迟', native_events_lost: '系统事件丢失', clock_changed: '系统时间调整' };
+const directionColors = { up: '#d58526', down: '#287ca5' };
+let chartTooltip;
+function chartSeries(name, rows, source, route = '') {
+  const shortNames = { '本机已观测': '本机', '本机进程记录': '本机', '梯子代理出口': '梯子', '代理出口': '代理', 'DIRECT 直连': '直连', '出口未知': '未知' };
+  return { name, shortName: shortNames[name] || name, source, rows: (rows || []).map((row) => ({ at: row.at, ...(route ? row[route] : row) })) };
+}
+function mergedGapMs(gaps, from, to) {
+  let end = from, amount = 0;
+  for (const gap of [...gaps].sort((a, b) => a.gapFrom - b.gapFrom)) {
+    const start = Math.max(from, gap.gapFrom, end), stop = Math.min(to, gap.gapTo);
+    if (stop > start) { amount += stop - start; end = stop; }
+  }
+  return amount;
+}
+function chartModel(series, selectedRange, fullRange) {
+  const baseInterval = selectedRange.intervalMs || 3600000;
+  const intervalMs = baseInterval * Math.max(1, Math.ceil((selectedRange.to-selectedRange.from) / baseInterval / 240));
+  const observed = series.flatMap((line) => [...line.rows, ...(line.source?.timeline || [])])
+    .filter((row) => row.at + intervalMs > selectedRange.from && row.at < selectedRange.to);
+  const first = fullRange || !observed.length ? selectedRange.from : Math.max(selectedRange.from, Math.min(...observed.map((row) => row.at)));
+  const start = Math.floor(first / intervalMs) * intervalMs;
+  // Always include intermediate slots and the latest selected time, even if the collector is offline.
+  const count = Math.max(1, Math.ceil((selectedRange.to - start) / intervalMs));
+  const maps = series.map((line) => {
+    const values = new Map();
+    for (const row of line.rows) {
+      const at = Math.floor(row.at / intervalMs) * intervalMs;
+      const bucket = values.get(at) || { up: 0, down: 0 };
+      bucket.up += Number(row.up || 0); bucket.down += Number(row.down || 0); values.set(at, bucket);
+    }
+    return values;
+  });
+  const points = Array.from({ length: count }, (_, index) => {
+    const at = start + index * intervalMs, from = Math.max(at, selectedRange.from), to = Math.min(at + intervalMs, selectedRange.to);
+    const values = series.map((line, i) => {
+      const row = maps[i].get(at), source = line.source;
+      const gaps = (source?.gapDetails || []).filter((gap) => gap.gapFrom < to && gap.gapTo > from);
+      const gapMs = mergedGapMs(gaps, from, to);
+      const sampleWidth = source?.range?.intervalMs || intervalMs;
+      // Detail traffic is minute resolution, while coverage may be hourly. A missing
+      // process row alone is never evidence of a stopped collector or of no real traffic.
+      const sampled = (source?.timeline || []).some((item) => item.samples > 0 && item.at < to && item.at + sampleWidth > from);
+      const outsideHistory = source?.firstAt > to || source?.lastAt < from;
+      const missing = !row && (source?.available === false || outsideHistory || !sampled || gapMs >= to - from);
+      const partial = !missing && gapMs > 0;
+      return { ...row, value: missing ? null : total(row), state: missing ? 'missing' : partial ? 'partial' : 'observed', gaps, gapMs };
+    });
+    return { at, from, to, values, current: to < at + intervalMs && Date.now() - to < 90000 };
+  });
+  return { intervalMs, points };
+}
+function drawChart(canvas, series, onSelect, options = {}) {
+  if (!canvas || !canvas.closest('[data-view]') || canvas.closest('[data-view]').hidden) return;
+  canvas._dispose?.();
+  const selectedRange = options.range;
+  if (!selectedRange || selectedRange.to <= selectedRange.from) return;
+  if (chartTooltip?.dataset.chart === canvas.id) chartTooltip.hidden = true;
+  const wrap = canvas.closest('.chart-wrap');
+  let plot = canvas.parentElement;
+  if (!plot.classList.contains('chart-plot')) {
+    plot = node('div', undefined, 'chart-plot'); wrap.append(plot); plot.append(canvas);
+    const ticks = options.ticks ? $(options.ticks) : node('div', undefined, 'chart-ticks');
+    plot.append(ticks);
+    const caption = node('div', undefined, 'chart-caption'); caption.id = `${canvas.id}Caption`;
+    wrap.after(caption); canvas.setAttribute('aria-describedby', caption.id);
+  }
+  const model = chartModel(series, selectedRange, options.fullRange);
+  const { points, intervalMs } = model;
+  const pad = { left: 60, right: 16, top: 26, bottom: series.length > 1 ? 29 : 19 };
+  const minSlot = intervalMs >= 3600000 ? Math.max(58, series.length * 30 + 16) : Math.max(12, series.length * 9 + 4);
+  const width = Math.max(240, wrap.clientWidth || 400);
+  const logicalWidth = Math.max(width, pad.left + pad.right + points.length * minSlot);
+  plot.style.width = `${logicalWidth}px`;
+  canvas.style.width = `${width}px`;
+  const height = Math.max(120, canvas.clientHeight || 210), innerHeight = height - pad.top - pad.bottom;
+  const innerWidth = logicalWidth - pad.left - pad.right, slotWidth = innerWidth / points.length;
+  const dpr = Math.min(2, window.devicePixelRatio || 1);
+  canvas.width = Math.round(width * dpr); canvas.height = Math.round(height * dpr);
+  const ctx = canvas.getContext('2d'); ctx.scale(dpr, dpr);
+  const maximum = Math.max(0, ...points.flatMap((point) => point.values.map((value) => value.value || 0)));
+  const rawStep = maximum / 3, magnitude = 10 ** Math.floor(Math.log10(rawStep || 1));
+  const step = [1, 2, 2.5, 5, 10].find((value) => value * magnitude >= rawStep) * magnitude;
+  const scale = step * 3;
+  const groupWidth = Math.min(slotWidth * .68, series.length === 1 ? 52 : 72), barGap = series.length > 1 ? Math.min(4, groupWidth * .07) : 0;
+  const barWidth = (groupWidth - (series.length - 1) * barGap) / series.length;
+  points.forEach((point, i) => { point.x = pad.left + (i + .5) * slotWidth; });
+  canvas._plotPoints = points; canvas._chartModel = { ...model, range: selectedRange, series: series.map(({ name, shortName }) => ({ name, shortName })), directions: directionColors, width, logicalWidth, height, slotWidth, scale, pad, groupWidth, barWidth, barGap };
+  canvas.tabIndex = 0;
+  const ticks = plot.querySelector('.chart-ticks'); ticks.replaceChildren();
+  const labelEvery = Math.max(1, [1, 2, 3, 5, 10, 15, 30, 60].find((n) => n * slotWidth >= (intervalMs >= 3600000 ? 44 : 42)) || 60);
+  for (let i = 0; i < points.length; i++) {
+    const point = points[i], tick = node('span', undefined, 'chart-tick');
+    const show = i % labelEvery === 0 || (i === points.length - 1 && i % labelEvery > labelEvery / 2);
+    tick.style.left = `${point.x}px`; tick.title = `${time(point.from, true)} 至 ${time(point.to, true)}`;
+    if (show) {
+      tick.append(node('span', clockFormat.format(point.at)));
+      if (intervalMs >= 6 * 3600000 || i === 0 || dayFormat.format(point.at) !== dayFormat.format(points[Math.max(0, i - labelEvery)].at)) tick.append(node('small', dayFormat.format(point.at)));
+    } else tick.classList.add('tick-unlabelled');
+    ticks.append(tick);
+  }
+  const caption = $(`${canvas.id}Caption`); caption.replaceChildren();
+  const unit = intervalMs < 3600000 ? `${intervalMs / 60000} 分钟` : intervalMs < 86400000 ? `${intervalMs / 3600000} 小时` : `${intervalMs / 86400000} 天`;
+  caption.append(node('span', `${time(points[0].from)}—${time(points.at(-1).to)} · 北京时间 · 每组 ${unit}`, 'chart-range'));
+  for (const [label, color] of [['↑ 上传', directionColors.up], ['↓ 下载', directionColors.down]]) {
+    const key = node('span', label, 'bar-legend-item'); key.style.setProperty('--legend', color); caption.append(key);
+  }
+  caption.append(node('span', series.length > 1 ? `柱子从左到右：${series.map((line) => line.shortName).join(' / ')}` : series[0].name, 'chart-column-order'));
+  if (points.some((point) => point.values.some((value) => value.state === 'missing'))) caption.append(node('span', '未采集 ≠ 0 流量', 'bar-legend-item missing-key'));
+  if (points.some((point) => point.values.some((value) => value.state === 'partial'))) caption.append(node('span', '部分缺采', 'bar-legend-item partial-key'));
+  if (points.some((point) => point.current)) caption.append(node('span', '当前时段尚未结束', 'chart-current-note'));
+  if (logicalWidth > width + 2) caption.append(node('span', '↔ 横向滚动可看完整时间', 'chart-scroll-note'));
+  const draw = (active = -1) => {
+    ctx.clearRect(0, 0, width, height);
+    ctx.font = '11px Segoe UI, Microsoft YaHei UI, sans-serif'; ctx.textAlign = 'right';
+    for (let i = 0; i <= 3; i++) {
+      const y = pad.top + innerHeight * i / 3;
+      ctx.strokeStyle = '#e8ece9'; ctx.lineWidth = 1;
+      ctx.beginPath(); ctx.moveTo(pad.left, y); ctx.lineTo(width - pad.right, y); ctx.stroke();
+      if (maximum || i === 3) { ctx.fillStyle = '#7c8781'; ctx.fillText(bytes(scale * (3 - i) / 3), pad.left - 8, y + 4); }
+    }
+    ctx.save(); ctx.beginPath(); ctx.rect(pad.left,0,width-pad.left-pad.right,height); ctx.clip(); ctx.translate(-wrap.scrollLeft,0);
+    const visibleStart = Math.max(0, Math.floor(wrap.scrollLeft / slotWidth) - 1), visibleEnd = Math.min(points.length, visibleStart + Math.ceil(width / slotWidth) + 3);
+    points.slice(visibleStart, visibleEnd).forEach((point, localIndex) => {
+      const i = localIndex + visibleStart;
+      point.values.forEach((value, s) => {
+        const x = point.x - groupWidth / 2 + s * (barWidth + barGap), baseline = pad.top + innerHeight;
+        if (value.state === 'missing') {
+          ctx.save(); ctx.beginPath(); ctx.rect(x, pad.top, barWidth, innerHeight); ctx.clip();
+          ctx.fillStyle = '#f3f5f4'; ctx.fillRect(x, pad.top, barWidth, innerHeight);
+          ctx.strokeStyle = '#d8dfda'; ctx.lineWidth = 1;
+          for (let dy = -barWidth; dy < innerHeight + barWidth; dy += 8) {
+            ctx.beginPath(); ctx.moveTo(x, pad.top + dy); ctx.lineTo(x + barWidth, pad.top + dy + barWidth); ctx.stroke();
+          }
+          ctx.restore();
+          if (series.length === 1 && slotWidth >= 52) { ctx.fillStyle = '#839087'; ctx.textAlign = 'center'; ctx.fillText('未采集', point.x, pad.top - 9); }
+        } else {
+          const barHeight = value.value > 0 ? Math.max(1, value.value / scale * innerHeight) : 0;
+          if (barHeight > 0) {
+            const downHeight = barHeight * Number(value.down || 0) / value.value;
+            ctx.save(); ctx.beginPath();
+            ctx.roundRect(x, baseline - barHeight, barWidth, barHeight, [Math.min(4, barWidth / 3, barHeight / 2), Math.min(4, barWidth / 3, barHeight / 2), 0, 0]); ctx.clip();
+            ctx.fillStyle = directionColors.down; ctx.fillRect(x, baseline - downHeight, barWidth, downHeight);
+            ctx.fillStyle = directionColors.up; ctx.fillRect(x, baseline - barHeight, barWidth, barHeight - downHeight);
+            ctx.restore();
+          } else { ctx.fillStyle = '#b5c5bb'; ctx.fillRect(x, baseline - 1, barWidth, 1); }
+          if (value.state === 'partial') { ctx.fillStyle = '#b58033'; ctx.beginPath(); ctx.arc(x + barWidth / 2, baseline + 8, 2.5, 0, Math.PI * 2); ctx.fill(); }
+          if (series.length === 1 && slotWidth >= 62 && value.value > 0) {
+            ctx.textAlign = 'center'; ctx.fillStyle = '#556f60'; ctx.fillText(bytes(value.value), point.x, baseline - barHeight - 8);
+          }
+        }
+        if (series.length > 1 && barWidth >= 20) {
+          ctx.textAlign = 'center'; ctx.fillStyle = '#7d8e81'; ctx.font = '9px Segoe UI, Microsoft YaHei UI, sans-serif';
+          ctx.fillText(series[s].shortName, x + barWidth / 2, baseline + 23);
+          ctx.font = '11px Segoe UI, Microsoft YaHei UI, sans-serif';
+        }
+      });
+      if (point.current) {
+        ctx.strokeStyle = '#90aa9a'; ctx.setLineDash([3, 3]); ctx.lineWidth = 1;
+        ctx.strokeRect(point.x - groupWidth / 2 - 3, pad.top - 7, groupWidth + 6, innerHeight + 11); ctx.setLineDash([]);
+      }
+    });
+    ctx.restore();
+    if (!maximum && !points.every((point) => point.values.every((value) => value.state === 'missing'))) {
+      ctx.textAlign = 'center'; ctx.fillStyle = '#728178'; ctx.fillText('该范围未记录到匹配流量', pad.left + innerWidth / 2, pad.top + 24);
+    }
+  };
+  let active = -1, hoverFrame = 0, scrollFrame = 0, pointer;
+  const marker = plot.querySelector('.chart-hover-marker') || node('div',undefined,'chart-hover-marker');
+  plot.append(marker); marker.hidden = true;
+  const hideTooltip = () => { cancelAnimationFrame(hoverFrame); hoverFrame = 0; marker.hidden = true; active = -1; if (chartTooltip?.dataset.chart === canvas.id) chartTooltip.hidden = true; };
+  const showPoint = (index, clientX, clientY) => {
+    if (index < 0 || index >= points.length) { hideTooltip(); return; }
+    const point = points[index];
+    if (!chartTooltip) { chartTooltip = node('div', undefined, 'chart-tooltip'); chartTooltip.id = 'chartTooltip'; chartTooltip.setAttribute('role', 'tooltip'); document.body.append(chartTooltip); }
+    if (active !== index || chartTooltip.dataset.chart !== canvas.id || chartTooltip.hidden) {
+    active = index; marker.hidden = false; marker.style.left = `${point.x-slotWidth/2+1}px`; marker.style.width = `${slotWidth-2}px`;
+    chartTooltip.dataset.chart = canvas.id; chartTooltip.replaceChildren();
+    const endLabel = `${dayFormat.format(point.from) !== dayFormat.format(point.to) ? dayFormat.format(point.to) + ' ' : ''}${clockFormat.format(point.to)}`;
+    chartTooltip.append(node('strong', `${dayFormat.format(point.from)} ${clockFormat.format(point.from)}—${endLabel}${point.current ? ' · 进行中' : ''}`, 'chart-tooltip-time'));
+    point.values.forEach((value, s) => {
+      const row = node('div', undefined, 'chart-tooltip-series');
+      row.append(node('span', series[s].name, 'chart-tooltip-name'));
+      row.append(node('strong', value.state === 'missing' ? '未采集 · 用量未知' : `合计 ${bytes(value.value)}`));
+      if (value.state !== 'missing') {
+        const directions = node('div', undefined, 'chart-tooltip-directions');
+        for (const [label, amount, color] of [['↑ 上传', value.up || 0, directionColors.up], ['↓ 下载', value.down || 0, directionColors.down]]) {
+          const item = node('span', `${label} ${bytes(amount)}`, 'bar-legend-item'); item.style.setProperty('--legend', color); directions.append(item);
+        }
+        row.append(directions);
+        if (!value.value) row.append(node('small', '未记录到匹配流量'));
+      }
+      if (value.gaps.length) {
+        const reasons = [...new Set(value.gaps.map((gap) => gapReasons[gap.reason] || gap.reason))].join('、');
+        row.append(node('small', `${value.state === 'partial' ? '部分缺采' : '缺口原因'}：${reasons}（本组内约 ${Math.max(1, Math.round(value.gapMs / 1000))} 秒）`, 'chart-tooltip-gap'));
+      }
+      chartTooltip.append(row);
+    });
+    chartTooltip.append(node('small', point.values.every((value) => value.state === 'missing') ? '点击查看采集缺口，不能将此时段当成零流量' : '点击柱子，查看这个时段的应用与连接', 'chart-tooltip-hint'));
+    }
+    chartTooltip.hidden = false;
+    chartTooltip.style.left = `${Math.max(8, Math.min(window.innerWidth - chartTooltip.offsetWidth - 10, clientX + 14))}px`;
+    chartTooltip.style.top = `${Math.max(8, Math.min(window.innerHeight - chartTooltip.offsetHeight - 10, clientY + 16))}px`;
+  };
+  const hit = (event) => {
+    const bounds = canvas.getBoundingClientRect(), x = event.clientX - bounds.left, y = event.clientY - bounds.top;
+    if (x < pad.left || x >= width - pad.right || y < pad.top - 12 || y > height - 2) return -1;
+    return Math.floor((x + wrap.scrollLeft - pad.left) / slotWidth);
+  };
+  const select = (index) => {
+    const point = points[index]; if (!point) return;
+    hideTooltip();
+    if (point.values.every((value) => value.state === 'missing')) {
+      showToast(`${time(point.from)} 至 ${time(point.to)} 没有采集记录，实际用量未知。`);
+      setView('investigate'); document.querySelector('.gap-section').scrollIntoView({ behavior: 'smooth', block: 'start' });
+    } else onSelect?.(point);
+  };
+  canvas.onmousemove = (event) => {
+    pointer = { clientX: event.clientX, clientY: event.clientY };
+    if (!hoverFrame) hoverFrame = requestAnimationFrame(() => { hoverFrame = 0; showPoint(hit(pointer),pointer.clientX,pointer.clientY); });
+  };
+  canvas.onmouseleave = hideTooltip; canvas.onblur = hideTooltip;
+  canvas.onclick = (event) => select(hit(event));
+  canvas.onkeydown = (event) => {
+    if (['ArrowLeft', 'ArrowRight', 'Home', 'End'].includes(event.key)) {
+      event.preventDefault();
+      const index = event.key === 'Home' ? 0 : event.key === 'End' ? points.length - 1 : Math.min(points.length - 1, Math.max(0, active < 0 ? 0 : active + (event.key === 'ArrowRight' ? 1 : -1)));
+      wrap.scrollLeft = Math.max(0, points[index].x - wrap.clientWidth / 2);
+      const bounds = canvas.getBoundingClientRect(); showPoint(index, bounds.left + points[index].x - wrap.scrollLeft, bounds.top + height / 2);
+    } else if (event.key === 'Enter' || event.key === ' ') { event.preventDefault(); select(active < 0 ? 0 : active); }
+    else if (event.key === 'Escape') hideTooltip();
+  };
+  wrap.onscroll = () => { if (document.activeElement !== canvas) hideTooltip(); if (!scrollFrame) scrollFrame = requestAnimationFrame(() => {scrollFrame=0;draw();}); };
+  canvas._dispose = () => { cancelAnimationFrame(hoverFrame); cancelAnimationFrame(scrollFrame); marker.hidden = true; };
+  canvas.removeAttribute('title'); draw();
+}
+function renderOverview() {
+  if (!data?.machine || !data?.clash) return;
+  const machine = data.machine, clash = data.clash;
+  renderHeader();
+  $('overviewMachine').textContent = machine.available ? bytes(total(machine.totals)) : '不可用';
+  $('overviewMachineDirections').textContent = `↑ ${bytes(machine.totals?.up)}　↓ ${bytes(machine.totals?.down)}`;
+  $('overviewProxy').textContent = clash.available ? bytes(total(clash.groups?.proxy)) : '不可用';
+  $('overviewProxyDirections').textContent = `↑ ${bytes(clash.groups?.proxy?.up)}　↓ ${bytes(clash.groups?.proxy?.down)}`;
+  const familyTotals = machine.familyTotals || {};
+  const harnessBytes = ['codex', 'claude', 'dsh'].reduce((n, key) => n + total(familyTotals[key]), 0);
+  $('overviewHarness').textContent = bytes(harnessBytes);
+  $('overviewHarnessBreakdown').textContent = ['codex', 'claude', 'dsh'].map((key) => `${familyNames[key]} ${bytes(total(familyTotals[key]))}`).join('　');
+  const unknownBytes = total(familyTotals.unknown) + total(machine.unassigned);
+  $('overviewUnknown').textContent = bytes(unknownBytes);
+  $('overviewUnknownNote').textContent = `待识别进程 ${bytes(total(familyTotals.unknown))} · 未归因差额 ${bytes(total(machine.unassigned))}`;
+  if (machine.detailReady === false) {
+    $('overviewHarness').textContent = '统计中'; $('overviewUnknown').textContent = '统计中';
+    $('overviewHarnessBreakdown').textContent = '总量已就绪，应用归因正在加载'; $('overviewUnknownNote').textContent = '详细统计加载后显示';
+  }
+  $('measurementNote').textContent = '本机总量来自 Windows 进程事件；梯子只计 Clash 已归因到代理节点的连接。两种位置分别记数，代理进程与应用可重复出现，不要相加当账单。';
+
+  drawChart($('overviewChart'), [
+    chartSeries('本机已观测', machine.timeline, machine),
+    chartSeries('梯子代理出口', clash.routeTimeline, clash, 'proxy'),
+  ], (point) => showTimeDetail(point.from, point.to, '流量时段明细'), {
+    range: machine.range || clash.range, ticks: 'chartTicks',
+  });
+  renderPeaks($('peakRows'), machine.peaks, 'machine');
+  renderCompactPrograms($('topProcessRows'), machine.allPrograms, 6, (row) => selectApp(row));
+  if (machine.detailReady === false) $('topProcessRows').replaceChildren(node('p','正在汇总应用，当前总量已可查看…','empty-state'));
+  renderIntegrity(machine, clash);
+  renderOverviewWarnings(machine, clash);
+  renderBudgetStrip();
+}
+function renderPeaks(target, rows, source) {
+  target.replaceChildren();
+  if (!rows?.length) { target.append(node('p', '没有可显示的时段采样。', 'empty-state')); return; }
+  const width = 5 * 60000;
+  for (const row of rows.slice(0, 8)) {
+    const button = node('button', undefined, 'compact-row'); button.type = 'button';
+    const label = source === 'machine' ? `${time(row.at, true)} · ${row.samples || 0} 个样本` : time(row.at, true);
+    const left = node('span', undefined, 'compact-label'); left.append(node('strong', label), node('small', `↑ ${bytes(row.up)}　↓ ${bytes(row.down)}`));
+    button.append(left, node('strong', bytes(total(row)), 'compact-value'));
+    button.addEventListener('click', () => showTimeDetail(Math.max(row.at, data.machine.range.from), Math.min(data.machine.range.to, row.at + width), '5 分钟高峰明细'));
+    target.append(button);
+  }
+}
+function renderCompactPrograms(target, rows, limit, onSelect) {
+  target.replaceChildren();
+  if (!rows?.length) { target.append(node('p', '这个时段没有已归因到进程的用量。', 'empty-state')); return; }
+  for (const row of rows.slice(0, limit)) {
+    const button = node('button', undefined, 'compact-row'); button.type = 'button';
+    const left = node('span', undefined, 'compact-label');
+    left.append(node('strong', row.name || '未识别进程'), node('small', `${familyNames[row.family] || familyNames.other} · ↑ ${bytes(row.up)}　↓ ${bytes(row.down)}`));
+    button.append(left, node('strong', bytes(total(row)), 'compact-value'));
+    button.addEventListener('click', () => onSelect(row));
+    target.append(button);
+  }
+}
+function renderIntegrity(machine, clash) {
+  const target = $('integritySummary'); target.replaceChildren();
+  for (const [name, item, source] of [['本机', machine, 'Windows ETW'], ['梯子', clash, 'Mihomo / Clash']]) {
+    const column = node('div', undefined, `integrity-cell ${item.coverage?.percent < 70 || item.gaps ? 'has-gap' : ''}`);
+    column.append(node('span', name), node('strong', item.available ? percent(item.coverage?.percent) : '不可用'), node('small', `${source} · ${item.gaps || 0} 段缺口 · 最近 ${time(item.lastAt)}`));
+    target.append(column);
+  }
+  const actions = node('button', '查看完整性', 'quiet-button'); actions.type = 'button'; actions.addEventListener('click', () => setView('investigate')); target.append(actions);
+}
+function renderOverviewWarnings(machine, clash) {
+  const target = $('overviewWarnings'); target.replaceChildren();
+  const messages = [];
+  if (machine.firstAt > machine.range?.from) messages.push(`已选${rangeLabel()}；本机记录从 ${time(machine.firstAt,true)} 开始，更早的时间没有历史数据。`);
+  if (machine.available && machine.coverage?.percent < 70) messages.push(`本机所选时段覆盖率 ${percent(machine.coverage.percent)}；合计只代表实际采集到的时间。`);
+  if (machine.available && machine.connectionCountersExceedGlobal) messages.push('按连接累加的进程流量超过本机全局采样值。代理本机链路可能在多个进程层出现，进程排行用于定位，不能代替网卡账单。');
+  if (clash.available && clash.connectionCountersExceedGlobal) messages.push('Clash 连接快照累计与其全局计数存在差异；代理出口用量仅作定位参考。');
+  if (messages.length) {
+    target.classList.add('has-warning');
+    for (const message of messages) target.append(node('p', message));
+  } else target.classList.remove('has-warning');
+}
+function renderBudgetStrip() {
+  const target = $('budgetStrip'); target.replaceChildren();
+  const hasLimits = preferences.monthlyMachineGb > 0 || preferences.monthlyProxyGb > 0;
+  target.hidden = !hasLimits;
+  if (!hasLimits) return;
+  const machineUsed = total(monthData?.machine?.totals);
+  const proxyUsed = total(monthData?.clash?.groups?.proxy);
+  const items = [
+    ['本机月用量', machineUsed, preferences.monthlyMachineGb],
+    ['梯子月用量', proxyUsed, preferences.monthlyProxyGb],
+  ].filter((item) => item[2] > 0);
+  for (const [name, used, limitGb] of items) {
+    const limitBytes = limitGb * 1e9, ratio = limitBytes ? Math.min(100, (used / limitBytes) * 100) : 0;
+    const item = node('section', undefined, 'budget-meter');
+    const heading = node('div', undefined, 'budget-heading');
+    heading.append(node('strong', name), node('span', `${bytes(used)} / ${limitGb} GB`));
+    const bar = node('div', undefined, 'budget-track');
+    const fill = node('span'); fill.style.width = `${ratio}%`; fill.className = ratio >= 100 ? 'over-limit' : '';
+    bar.append(fill);
+    item.append(heading, bar, node('small', `${percent(used / limitBytes * 100)} · 本机参考上限，非运营商账单`));
+    target.append(item);
+    if (used >= limitBytes) notifyLimit(name, limitBytes, used);
+  }
+}
+function notifyLimit(name, limit, used) {
+  if (!preferences.notificationsEnabled || !('Notification' in window) || Notification.permission !== 'granted') return;
+  const key = `trafficwatch-limit-${new Date().toLocaleDateString('sv-SE', { timeZone: 'Asia/Shanghai' })}-${name}`;
+  try {
+    if (localStorage.getItem(key)) return;
+    new Notification('TrafficWatch 用量参考线', { body: `${name}已达到参考上限：${bytes(used)} / ${bytes(limit)}。` });
+    localStorage.setItem(key, 'yes');
+  } catch { /* The in-page meter remains available. */ }
+}
+function renderApps() {
+  if (!data?.machine?.available) {
+    if(data) {$('appRows').replaceChildren();const tr=node('tr'),td=node('td','本机历史暂不可读，点击刷新可重试。','empty-state');td.colSpan=7;tr.append(td);$('appRows').append(tr);}
+    return;
+  }
+  renderHeader();
+  $('appListTable').hidden = Boolean(activeAppDetail);
+  $('appListPager').hidden = Boolean(activeAppDetail);
+  $('backToApps').hidden = !activeAppDetail;
+  document.querySelector('[data-view="apps"] .filter-bar').hidden = Boolean(activeAppDetail);
+  if (activeAppDetail) { if (appDetailData) renderAppDetail(activeAppDetail,appDetailData); return; }
+  const query = $('appSearch').value.trim().toLowerCase();
+  const sort = $('appSort').value;
+  const rows = [...(data.machine.allPrograms || [])].filter((row) => (row.name || '').toLowerCase().includes(query));
+  rows.sort((a, b) => sort === 'name' ? a.name.localeCompare(b.name) : sort === 'up' ? b.up - a.up : sort === 'down' ? b.down - a.down : total(b) - total(a));
+  $('appCount').textContent = `${rows.length} 个进程名 · 包含待识别连接`;
+  const body = $('appRows'); body.replaceChildren();
+  if (!rows.length) { const tr = node('tr'); const td = node('td', '没有匹配的应用记录。', 'empty-state'); td.colSpan = 7; tr.append(td); body.append(tr); }
+  appPage = Math.max(0,Math.min(appPage,Math.ceil(rows.length/50)-1));
+  for (const row of rows.slice(appPage*50,(appPage+1)*50)) {
+    const tr = node('tr', undefined, 'selectable-row'); tr.tabIndex = 0;
+    const processCell = node('td', undefined, 'process-cell');
+    processCell.append(node('strong', row.name || '未识别进程'), node('small', row.process || '连接没有提供进程名'));
+    tr.append(processCell, node('td', familyNames[row.family] || familyNames.other), node('td', bytes(row.up)), node('td', bytes(row.down)), node('td', bytes(total(row)), 'numeric-strong'), node('td', String(row.connections || 0)), node('td', time(row.lastAt)));
+    const open = () => selectApp(row);
+    tr.addEventListener('click', open); tr.addEventListener('keydown', (event) => { if (event.key === 'Enter' || event.key === ' ') { event.preventDefault(); open(); } });
+    body.append(tr);
+  }
+  renderPager('appListPager',{page:appPage,pages:Math.ceil(rows.length/50),total:rows.length},(page)=>{appPage=page;renderApps();});
+  if (data.machine.detailReady === false) body.replaceChildren(node('tr',undefined,'empty-state'));
+  if (data.machine.detailReady === false) { const td=node('td','正在汇总该时段的应用…');td.colSpan=7;body.firstChild.append(td); }
+}
+function selectApp(row, inherited = null) {
+  const process = row.process || '__unknown__';
+  if (!inherited) { detailHistory = []; $('appSearch').value = row.name === '未识别进程' ? '' : row.name; }
+  openAppSelection({ ...(inherited || {}), process, scope: row.scope || undefined, page: 0,
+    title: row.name || row.process || '未识别进程' }, Boolean(inherited));
+}
+function openAppSelection(selection, remember = true) {
+  if (remember && activeAppDetail) { detailHistory.push({ ...activeAppDetail }); if(detailHistory.length>20)detailHistory.shift(); }
+  activeAppDetail = selection;
+  appDetailData = null;
+  setView('apps');
+  $('appDetail').hidden = false;
+  $('appDetailTitle').textContent = activeAppDetail.title;
+  $('appDetailMeta').textContent = '正在读取所选时段的分钟流量与目标…';
+  $('appDetailMetrics').replaceChildren(); $('appDestinations').replaceChildren(); $('appConnectionRows').replaceChildren();
+  renderApps();
+  loadAppDetail(activeAppDetail);
+  $('appDetail').scrollIntoView({ behavior: 'smooth', block: 'start' });
+}
+async function loadAppDetail(selection, timeRange = null) {
+  detailAbort?.abort(); detailAbort = new AbortController();
+  const signal = detailAbort.signal, key = queryKey();
+  const current = ++detailSequence;
+  try {
+    const { title, ...filters } = selection;
+    if (timeRange) { filters.from = timeRange.from; filters.to = timeRange.to; }
+    const result = await requestDetail('windows', filters, { signal });
+    if (current !== detailSequence || key !== queryKey() || signal.aborted) return;
+    if (!result.available) throw new Error('该采集源尚未建立历史记录');
+    appDetailData = result;
+    if (view === 'apps') renderAppDetail(selection, result);
+  } catch (error) {
+    if (current === detailSequence && !isCancelled(error)) $('appDetailMeta').textContent = `明细暂不可用：${error.message}。可再次点击应用重试。`;
+  }
+}
+function renderAppDetail(selection, result) {
+  $('appDetail').hidden = false;
+  $('appDetailTitle').textContent = selection.title;
+  const { up, down } = result.summary;
+  $('appDetailMeta').textContent = `${time(result.range.from, true)} 至 ${time(result.range.to, true)}（不含结束） · 共 ${result.pagination.total} 条连接归因 · 汇总包含全部结果`;
+  $('detailBack').hidden = !detailHistory.length;
+  $('inspectFrom').value = localInputTime(result.range.from);
+  $('inspectTo').value = localInputTime(result.range.to);
+  renderCompactPrograms($('detailProcessRows'), result.processes, 12, (row) => selectApp(row, { ...selection, page: 0 }));
+  const metrics = $('appDetailMetrics'); metrics.replaceChildren();
+  for (const [label, value] of [['上传', up], ['下载', down], ['合计', up + down]]) {
+    const item = node('div', undefined, 'detail-metric'); item.append(node('span', label), node('strong', bytes(value))); metrics.append(item);
+  }
+  renderCompactPrograms($('appDestinations'), result.destinations, 10, (row) => openAppSelection({ ...selection, host: row.name, page: 0, title: `${selection.title} → ${row.name}` }));
+  drawChart($('appDetailChart'), [chartSeries('所选应用合计', result.series, result.observation || data?.machine)],
+    (point) => showTimeDetail(point.from, point.to, selection.title, selection), { range: result.range, fullRange: true });
+  const body = $('appConnectionRows'); body.replaceChildren();
+  if (!result.connections.length) { const tr = node('tr'); const td = node('td', '此时段没有连接明细；可能是采集暂停，或该进程尚未产生可归因流量。', 'empty-state'); td.colSpan = 7; tr.append(td); body.append(tr); }
+  for (const row of result.connections) {
+    const tr = node('tr');
+    tr.append(node('td', time(row.lastAt, true)), node('td', `${row.process || '未识别'}${row.pid ? ` · PID ${row.pid}` : row.observedPID ? ` · 事件 PID ${row.observedPID}（无进程名证据）` : ''}`), node('td', row.host + (row.destinationPort ? `:${row.destinationPort}` : '')), node('td', evidenceNames[row.evidence] || row.evidence), node('td', bytes(row.up)), node('td', bytes(row.down)), node('td', bytes(row.amount), 'numeric-strong'));
+    body.append(tr);
+  }
+  renderPager('appPager', result.pagination, (page) => { activeAppDetail = { ...selection, page }; loadAppDetail(activeAppDetail); });
+}
+function localInputTime(at) { return new Date(at + 8 * 3600000).toISOString().slice(0, 16); }
+function renderPager(id, pagination, onPage) {
+  const target = $(id); target.replaceChildren();
+  const { page, pages, total: count } = pagination;
+  const previous = node('button', '上一页', 'quiet-button'), next = node('button', '下一页', 'quiet-button');
+  previous.type = next.type = 'button'; previous.disabled = page <= 0; next.disabled = page + 1 >= pages;
+  previous.addEventListener('click', () => onPage(page - 1)); next.addEventListener('click', () => onPage(page + 1));
+  target.append(previous, node('span', `第 ${pages ? page + 1 : 0} / ${pages} 页 · 共 ${count} 条`), next);
+}
+function showTimeDetail(from, to, title, filters = {}) {
+  if (to <= from) return;
+  $('appSearch').value = '';
+  openAppSelection({ ...filters, from, to, page: 0, title: `${title} · ${time(from, true)}` });
+}
+function renderLadder() {
+  if (!data?.clash?.available) {
+    if(data) {$('routeSummary').replaceChildren(node('p','梯子历史暂不可读，点击刷新可重试。','empty-state'));for(const id of ['ladderProcessRows','ladderDomainRows','ladderNodeRows'])$(id).replaceChildren(node('p','等待历史记录…','empty-state'));$('ladderChart').width=1;$('ladderChart').height=1;}
+    return;
+  }
+  renderHeader();
+  renderTotals($('routeSummary'), { ...data.clash.groups, unassigned: data.clash.unassigned }, (route) => {
+    $('routeFilter').value = route;
+    activeLadderDetail = null; ladderDetailData = null; $('ladderDetail').hidden = true;
+    renderLadder();
+  });
+  const filtered = $('routeFilter').value;
+  const routes = filtered === 'all' ? ['proxy', 'direct', 'unknown'] : [filtered];
+  const routeNames = { proxy: '代理出口', direct: 'DIRECT 直连', unknown: '出口未知' };
+  drawChart($('ladderChart'), routes.map((key) => chartSeries(routeNames[key], data.clash.routeTimeline, data.clash, key)),
+    (point) => loadLadderDetail({ from: point.from, to: point.to, title: '梯子时段明细' }), { range: data.clash.range, ticks: 'ladderTicks' });
+  const routeRows = filtered === 'all' ? data.clash.allPrograms : data.clash.routePrograms?.[filtered] || [];
+  renderCompactPrograms($('ladderProcessRows'), routeRows, 15,
+    (row) => loadLadderDetail({ process: row.process || '__unknown__', title: row.name }));
+  renderCompactPrograms($('ladderDomainRows'), data.clash.routeDomains?.[filtered] || data.clash.domains, 15,
+    (row) => loadLadderDetail({ host: row.name, title: row.name }));
+  renderCompactPrograms($('ladderNodeRows'), data.clash.routeNodes?.[filtered] || data.clash.nodes, 8,
+    (row) => loadLadderDetail({ node: row.name, title: `出口节点 · ${row.name}` }));
+  if(data.clash.detailReady === false) for (const id of ['ladderProcessRows','ladderDomainRows','ladderNodeRows']) $(id).replaceChildren(node('p','正在汇总连接归因…','empty-state'));
+  $('ladderAccountingNote').textContent = data.clash.connectionCountersExceedGlobal
+    ? '连接累计超过 Clash 全局计数。短连接、采样时点和计数重置都会造成差异；此处用于定位，不是精确账单。'
+    : 'Clash 总计包含代理、DIRECT 与未归因流量。这里只把明确走代理节点的连接计入“梯子代理出口”；短连接可能低估。';
+  if (activeLadderDetail && ladderDetailData) renderLadderDetail(activeLadderDetail, ladderDetailData);
+}
+async function loadLadderDetail(selection) {
+  detailAbort?.abort(); detailAbort = new AbortController();
+  const signal = detailAbort.signal, key = queryKey();
+  activeLadderDetail = selection;
+  ladderDetailData = null;
+  $('ladderDetail').hidden = false;
+  $('ladderDetailTitle').textContent = selection.title;
+  $('ladderDetailMeta').textContent = '正在读取代理连接与目标…';
+  $('ladderConnectionRows').replaceChildren();
+  const current = ++detailSequence;
+  try {
+    const result = await requestDetail('clash', {
+      process: selection.process,
+      host: selection.host,
+      node: selection.node,
+      route: $('routeFilter').value,
+      from: selection.from,
+      to: selection.to,
+      page: selection.page || 0,
+    }, { signal });
+    if (current !== detailSequence || key !== queryKey() || signal.aborted) return;
+    if (!result.available) throw new Error('该采集源尚未建立历史记录');
+    ladderDetailData = result;
+    if (view === 'ladder') { renderLadderDetail(selection, result); $('ladderDetail').scrollIntoView({ behavior: 'smooth', block: 'start' }); }
+  } catch (error) { if(current === detailSequence && !isCancelled(error)) $('ladderDetailMeta').textContent = `连接明细暂不可用：${error.message}。请再次点击时段重试。`; }
+}
+function renderLadderDetail(selection, result) {
+  $('ladderDetail').hidden = false;
+  $('ladderDetailTitle').textContent = selection.title;
+  const routeBytes = total(result.routeTotals.proxy);
+  $('ladderDetailMeta').textContent = `${time(result.range.from, true)} 至 ${time(result.range.to, true)} · 代理 ${bytes(routeBytes)} · DIRECT ${bytes(total(result.routeTotals.direct))} · 未知 ${bytes(total(result.routeTotals.unknown))} · 共 ${result.pagination.total} 条连接，汇总含全部结果`;
+  const filtered = $('routeFilter').value, routes = filtered === 'all' ? ['proxy', 'direct', 'unknown'] : [filtered];
+  const routeNames = { proxy: '代理出口', direct: 'DIRECT 直连', unknown: '出口未知' };
+  drawChart($('ladderDetailChart'), routes.map((key) => chartSeries(routeNames[key], result.series, result.observation || data?.clash, key)),
+    (point) => loadLadderDetail({ ...selection, page: 0, from: point.from, to: point.to }), { range: result.range, fullRange: true });
+  const body = $('ladderConnectionRows'); body.replaceChildren();
+  if (!result.connections.length) { const tr = node('tr'); const td = node('td', '这个时段没有匹配的代理连接。', 'empty-state'); td.colSpan = 7; tr.append(td); body.append(tr); }
+  for (const row of result.connections) {
+    const tr = node('tr');
+    tr.append(node('td', time(row.lastAt, true)), node('td', row.process || '未识别'), node('td', row.host), node('td', row.node || '未知出口'), node('td', bytes(row.up)), node('td', bytes(row.down)), node('td', bytes(row.amount), 'numeric-strong'));
+    body.append(tr);
+  }
+  renderPager('ladderPager', result.pagination, (page) => loadLadderDetail({ ...selection, page }));
+}
+function renderHarnessTabs() {
+  const target = $('harnessTabs'); target.replaceChildren();
+  for (const family of ['codex', 'claude', 'dsh']) {
+    const button = node('button', familyNames[family]); button.type = 'button'; button.setAttribute('role', 'tab');
+    button.setAttribute('aria-selected', String(activeFamily === family));
+    button.addEventListener('click', () => { activeFamily = family; renderHarnessTabs(); loadHarness(family, true); });
+    target.append(button);
+  }
+}
+async function loadHarness(family, force = false) {
+  activeFamily = family;
+  const key = `${family}|${range}|${range === 'day' ? selectedDate : ''}|${JSON.stringify(apps)}`;
+  if (!force && key === harnessLoadedKey && Date.now() - harnessLoadedAt < 60000) return;
+  harnessAbort?.abort(); harnessAbort = new AbortController(); const signal=harnessAbort.signal, rangeKey=queryKey();
+  harnessLoadedKey = key;
+  harnessLoadedAt = Date.now();
+  const current = ++harnessSequence;
+  $('harnessSelectedName').textContent = familyNames[family];
+  if (!harnessResult || harnessResult[0] !== family) {
+    $('harnessTotal').textContent = '读取中'; $('harnessProxyTotal').textContent = '读取中';
+    $('harnessProcessRows').replaceChildren(node('p', '正在读取…', 'empty-state'));
+    $('harnessChart')._dispose?.();$('harnessChart').width=1;$('harnessChart').height=1;$('harnessDirections').textContent='正在读取所选分组…';$('harnessNotice').replaceChildren();
+  }
+  try {
+    const [machine, proxy] = await Promise.all([
+      requestDetail('windows', { family }, { signal }),
+      requestDetail('clash', { family, route: 'proxy' }, { signal }),
+    ]);
+    if (current !== harnessSequence || rangeKey !== queryKey() || signal.aborted) return;
+    if (!machine.available || !proxy.available) throw new Error('部分采集源尚未建立历史记录');
+    harnessResult = [family, machine, proxy];
+    if (view === 'harness') renderHarness(family, machine, proxy);
+  } catch (error) {
+    if (current === harnessSequence && !isCancelled(error)) { harnessLoadedKey='';$('harnessNotice').textContent = `Harness 明细暂不可用：${error.message}。再次点击分组可重试。`; }
+  }
+}
+function renderHarness(family, machine, proxy) {
+  const machineBytes = total(machine.summary);
+  const proxyBytes = total(proxy.routeTotals.proxy);
+  const systemBytes = total(data?.machine?.totals);
+  $('harnessSelectedName').textContent = familyNames[family];
+  $('harnessTotal').textContent = bytes(machineBytes);
+  const { up, down } = machine.summary;
+  $('harnessDirections').textContent = `↑ ${bytes(up)}　↓ ${bytes(down)}`;
+  $('harnessProxyTotal').textContent = bytes(proxyBytes);
+  $('harnessProxyShare').textContent = 'Clash 代理连接独立计数，与左侧不相加';
+  $('harnessShare').textContent = systemBytes ? percent((machineBytes / systemBytes) * 100) : '—';
+  $('harnessPeak').textContent = `最高时段 ${peakFrom(machine.series)}`;
+  drawChart($('harnessChart'), [
+    chartSeries('本机进程记录', machine.series, machine.observation || data?.machine),
+    chartSeries('梯子代理出口', proxy.series, proxy.observation || data?.clash, 'proxy'),
+  ], (point) => showTimeDetail(point.from, point.to, familyNames[family], { family }), { range: machine.range });
+  renderCompactPrograms($('harnessProcessRows'), machine.processes, 15,
+    (row) => selectApp(row, { family }));
+  const notice = $('harnessNotice'); notice.replaceChildren();
+  if (!machineBytes) {
+    notice.className = 'warning-list has-warning';
+    notice.append(node('p', family === 'dsh'
+      ? '所选时段没有可归入 dsh 的记录。已支持通过 dsh 的 Node 启动脚本识别及其子进程；旧记录缺少这项证据时保留为其他应用。'
+      : '所选时段没有匹配到此 Harness 的连接记录。'));
+  } else {
+    notice.className = 'warning-list';
+    if (family !== 'codex') notice.append(node('p', '既有历史按已有进程证据归组；新版本启用后额外记录脚本与父子进程归属。'));
+  }
+}
+function peakFrom(rows) {
+  const peak = [...rows].sort((a, b) => total(b) - total(a))[0];
+  return peak && total(peak) > 0 ? `${time(peak.at, true)} · ${bytes(total(peak))}` : '暂无峰值';
+}
+function renderInvestigation() {
+  if (!data?.machine) return;
+  renderHeader();
+  renderPeaks($('issueRows'), data.machine.peaks, 'machine');
+  const unknown = (data.machine.allPrograms || []).filter((row) => row.family === 'unknown' || row.scope === 'unknown');
+  renderCompactPrograms($('unknownRows'), unknown, 12, (row) => selectApp(row));
+  const gapSummary = $('gapSummary'); gapSummary.replaceChildren();
+  for (const [label, item] of [['本机', data.machine], ['梯子', data.clash]]) {
+    const section = node('div', undefined, `gap-metric ${item.gaps ? 'has-gap' : ''}`);
+    section.append(node('span', label), node('strong', `${percent(item.coverage?.percent)} 覆盖`), node('small', `${item.gaps || 0} 段记录缺口 · ${item.retentionDays === 0 ? '无限保留' : `${item.retentionDays} 天保留`}`));
+    gapSummary.append(section);
+  }
+  const gaps = [
+    ...(data.machine.gapDetails || []).map((item) => ({ ...item, source: '本机' })),
+    ...(data.clash.gapDetails || []).map((item) => ({ ...item, source: '梯子' })),
+  ].sort((a, b) => b.gapFrom - a.gapFrom).slice(0, 40);
+  const target = $('gapRows'); target.replaceChildren();
+  if (!gaps.length) target.append(node('p', '所选时段没有记录到采集缺口。', 'empty-state'));
+  for (const gap of gaps) {
+    const reasons = { collector_restart:'采集程序重启',initial_baseline:'首次采集基线',source_unavailable:'采集源未连接',collector_error:'采集异常',source_changed:'切换采集来源',observer_unavailable:'进程信息暂不可用',sampling_delay:'采样延迟',native_events_lost:'系统事件丢失',clock_changed:'系统时间调整' };
+    const row = node('div', undefined, 'gap-row');
+    row.append(node('span', gap.source, 'gap-source'), node('strong', time(gap.gapFrom, true)), node('span', gap.ongoing ? '仍在持续' : time(gap.gapTo, true)), node('span', duration(gap.durationMs)), node('span', reasons[gap.reason] || gap.reason));
+    target.append(row);
+  }
+}
+function renderSettings() {
+  if (!data?.machine) return;
+  settingsInitialized = true;
+  renderHeader();
+  $('monthlyMachineLimit').value = preferences.monthlyMachineGb || '';
+  $('monthlyProxyLimit').value = preferences.monthlyProxyGb || '';
+  $('notificationsEnabled').checked = preferences.notificationsEnabled;
+  const detected = $('detectedProcesses'); detected.replaceChildren();
+  const names = [...new Set((data.machine.allPrograms || []).map((row) => row.process).filter(Boolean))].sort((a, b) => a.localeCompare(b));
+  for (const name of names) { const option = node('option'); option.value = name; detected.append(option); }
+  renderAliases();
+}
+function renderAliases() {
+  if (!apps) return;
+  const target = $('aliasGroups'); target.replaceChildren();
+  for (const family of ['claude', 'dsh']) {
+    const section = node('section', undefined, 'alias-family');
+    section.append(node('h4', familyNames[family]));
+    const list = node('div', undefined, 'alias-list');
+    for (const name of apps[family] || []) {
+      const chip = node('span', undefined, 'alias-chip');
+      chip.append(node('span', name));
+      const remove = node('button', '×'); remove.type = 'button'; remove.title = `移除 ${name}`; remove.setAttribute('aria-label', `移除 ${familyNames[family]} 进程名 ${name}`);
+      remove.addEventListener('click', () => updateAlias(family, name, false));
+      chip.append(remove); list.append(chip);
+    }
+    if (!list.childNodes.length) list.append(node('span', '暂无别名', 'muted'));
+    section.append(list); target.append(section);
+  }
+  const codex = node('section', undefined, 'alias-family');
+  codex.append(node('h4', 'Codex · 由采集配置识别'));
+  codex.append(node('div', (apps.codex || []).join(' · ') || '没有 Codex 进程名', 'locked-aliases'));
+  target.append(codex);
+  target.append(node('p', '自动识别：Codex / Claude Code / dsh 的官方 Node 启动脚本及其子进程。通用 node.exe、PowerShell 不能整体加入某个分组。', 'fine-print'));
+}
+async function updateAlias(family, process, add) {
+  const status = $('aliasStatus'); status.textContent = '正在同步到两路采集…';
+  const next = { codex: apps.codex, claude: [...apps.claude], dsh: [...apps.dsh] };
+  const name = process.trim().split(/[\\/]/).at(-1).toLowerCase();
+  next[family] = add ? [...new Set([...next[family], name])] : next[family].filter((item) => item !== name);
+  if (['codex', 'claude', 'dsh'].some((key) => key !== family && next[key].includes(name))) {
+    status.textContent = '这个进程名已经属于其他分组。'; return;
+  }
+  try {
+    const result = await api('/api/harness-apps', { method: 'POST', body: JSON.stringify({ apps: next }) });
+    apps = result.apps;
+    $('aliasProcess').value = '';
+    status.textContent = '规则已同步；直接进程历史已按新分组归类，后续子进程会保留归属。';
+    await refresh(true);
+    renderAliases();
+  } catch (error) { status.textContent = `规则未保存：${error.message}`; }
+}
+function renderBudgetSettingsStatus() {
+  $('limitsStatus').textContent = preferences.monthlyMachineGb || preferences.monthlyProxyGb
+    ? '参考线保存在当前浏览器本机配置中；达到上限时仅在此页面打开且已启用通知的情况下提醒。'
+    : '参考线为可选项，留空或设为 0 表示不显示。';
+}
+function csvCell(value) {
+  let text = String(value ?? '');
+  if (/^[\s]*[=+\-@\t\r]/.test(text)) text = `'${text}`;
+  return `"${text.replaceAll('"', '""')}"`;
+}
+function exportCsv(filename, columns, rows) {
+  const content = '\uFEFF' + [columns.map((item) => csvCell(item.label)).join(','), ...rows.map((row) => columns.map((item) => csvCell(typeof item.value === 'function' ? item.value(row) : row[item.value])).join(','))].join('\r\n');
+  const url = URL.createObjectURL(new Blob([content], { type: 'text/csv;charset=utf-8' }));
+  const link = node('a'); link.href = url; link.download = filename; link.click();
+  setTimeout(() => URL.revokeObjectURL(url), 1000);
+}
+function exportAppsCsv(rows, name) {
+  exportCsv(name, [
+    { label: '进程名', value: (row) => row.process || row.name },
+    { label: 'Harness', value: (row) => familyNames[row.family] || row.family },
+    { label: '归因范围', value: 'scope' }, { label: '证据', value: (row) => evidenceNames[row.evidence] || row.evidence },
+    { label: '上传字节', value: 'up' }, { label: '下载字节', value: 'down' },
+    { label: '合计字节', value: total }, { label: '连接数', value: 'connections' },
+    { label: '首活动', value: (row) => time(row.firstAt, true) }, { label: '末活动', value: (row) => time(row.lastAt, true) },
+  ], rows);
+}
+function exportConnectionsCsv(rows, filename) {
+  exportCsv(filename, [
+    { label: '进程名', value: 'process' }, { label: 'PID', value: 'pid' }, { label: '目标', value: 'host' },
+    { label: 'Harness', value: (row) => familyNames[row.family] || row.family }, { label: '出口', value: (row) => row.node || row.route || '' },
+    { label: '证据', value: (row) => evidenceNames[row.evidence] || row.evidence }, { label: '上传字节', value: 'up' },
+    { label: '下载字节', value: 'down' }, { label: '合计字节', value: total },
+    { label: '最后活动', value: (row) => time(row.lastAt, true) },
+  ], rows);
+}
+function renderCurrentView() {
+  if (document.hidden) return;
+  renderHeader();
+  if (view === 'overview') renderOverview();
+  else if (view === 'apps') renderApps();
+  else if (view === 'ladder') renderLadder();
+  else if (view === 'harness') { renderHarnessTabs(); loadHarness(activeFamily); }
+  else if (view === 'investigate') renderInvestigation();
+  else if (view === 'settings' && !settingsInitialized) renderSettings();
+}
+function acceptOverview(next, key, quick) {
+  const previous = dataKey === key ? data : null;
+  const merged = { ...next };
+  const retained = [];
+  for (const lane of ['machine','clash']) {
+    if (!next[lane]?.available && previous?.[lane]?.available) {
+      merged[lane] = previous[lane]; retained.push(lane === 'machine' ? '本机' : '梯子');
+    } else if (quick && previous?.[lane]?.detailReady !== false && previous?.[lane]?.available) {
+      merged[lane] = { ...next[lane] };
+      for (const field of ['allPrograms','programs','familyTotals','unassigned','connectionCountersExceedGlobal','routePrograms','domains','nodes','routeDomains','routeNodes','detailReady']) merged[lane][field] = previous[lane][field];
+    }
+  }
+  data = merged; dataKey = key; apps = next.apps || apps;
+  document.querySelector('main').classList.remove('range-loading');
+  const missing = ['machine','clash'].filter(lane=>!next[lane]?.available);
+  $('globalNotice').hidden = !missing.length;
+  if (missing.length) $('globalNotice').textContent = retained.length ? retained.join(' / ') + '暂时不可读，已保留该时间范围上次成功的记录。' : '部分历史暂时不可读，可点击刷新重试；采集状态单独更新。';
+  renderCurrentView();
+}
+function refresh(force = false) {
+  if (document.hidden) return Promise.resolve();
+  const key = queryKey();
+  if (refreshPromise && refreshKey === key) return refreshPromise;
+  historyAbort?.abort(); historyAbort = new AbortController();
+  const signal = historyAbort.signal, current = ++refreshSequence;
+  clearTimeout(refreshTimer); refreshKey = key; historyState = 'loading'; historyError = '';
+  if (dataKey !== key) {
+    const snapshot = snapshotCache.get(key);
+    if (snapshot) { data = snapshot; dataKey = key; renderCurrentView(); }
+    document.querySelector('main').classList.toggle('range-loading',dataKey !== key);
+    $('globalNotice').hidden = dataKey === key;
+    if (dataKey !== key) $('globalNotice').textContent = '正在读取' + rangeLabel() + '，暂时保留先前画面；加载期间无法点击旧时段。';
+  }
+  renderHeader();
+  const params = rangeParams();
+  const run = async () => {
+    let quickOk = false;
+    try {
+      try {
+        const quick = await api('/api/overview?' + params + '&quick=1' + (force ? '&fresh=1' : ''), { signal, timeoutMs:15000 });
+        if (current !== refreshSequence || signal.aborted) return;
+        acceptOverview(quick,key,true); quickOk = true;
+      } catch (error) { if(signal.aborted) return; }
+      const next = await api('/api/overview?' + params + (force ? '&fresh=1' : ''), { signal });
+      if (current !== refreshSequence || signal.aborted) return;
+      historyState = 'ready'; acceptOverview(next,key,false);
+      if (next.machine?.available && next.clash?.available) saveSnapshot(key,data);
+      if (!next.machine?.available || !next.clash?.available) throw new Error('部分历史暂时不可读，保留已有记录');
+      if ((preferences.monthlyMachineGb > 0 || preferences.monthlyProxyGb > 0) && Date.now()-monthLoadedAt > 300000) {
+        try { monthData = await api('/api/overview?range=month&quick=1',{signal});monthLoadedAt=Date.now();if(view==='overview')renderBudgetStrip(); } catch { /* A budget refresh cannot block the selected range. */ }
+      }
+    } catch (error) {
+      if (current !== refreshSequence || signal.aborted || isCancelled(error)) return;
+      historyState = 'error'; historyError = error.message;
+      $('globalNotice').hidden = false;
+      $('globalNotice').textContent = (quickOk ? '总量和趋势已加载，详细归因暂未完成。' : '历史更新暂未完成，已保留上次成功的记录。') + ' 点击右上角刷新可重试。';
+    } finally {
+      if (current === refreshSequence) {
+        refreshPromise = null; renderHeader();
+        if (!document.hidden) refreshTimer = setTimeout(()=>refresh(), data?.refreshing ? 5000 : range === 'day' && selectedDate < new Date().toLocaleDateString('sv-SE',{timeZone:'Asia/Shanghai'}) ? 300000 : 60000);
+      }
+    }
+  };
+  refreshPromise = run(); return refreshPromise;
+}
+async function refreshLive() {
+  clearTimeout(liveTimer);
+  if (document.hidden || liveAbort) return;
+  const controller = liveAbort = new AbortController();
+  try { livePacket = (await api('/api/live', { signal:controller.signal, timeoutMs:3000 })).live; if(!controller.signal.aborted)renderHeader(); }
+  catch { if(!controller.signal.aborted){setSourceStatus('machineStatus',null,'native');setSourceStatus('clashStatus',null,'mihomo');} }
+  finally { if(liveAbort===controller)liveAbort=null;if(!document.hidden)liveTimer=setTimeout(refreshLive,5000); }
+}
+function clearDetails() {
+  detailAbort?.abort(); harnessAbort?.abort();
+  detailSequence++; harnessSequence++; activeAppDetail = activeLadderDetail = appDetailData = ladderDetailData = harnessResult = null;
+  detailHistory = []; harnessLoadedKey = ''; appPage = 0; $('appDetail').hidden = $('ladderDetail').hidden = true;
+  for(const canvas of document.querySelectorAll('canvas')){canvas._dispose?.();canvas.width=1;canvas.height=1;canvas._plotPoints=[];canvas._chartModel=null;}
+  hideChartTooltip();
+}
+async function exportAllConnections(lane, selection, result, button) {
+  if (!selection || !result?.available) { showToast('先选择一个应用、节点或时段。'); return; }
+  const oldLabel = button.textContent; button.disabled = true;
+  try {
+    const { title, ...filters } = selection;
+    const query = { ...filters, from: result.range.from, to: result.range.to, export: 1, page: 0 };
+    if (lane === 'clash') query.route = $('routeFilter').value;
+    const first = await requestDetail(lane, query);
+    const rows = [...first.connections];
+    for (let page = 1; page < first.pagination.pages; page++) {
+      button.textContent = `导出 ${page + 1}/${first.pagination.pages}…`;
+      rows.push(...(await requestDetail(lane, { ...query, page })).connections);
+    }
+    exportConnectionsCsv(rows, `${lane === 'clash' ? '梯子' : '本机'}连接明细.csv`);
+    showToast(`已导出 ${rows.length} 条连接明细，保留当前时间与筛选。`);
+  } catch (error) { showToast(`导出未完成：${error.message}`); }
+  finally { button.disabled = false; button.textContent = oldLabel; }
+}
+
+$('range').addEventListener('change', () => {
+  range = $('range').value;
+  clearDetails();
+  $('selectedDate').hidden = range !== 'day';
+  if (range === 'day' && !$('selectedDate').value) $('selectedDate').value = selectedDate;
+  refresh(true);
+});
+$('selectedDate').value = selectedDate;
+$('selectedDate').max = selectedDate;
+$('selectedDate').addEventListener('change', () => { selectedDate = $('selectedDate').value || selectedDate; clearDetails(); refresh(true); });
+$('refreshButton').addEventListener('click', () => refresh(true));
+let searchTimer;
+$('appSearch').addEventListener('input',()=>{clearTimeout(searchTimer);searchTimer=setTimeout(()=>{appPage=0;renderApps();},120);});
+$('appSort').addEventListener('change',()=>{appPage=0;renderApps();});
+$('routeFilter').addEventListener('change', () => { renderLadder(); if (activeLadderDetail) loadLadderDetail({ ...activeLadderDetail, page: 0 }); });
+$('exportApps').addEventListener('click', () => exportAppsCsv(data?.machine?.allPrograms || [], '本机应用流量.csv'));
+$('exportAppDetail').addEventListener('click', () => exportAllConnections('windows', activeAppDetail, appDetailData, $('exportAppDetail')));
+$('exportLadder').addEventListener('click', () => exportAppsCsv(data?.clash?.programs || [], '梯子代理应用.csv'));
+$('exportLadderDetail').addEventListener('click', () => exportAllConnections('clash', activeLadderDetail, ladderDetailData, $('exportLadderDetail')));
+$('inspectRange').addEventListener('click', () => {
+  const from = Date.parse(`${$('inspectFrom').value}:00+08:00`), to = Date.parse(`${$('inspectTo').value}:00+08:00`);
+  if (!Number.isFinite(from) || !Number.isFinite(to) || to <= from || from > Date.now()) { showToast('请选择有效的开始和结束时间，结束需晚于开始。'); return; }
+  showTimeDetail(from, to, '自选时段');
+});
+$('detailBack').addEventListener('click', () => { const previous = detailHistory.pop(); if (previous) openAppSelection(previous, false); });
+$('backToApps').addEventListener('click', () => {
+  detailSequence++; activeAppDetail = appDetailData = null; detailHistory=[];
+  $('appDetail').hidden=true; $('appSearch').value=''; renderApps();
+});
+$('copyEvidence').addEventListener('click', async () => {
+  if (!appDetailData?.available) return;
+  const result = appDetailData;
+  const report = [
+    `TrafficWatch 排查摘要：${activeAppDetail.title}`,
+    `${time(result.range.from,true)} 至 ${time(result.range.to,true)}（北京时间，结束不含）`,
+    `上传 ${bytes(result.summary.up)}；下载 ${bytes(result.summary.down)}；合计 ${bytes(total(result.summary))}`,
+    `连接归因 ${result.pagination.total} 条；应用：`,
+    ...result.processes.slice(0,8).map((row) => `${row.name}: ↑${bytes(row.up)} ↓${bytes(row.down)} (${familyNames[row.family] || row.family})`),
+    '主要目标：', ...result.destinations.slice(0,5).map((row) => `${row.name}: ${bytes(total(row))}`),
+    '来源为本机 Windows 进程网络事件；回环与代理进程可能重复出现，未采集时段不补录。',
+  ].join('\n');
+  try { await navigator.clipboard.writeText(report); showToast('已复制排查摘要。'); }
+  catch { exportCsv('排查摘要.csv', [{label:'内容',value:'text'}], report.split('\n').map((text) => ({text}))); }
+});
+$('addAlias').addEventListener('click', () => {
+  const name = $('aliasProcess').value.trim();
+  if (!name) { $('aliasStatus').textContent = '先选择或输入一个精确的进程名。'; return; }
+  const family = $('aliasFamily').value;
+  if (apps?.[family]?.includes(name.toLowerCase().split(/[\\/]/).at(-1))) { $('aliasStatus').textContent = '这个进程名已经在该分组中。'; return; }
+  updateAlias(family, name, true);
+});
+$('aliasProcess').addEventListener('keydown', (event) => { if (event.key === 'Enter') { event.preventDefault(); $('addAlias').click(); } });
+$('saveLimits').addEventListener('click', () => {
+  const machine = Number($('monthlyMachineLimit').value) || 0, proxy = Number($('monthlyProxyLimit').value) || 0;
+  if (![machine, proxy].every((value) => Number.isFinite(value) && value >= 0 && value <= 1000000)) { $('limitsStatus').textContent = '参考上限应为 0 到 1000000 GB。'; return; }
+  preferences.monthlyMachineGb = machine; preferences.monthlyProxyGb = proxy; savePreferences();
+  $('limitsStatus').textContent = '参考线上限已保存到此浏览器。';
+  refresh(true);
+});
+$('notificationsEnabled').addEventListener('change', async (event) => {
+  if (event.target.checked && 'Notification' in window && Notification.permission !== 'granted') {
+    const permission = await Notification.requestPermission();
+    if (permission !== 'granted') event.target.checked = false;
+  }
+  preferences.notificationsEnabled = event.target.checked && 'Notification' in window && Notification.permission === 'granted';
+  savePreferences();
+  renderBudgetSettingsStatus();
+});
+document.addEventListener('visibilitychange', () => {
+  clearTimeout(refreshTimer); clearTimeout(liveTimer); hideChartTooltip();
+  if(document.hidden){historyAbort?.abort();liveAbort?.abort();detailAbort?.abort();harnessAbort?.abort();refreshSequence++;refreshPromise=null;for(const canvas of document.querySelectorAll('canvas'))canvas._dispose?.();}
+  else{refreshLive();refresh();if(activeAppDetail&&!appDetailData)loadAppDetail(activeAppDetail);if(activeLadderDetail&&!ladderDetailData)loadLadderDetail(activeLadderDetail);if(view==='harness'){harnessLoadedKey='';loadHarness(activeFamily);}}
+});
+let resizeFrame;
+window.addEventListener('resize', () => {
+  cancelAnimationFrame(resizeFrame);
+  resizeFrame=requestAnimationFrame(()=>{
+  if(document.hidden)return;
+  if (view === 'overview') renderOverview();
+  if (view === 'ladder') renderLadder();
+  if (view === 'apps' && appDetailData) renderAppDetail(activeAppDetail, appDetailData);
+  if (view === 'harness' && harnessResult) renderHarness(...harnessResult);
+  });
+});
+document.querySelector('.brand').addEventListener('click', (event) => { event.preventDefault(); setView('overview'); });
+renderBudgetSettingsStatus();
+const initialView = location.hash.slice(1);
+if (Object.hasOwn(pageNames, initialView)) setView(initialView);
+refreshLive();
+refresh(true);
