@@ -2,9 +2,11 @@
 
 ## Source development
 
-Use Node.js 24+. No `npm install` is necessary: the collector uses built-in Node.js modules, including `node:sqlite`. Run `npm run check` and `npm test` from the checkout.
+Use Node.js 24+. Run `npm ci --ignore-scripts --no-audit --no-fund` to install the pinned multiple-cipher SQLite runtime; install scripts are disabled. The legacy collector still uses built-in `node:sqlite` until password encryption is configured. Run `npm run check` and `npm test` from the checkout.
 
 `npm run demo` starts the inherited synthetic-data collector on port 43128 with isolated `data/demo`. Set `CODEX_FLOW_PORT` to an unused port if another collector is running. This command previews the legacy dashboard, without changing boot tasks. `npm start` starts only the unified viewer on port 43131 and needs `windows/monitor.sqlite` and `clash/monitor.sqlite` under its data root. `TRAFFICWATCH_DATA_ROOT` and `TRAFFICWATCH_CACHE_ROOT` can select those directories for a development viewer; `TRAFFICWATCH_OVERVIEW_PORT` selects an unused viewer port. Use an administrator-installed collector for real ETW data.
+
+The viewer isolates quick totals, complete overviews and interactive connection details in separate bounded workers. `/api/health` exposes each worker's current stage, elapsed time, queued work, completions and failures without returning traffic records. A detail click shows its time window before waiting for SQL; abandoned page selections cancel their work. Queries retain exact minute attribution and authorized dates across online and archived history.
 
 ## Windows package
 
@@ -12,7 +14,7 @@ Use Node.js 24+. No `npm install` is necessary: the collector uses built-in Node
 powershell.exe -NoProfile -ExecutionPolicy Bypass -File scripts/build-windows.ps1
 ```
 
-The build requires Windows x64, the .NET Framework C# compiler, and `curl.exe`. It downloads official Node.js 24.22.1 and WebView2 SDK 1.0.4258.31 with pinned SHA256 values. Generated dependencies, native binaries, desktop executables, staging and archives remain in `.build/`, except a separately invoked `scripts/build-native.ps1` writes its ignored helper under `native/`.
+The build requires Windows x64, the .NET Framework C# compiler, and `curl.exe`. It downloads official Node.js 24.22.1 and WebView2 SDK 1.0.4258.31 with pinned SHA256 values. The diagnostic-helper build also downloads Microsoft.Diagnostics.Tracing.TraceEvent 2.0.77 and System.Runtime.CompilerServices.Unsafe 4.5.2 from the official NuGet flat-container API when absent from `.build/dependencies`; it verifies each SHA256 before publishing the downloaded cache file. Generated dependencies, native binaries, desktop executables, staging and archives remain in `.build/`, except a separately invoked `scripts/build-native.ps1` writes its ignored helper under `native/`.
 
 Outputs:
 
@@ -20,9 +22,9 @@ Outputs:
 - `.build/trafficwatch-windows-x64.zip`: package archive.
 - `.build/SHA256SUMS.txt`: archive SHA256.
 
-The Node.js and WebView2 full license/notices are copied into the package. Edge WebView2 Evergreen Runtime and .NET Framework 4.8 are installed system prerequisites. Generated EXEs are unsigned. Digest checks verify the pinned dependencies and archive contents, not Windows publisher identity.
+The Node.js, WebView2, encrypted SQLite, YAML and diagnostic dependency licenses/notices are copied into the package. Edge WebView2 Evergreen Runtime and .NET Framework 4.8 are installed system prerequisites. Generated EXEs are unsigned. Digest checks verify the pinned dependencies and archive contents, not Windows publisher identity.
 
-For an offline build, pass `-DependencyRoot` pointing to an extracted, already available official-compatible package containing `runtime/node.exe`, the Node.js licenses/checksums, the three WebView2 DLLs and their license/notice files. The same executable/DLL hashes are checked. Build staging is cleared only after its absolute path is checked to equal this checkout's `.build/windows`.
+For an offline build, install the locked npm dependencies ahead of time, and pass `-DependencyRoot` pointing to an extracted, already available official-compatible package containing `runtime/node.exe`, the Node.js licenses/checksums, the three WebView2 DLLs and their license/notice files. The same executable/DLL hashes are checked. Also prepopulate this checkout's `.build/dependencies/traceevent-2.0.77.nupkg` and `.build/dependencies/unsafe-4.5.2.nupkg` using the official URLs and SHA256 pins in `scripts/build-diagnostics.ps1`; those packages are checked even when cached. Build staging is cleared only after its absolute path is checked to equal this checkout's `.build/windows`.
 
 ## Fresh installation
 

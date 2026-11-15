@@ -30,6 +30,7 @@ if ($Action -eq 'Stop') {
     foreach ($suiteProfile in $suiteProfiles) {
         try { Invoke-RestMethod -Uri ('http://127.0.0.1:'+ $suiteProfile.Port +'/api/stop') -Method Post -Headers $suiteHeader -Body '{}' -ContentType 'application/json' -TimeoutSec 3 | Out-Null } catch {}
     }
+    try{Invoke-RestMethod -Uri 'http://127.0.0.1:43131/api/stop' -Method Post -Headers $suiteHeader -TimeoutSec 3|Out-Null}catch{}
     exit
 }
 New-Item -ItemType Directory -Path $suiteData -Force | Out-Null
@@ -86,9 +87,45 @@ function Start-SuiteProfile($profile) {
     $env:MIHOMO_SECRET=''
     Write-SuiteLog ('Started '+$profile.Name+' collector PID '+$suiteProcess.Id)
 }
+function Ensure-SuiteViewer {
+    try{$viewerHealth=Invoke-RestMethod -Uri 'http://127.0.0.1:43131/api/health' -TimeoutSec 2;if($viewerHealth.app -eq 'trafficwatch-overview'){return}}catch{}
+    $old=$suiteChildren['viewer'];if($old -and -not $old.HasExited){return}
+    $env:TRAFFICWATCH_DATA_ROOT=$suiteData
+    $env:TRAFFICWATCH_CACHE_ROOT=Join-Path $suiteData 'viewer-cache'
+    New-Item -ItemType Directory -Path $env:TRAFFICWATCH_CACHE_ROOT -Force|Out-Null
+    $suiteChildren['viewer']=Start-Process -FilePath $suiteNode -ArgumentList '--disable-warning=ExperimentalWarning','src/overview-server.mjs' -WorkingDirectory $suiteApp -WindowStyle Hidden -RedirectStandardOutput (Join-Path $env:TRAFFICWATCH_CACHE_ROOT 'viewer.log') -RedirectStandardError (Join-Path $env:TRAFFICWATCH_CACHE_ROOT 'viewer-error.log') -PassThru
+    Write-SuiteLog ('Started protected viewer PID '+$suiteChildren['viewer'].Id)
+}
+function Ensure-SuiteDiagnostics {
+    if(-not(Test-Path -LiteralPath (Join-Path $suiteData 'vault\vault.json'))){return}
+    foreach($suiteComponent in @('diagnostics','relay-bypass')){
+        if($suiteComponent -eq 'relay-bypass' -and -not $suiteOwnerSettings.RelayHosts){continue}
+        $suiteDisabled=Join-Path $suiteData ($suiteComponent+'\disabled')
+        if(Test-Path -LiteralPath $suiteDisabled){continue}
+        $suiteTaskName=if($suiteComponent -eq 'diagnostics'){'TrafficWatch - AI diagnostics'}else{'TrafficWatch - Relay physical bypass'}
+        $suiteTask=Get-ScheduledTask -TaskName $suiteTaskName -ErrorAction SilentlyContinue
+        if($suiteTask){if($suiteTask.State -ne 'Running'){Start-ScheduledTask -TaskName $suiteTaskName};continue}
+        $suiteOld=$suiteChildren[$suiteComponent];if($suiteOld -and -not $suiteOld.HasExited){continue}
+        $suiteLive=$false
+        if($suiteComponent -eq 'diagnostics'){
+            try{$suiteStatus=Invoke-RestMethod -Uri 'http://127.0.0.1:43132/api/health' -TimeoutSec 1;$suiteLive=$suiteStatus.app -eq 'trafficwatch-ai-diagnostics'}catch{}
+        }else{
+            if(-not $suiteOwnerSettings.RelayHosts){continue}
+            $suiteBypassState=Join-Path $suiteData 'relay-bypass\status.json'
+            try{$suiteStatus=Get-Content -LiteralPath $suiteBypassState -Raw|ConvertFrom-Json;$suiteLive=$suiteStatus.state -notin @('stopped','rolled_back') -and ([DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds()-$suiteStatus.at -lt 150000) -and [bool](Get-Process -Id $suiteStatus.pid -ErrorAction SilentlyContinue)}catch{}
+        }
+        if($suiteLive){continue}
+        $suiteScript=if($suiteComponent -eq 'diagnostics'){'src/ai-diagnostic-daemon.mjs'}else{'src/relay-bypass.mjs'}
+        $suiteDir=Join-Path $suiteData $suiteComponent;[IO.Directory]::CreateDirectory($suiteDir)|Out-Null
+        $suiteChildren[$suiteComponent]=Start-Process -FilePath $suiteNode -ArgumentList '--disable-warning=ExperimentalWarning',$suiteScript -WorkingDirectory $suiteApp -WindowStyle Hidden -RedirectStandardOutput (Join-Path $suiteDir 'daemon.log') -RedirectStandardError (Join-Path $suiteDir 'daemon-error.log') -PassThru
+        Write-SuiteLog ('Started '+$suiteComponent+' PID '+$suiteChildren[$suiteComponent].Id)
+    }
+}
 Write-SuiteLog 'Supervisor started; Windows native and Mihomo databases are independent.'
 Repair-SuiteNativeSessions
 while (-not (Test-Path -LiteralPath $suiteStopSignal)) {
+    try{Ensure-SuiteViewer}catch{Write-SuiteLog ('Viewer start failed: '+$_.Exception.Message)}
+    try{Ensure-SuiteDiagnostics}catch{Write-SuiteLog 'Diagnostics background start failed.'}
     foreach ($suiteProfile in $suiteProfiles) {
         if (Test-Path -LiteralPath $suiteStopSignal) { break }
         $suiteHealth=Read-SuiteHealth $suiteProfile
@@ -109,6 +146,7 @@ while (-not (Test-Path -LiteralPath $suiteStopSignal)) {
 foreach ($suiteProfile in $suiteProfiles) {
     try { Invoke-RestMethod -Uri ('http://127.0.0.1:'+ $suiteProfile.Port +'/api/stop') -Method Post -Headers $suiteHeader -Body '{}' -ContentType 'application/json' -TimeoutSec 3 | Out-Null } catch {}
 }
+try{Invoke-RestMethod -Uri 'http://127.0.0.1:43131/api/stop' -Method Post -Headers $suiteHeader -TimeoutSec 3|Out-Null}catch{}
 $suiteStopDeadline=(Get-Date).AddSeconds(15)
 do {
     $suiteLiveHelpers=@(Get-Process -Name 'Codex-Netwatch-Capture' -ErrorAction SilentlyContinue)

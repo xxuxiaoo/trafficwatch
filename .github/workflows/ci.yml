@@ -26,6 +26,7 @@ jobs:
       - uses: actions/setup-node@v4
         with:
           node-version: '24'
+      - run: npm ci --ignore-scripts --no-audit --no-fund
       - run: npm run check
       - name: Build and self-test the Windows native helper
         if: runner.os == 'Windows'
@@ -43,6 +44,7 @@ jobs:
       - uses: actions/setup-node@v4
         with:
           node-version: '24'
+      - run: npm ci --ignore-scripts --no-audit --no-fund
       - name: Build Windows package
         shell: powershell
         run: powershell.exe -NoProfile -ExecutionPolicy Bypass -File scripts/build-windows.ps1

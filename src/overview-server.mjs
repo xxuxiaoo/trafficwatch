@@ -4,21 +4,49 @@ import http from 'node:http';
 import { fileURLToPath } from 'node:url';
 import { HistoryReader } from './history-reader.mjs';
 import { DEFAULT_CODEX_PROCESS_NAMES, normalizeHarnessApps } from './harness.mjs';
+import { VaultService } from './vault-service.mjs';
+import { vaultRoute } from './vault-router.mjs';
+import { signCommand } from './vault-commands.mjs';
+import { csvCell } from './server.mjs';
+import { VERSION } from './version.mjs';
+import { diagnosticRoute } from './ai-diagnostic-router.mjs';
 
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
+export function startOverviewServer({guardFactory,listenPort,suiteSettings,historyRoot,sourcePorts,readerFactory=(data,options)=>new HistoryReader(data,options)}={}){
 const settingsPath = path.join(root, 'suite-settings.json');
-const settings = fs.existsSync(settingsPath)
+const settings = suiteSettings||(fs.existsSync(settingsPath)
   ? JSON.parse(fs.readFileSync(settingsPath, 'utf8').replace(/^\uFEFF/, ''))
-  : {};
-const dataRoot = path.resolve(process.env.TRAFFICWATCH_DATA_ROOT || settings.DataRoot || path.join(root, 'data'));
-const port = Number(process.env.TRAFFICWATCH_OVERVIEW_PORT || 43131);
+  : {});
+const dataRoot = path.resolve(historyRoot||process.env.TRAFFICWATCH_DATA_ROOT || settings.DataRoot || path.join(root, 'data'));
+const port = Number(listenPort||process.env.TRAFFICWATCH_OVERVIEW_PORT || 43131);
 if (!Number.isInteger(port) || port < 1024 || port > 65535) throw new Error('Invalid overview port');
 const host = `127.0.0.1:${port}`;
+const collectorPorts=sourcePorts||[Number(process.env.TRAFFICWATCH_MACHINE_PORT||43128),Number(process.env.TRAFFICWATCH_CLASH_PORT||43130)];
+if(collectorPorts.some(value=>!Number.isInteger(value)||value<1024||value>65535))throw new Error('Invalid collector port');
 const cacheRoot = process.env.TRAFFICWATCH_CACHE_ROOT || path.join(dataRoot, 'viewer-cache');
-const fullReader = new HistoryReader({ dataRoot, cacheRoot });
-const quickReader = new HistoryReader({ dataRoot }, { timeoutMs: 12000 });
+const encryptedCacheRoot=path.join(cacheRoot,'encrypted-v1');
+const makeReader=(role,keyEntries)=>readerFactory({dataRoot,...(role==='history'?{cacheRoot:keyEntries?encryptedCacheRoot:cacheRoot}:{}),...(keyEntries?{keyEntries}:{})},{timeoutMs:role==='quick'?12000:role==='detail'?20000:45000},role);
+let fullReader=makeReader('history'),quickReader=makeReader('quick'),detailReader=makeReader('detail');
 const cache = new Map(), updating = new Set();
-let appsCache = null, appsPending = null, liveCache = null, livePending = null;
+let appsCache = null, appsPending = null, liveCache = null, livePending = null,cacheGeneration=0;
+const clearCache=()=>{cacheGeneration++;cache.clear();updating.clear();appsCache=appsPending=liveCache=livePending=null;};
+const vault=new VaultService({dataRoot,cacheRoot:encryptedCacheRoot,ownerSid:settings.OwnerSid,guardFactory,onLock:clearCache,onKeys:entries=>{
+  fullReader.close();quickReader.close();detailReader.close();clearCache();
+  fullReader=makeReader('history',entries);quickReader=makeReader('quick',entries);detailReader=makeReader('detail',entries);
+},onMaintenance:async active=>{
+  if(active){await Promise.all([fullReader.close(),quickReader.close(),detailReader.close()]);clearCache();}
+  else{
+    fullReader=makeReader('history',vault.keyEntries);quickReader=makeReader('quick',vault.keyEntries);detailReader=makeReader('detail',vault.keyEntries);clearCache();
+  }
+},waitForCollectors:async()=>{
+  for(let attempt=0;attempt<20;attempt++){
+    const states=await Promise.all(collectorPorts.map(async collectorPort=>{
+      try{const response=await fetch(`http://127.0.0.1:${collectorPort}/api/health`,{signal:AbortSignal.timeout(700)});const state=await response.json();return state.app==='codex-flow'?state.sealedStorage===true:false;}catch{return true;}
+    }));
+    if(states.every(Boolean))return;await new Promise(resolve=>setTimeout(resolve,500));
+  }
+  throw new Error('vault_collectors_need_update');
+}});
 function storeCache(key, data) {
   cache.delete(key); cache.set(key, { at: Date.now(), data, size: JSON.stringify(data).length });
   let size = [...cache.values()].reduce((n,item) => n+item.size,0);
@@ -27,18 +55,18 @@ function storeCache(key, data) {
 async function query(payload, { signal, quick = false, fresh = false } = {}) {
   const key = JSON.stringify([payload, new Date(Date.now()+8*3600000).toISOString().slice(0,10)]);
   const entry = cache.get(key), ttl = quick ? 10000 : payload.type === 'detail' ? 30000 : 60000;
-  const reader = quick ? quickReader : fullReader;
+  const reader = quick ? quickReader : payload.type==='detail'?detailReader:fullReader,currentGeneration=cacheGeneration;
   const load = async (signal) => {
     const result = await reader.query(payload, { signal });
     const data = { ...result, generatedAt: Date.now() };
     // An unreadable lane must not evict a previous good snapshot.
-    if (!data.machine || data.machine.available || data.clash?.available) storeCache(key,data);
+    if (currentGeneration===cacheGeneration&&(!data.machine || data.machine.available || data.clash?.available)) storeCache(key,data);
     return data;
   };
   if (entry && !(fresh && Date.now()-entry.at > 1000)) {
     cache.delete(key); cache.set(key,entry);
     if (Date.now()-entry.at >= ttl && !updating.has(key)) {
-      updating.add(key); load().catch(()=>{}).finally(()=>updating.delete(key));
+      updating.add(key); load().catch(()=>{}).finally(()=>{if(currentGeneration===cacheGeneration)updating.delete(key);});
     }
     return { ...entry.data, refreshing: Date.now()-entry.at >= ttl };
   }
@@ -51,7 +79,7 @@ async function live(collectorPort) {
       headers: { 'x-codex-flow': '1' }, signal: AbortSignal.timeout(900),
     });
     if (!response.ok) return null;
-    const data = await response.json();
+    const data = vault.decryptLive(await response.json());
     return data.app === 'trafficwatch-live' ? data : null;
   } catch { return null; }
 }
@@ -62,8 +90,11 @@ async function harnessApps() {
   appsPending = loadHarnessApps().finally(()=>{appsPending=null;}); return appsPending;
 }
 async function loadHarnessApps() {
+  if(vault.configured){
+    const saved=await quickReader.query({type:'apps'});appsCache={at:Date.now(),apps:saved.apps};return saved.apps;
+  }
   try {
-    const response = await fetch('http://127.0.0.1:43128/api/harness-apps', {
+    const response = await fetch(`http://127.0.0.1:${collectorPorts[0]}/api/harness-apps`, {
       headers: { 'x-codex-flow': '1' }, signal: AbortSignal.timeout(1200),
     });
     if (response.ok) {
@@ -81,7 +112,7 @@ async function loadHarnessApps() {
 }
 async function livePacket() {
   if (liveCache && Date.now()-liveCache.at < 1500) return liveCache.value;
-  if (!livePending) livePending = Promise.all([live(43128),live(43130)]).then(([machine,clash])=>{
+  if (!livePending) livePending = Promise.all(collectorPorts.map(live)).then(([machine,clash])=>{
     const value = { live: { machine,clash },generatedAt:Date.now() }; liveCache = { at:Date.now(),value }; return value;
   }).finally(()=>{livePending=null;});
   return livePending;
@@ -109,7 +140,7 @@ function readJson(req, limit = 4096) {
 async function updateHarnessApps(apps) {
   const current = await harnessApps();
   const normalized = normalizeHarnessApps(apps, current.codex);
-  const previous = await Promise.all([43128, 43130].map(async (collectorPort) => {
+  const previous = vault.configured?[current,current]:await Promise.all(collectorPorts.map(async (collectorPort) => {
     const response = await fetch(`http://127.0.0.1:${collectorPort}/api/harness-apps`, {
       headers: { 'x-codex-flow': '1' }, signal: AbortSignal.timeout(2000),
     });
@@ -118,10 +149,10 @@ async function updateHarnessApps(apps) {
   }));
   const changed = [];
   try {
-    for (const [index, collectorPort] of [43128, 43130].entries()) {
+    for (const [index, collectorPort] of collectorPorts.entries()) {
       const response = await fetch(`http://127.0.0.1:${collectorPort}/api/harness-apps`, {
         method: 'POST',
-        headers: { 'x-codex-flow': '1', 'content-type': 'application/json' },
+        headers: { 'x-codex-flow': '1', 'content-type': 'application/json',...(vault.configured?{'x-trafficwatch-command':signCommand('/api/harness-apps',{apps:normalized},vault.secrets)}:{}) },
         body: JSON.stringify({ apps: normalized }),
         signal: AbortSignal.timeout(2500),
       });
@@ -132,8 +163,8 @@ async function updateHarnessApps(apps) {
     let recovered = true;
     for (const index of changed) {
       try {
-        const response = await fetch(`http://127.0.0.1:${[43128,43130][index]}/api/harness-apps`, {
-          method: 'POST', headers: { 'x-codex-flow': '1', 'content-type': 'application/json' },
+        const response = await fetch(`http://127.0.0.1:${collectorPorts[index]}/api/harness-apps`, {
+          method: 'POST', headers: { 'x-codex-flow': '1', 'content-type': 'application/json',...(vault.configured?{'x-trafficwatch-command':signCommand('/api/harness-apps',{apps:previous[index]},vault.secrets)}:{}) },
           body: JSON.stringify({ apps: previous[index] }), signal: AbortSignal.timeout(2500),
         });
         recovered &&= response.ok;
@@ -151,10 +182,25 @@ const assets = new Map([
   ['/overview', ['overview.html', 'text/html; charset=utf-8']],
   ['/overview.css', ['overview.css', 'text/css; charset=utf-8']],
   ['/overview.js', ['overview.js', 'text/javascript; charset=utf-8']],
+  ['/security', ['vault.html','text/html; charset=utf-8']],
+  ['/vault.js', ['vault.js','text/javascript; charset=utf-8']],
+  ['/vault-browser.mjs', ['vault-browser.mjs','text/javascript; charset=utf-8']],
+  ['/vault.css', ['vault.css','text/css; charset=utf-8']],
+  ['/storage', ['storage.html','text/html; charset=utf-8']],
+  ['/storage.js', ['storage.js','text/javascript; charset=utf-8']],
+  ['/storage.css', ['storage.css','text/css; charset=utf-8']],
+  ['/diagnostics', ['diagnostics.html','text/html; charset=utf-8']],
+  ['/diagnostics.js', ['diagnostics.js','text/javascript; charset=utf-8']],
+  ['/diagnostics.css', ['diagnostics.css','text/css; charset=utf-8']],
   ['/icon.svg', ['icon.svg', 'image/svg+xml']],
+  ['/legacy',['index.html','text/html; charset=utf-8']],
+  ...['app.js','i18n.js','desktop.js','history.js','setup.js'].map(file=>['/'+file,[file,'text/javascript; charset=utf-8']]),
+  ['/style.css',['style.css','text/css; charset=utf-8']],
 ]);
 
 const server = http.createServer(async (req, res) => {
+  let securityContext;
+  const bearer=String(req.headers.authorization||'').replace(/^Bearer /,'');
   const abort = new AbortController();
   res.once('close', () => { if (!res.writableEnded) abort.abort(); });
   res.setHeader('Cache-Control', 'no-store');
@@ -162,19 +208,60 @@ const server = http.createServer(async (req, res) => {
   res.setHeader('Referrer-Policy', 'no-referrer');
   res.setHeader('X-Frame-Options', 'DENY');
   res.setHeader('Content-Security-Policy', "default-src 'self'; script-src 'self'; style-src 'self'; img-src 'self'; connect-src 'self'; object-src 'none'; frame-ancestors 'none'; base-uri 'none'; form-action 'self'");
-  const json = (code, data) => { res.writeHead(code, { 'Content-Type': 'application/json; charset=utf-8' }); res.end(JSON.stringify(data)); };
+  const json = (code, data) => {
+    if(code===200&&securityContext&&vault.configured){
+      try{vault.actor(bearer,securityContext);}catch{code=423;data={error:'vault_locked'};}
+    }
+    res.writeHead(code, { 'Content-Type': 'application/json; charset=utf-8' }); res.end(JSON.stringify(data));
+  };
   if (req.headers.host !== host || (req.headers.origin && req.headers.origin !== `http://${host}`))
     return json(403, { error: 'local_origin_required' });
   try {
     const url = new URL(req.url, `http://${host}`);
     if (req.method === 'GET' && url.pathname === '/api/health')
-      return json(200, { app: 'trafficwatch-overview', version: '0.7.2', collectorPid: process.pid, readOnly: true,
-        performance: { quick: quickReader.stats(), history: fullReader.stats(), cachedQueries: cache.size } });
+      return json(200, { app: 'trafficwatch-overview', version: VERSION, collectorPid: process.pid, readOnly: true,
+        performance: { quick: quickReader.stats(), history: fullReader.stats(), detail:detailReader.stats(),cachedQueries: cache.size } });
     if (url.pathname.startsWith('/api/')) {
       if (req.headers['x-codex-flow'] !== '1') return json(403, { error: 'local_header_required' });
+      if(await vaultRoute({req,url,json,vault,readJson,clearCache}))return;
+      if(await diagnosticRoute({req,url,json,vault,readJson,dataRoot,token:bearer}))return;
       if (req.method === 'POST' && url.pathname === '/api/stop') {
         json(200, { ok: true }); setTimeout(close, 100); return;
       }
+      let actor;
+      if(vault.configured){
+        securityContext={operation:url.pathname==='/api/harness-apps'&&req.method==='POST'?'rules':url.searchParams.get('export')==='1'?'export':'read',lane:url.pathname==='/api/detail'?(url.searchParams.get('lane')||'windows'):undefined};
+        actor=vault.actor(bearer,securityContext);
+        if(req.method==='GET'&&url.pathname==='/api/live'){
+          if(!actor.owner)return json(403,{error:'grant_live_not_available'});
+          return json(200,await livePacket());
+        }
+        if(!vault.ready)return json(503,{error:'vault_migrating'});
+        if(vault.storageBusy)return json(503,{error:'vault_storage_busy'});
+      }
+      const authorization=actor&&!actor.owner?{authorizedWindows:actor.windows,allowedLanes:actor.lanes}:{};
+      if(url.pathname.startsWith('/api/legacy/')){
+        if(vault.configured)vault.owner(bearer);
+        const match=/^\/api\/legacy\/(windows|clash)\/(dashboard|calendar|report|correlation|export|settings|capture|stop|update|diagnostics)$/.exec(url.pathname);
+        if(!match)return json(404,{error:'not_found'});
+        const [,lane,operation]=match,route='/api/'+operation,collectorPort=collectorPorts[lane==='windows'?0:1];
+        if(req.method==='POST'){
+          if(!['settings','capture','stop'].includes(operation))return json(403,{error:'legacy_operation_unavailable'});
+          const body=await readJson(req),response=await fetch(`http://127.0.0.1:${collectorPort}${route}`,{method:'POST',headers:{'x-codex-flow':'1','content-type':'application/json',...(vault.configured?{'x-trafficwatch-command':signCommand(route,body,vault.secrets)}:{})},body:JSON.stringify(body),signal:AbortSignal.timeout(10000)});
+          return json(response.status,await response.json());
+        }
+        if(operation==='update')return json(200,{supported:false,state:'unavailable',current:'0.8.0'});
+        if(operation==='diagnostics')return json(200,{app:'trafficwatch',protected:vault.configured,legacy:true});
+        const packet=await livePacket();
+        const result=await fullReader.query({type:'legacy',options:{lane,route,params:url.searchParams.toString(),live:packet.live[lane==='windows'?'machine':'clash']}},{signal:abort.signal});
+        if(vault.configured)vault.owner(bearer);
+        if(operation==='export'){
+          const columns=['host','process','pid','scope','evidence','network','up','down','last_seen'];
+          res.writeHead(200,{'content-type':'text/csv; charset=utf-8','content-disposition':'attachment; filename="trafficwatch-connections.csv"'});res.end('\uFEFF'+[columns.join(','),...result.rows.map(row=>columns.map(column=>csvCell(row[column])).join(','))].join('\r\n'));return;
+        }
+        return json(200,result);
+      }
+      if(actor&&!actor.owner)vault.audit(actor.id,'query',{route:url.pathname,range:url.searchParams.get('range'),lane:securityContext.lane});
       if (req.method === 'GET' && url.pathname === '/api/harness-apps')
         return json(200, { apps: await harnessApps() });
       if (req.method === 'POST' && url.pathname === '/api/harness-apps') {
@@ -189,11 +276,12 @@ const server = http.createServer(async (req, res) => {
         const apps = await harnessApps();
         const quick = url.searchParams.get('quick') === '1';
         const [data, packet] = await Promise.all([
-          query({ type: 'overview', range, date, options: { apps, quick } }, { signal: abort.signal, quick, fresh: url.searchParams.get('fresh') === '1' }), livePacket(),
+          query({ type: 'overview', range, date, options: { apps, quick,...authorization } }, { signal: abort.signal, quick, fresh: url.searchParams.get('fresh') === '1' }),actor&&!actor.owner?{live:{machine:null,clash:null}}:livePacket(),
         ]);
-        return json(200, { ...data, apps, live: packet.live });
+        return json(200, { ...data, apps, live: packet.live,backgroundImport:actor?.owner?vault.backgroundImport||null:undefined,...(actor&&!actor.owner?{authorization:{lanes:actor.lanes,windows:actor.windows,expiresAt:actor.expiresAt}}:{}) });
       }
       if (req.method === 'GET' && url.pathname === '/api/live') {
+        if(actor&&!actor.owner)return json(403,{error:'grant_live_not_available'});
         return json(200, await livePacket());
       }
       if (req.method === 'GET' && url.pathname === '/api/detail') {
@@ -217,12 +305,13 @@ const server = http.createServer(async (req, res) => {
           from: url.searchParams.has('from') ? url.searchParams.get('from') : undefined,
           to: url.searchParams.has('to') ? url.searchParams.get('to') : undefined,
           apps: await harnessApps(),
+          ...authorization,
         };
         if (options.family && !['codex', 'claude', 'dsh'].includes(options.family)) return json(400, { error: 'invalid_family' });
         if (options.scope && !['codex','other','unknown'].includes(options.scope)) return json(400, { error: 'invalid_scope' });
         if (options.export) options.export = true;
         const result = await query({ type: 'detail', range, options }, { signal: abort.signal });
-        return json(200, result.detail);
+        return json(200, {...result.detail,...(actor&&!actor.owner?{authorization:{lanes:actor.lanes,windows:actor.windows,expiresAt:actor.expiresAt}}:{})});
       }
       return json(404, { error: 'not_found' });
     }
@@ -232,16 +321,19 @@ const server = http.createServer(async (req, res) => {
     fs.createReadStream(path.join(root, 'public', asset[0])).on('error', () => res.destroy()).pipe(res);
   } catch (error) {
     if (res.destroyed || error.message === 'request_cancelled') return;
-    if (!res.headersSent) json(error.message === 'Invalid range' || error.message === 'Invalid date' || error.message === 'invalid_range' ? 400 : 503, { error: ['invalid_range','history_busy','history_timeout'].includes(error.message) ? error.message : 'history_unavailable' });
+    if (!res.headersSent) json(['vault_migrating','vault_busy','vault_storage_busy'].includes(error.message)?503:/^(vault_|grant_)/.test(error.message)?423:error.message === 'Invalid range' || error.message === 'Invalid date' || error.message === 'invalid_range' ? 400 : 503, { error: /^(vault_|grant_)/.test(error.message)||['invalid_range','history_busy','history_timeout'].includes(error.message) ? error.message : 'history_unavailable' });
     else res.end();
   }
 });
 
 function close() {
-  server.close(); server.closeIdleConnections(); fullReader.close(); quickReader.close();
-  setTimeout(() => process.exit(0), 200).unref();
+  server.close(); server.closeIdleConnections();vault.close(); fullReader.close(); quickReader.close();detailReader.close();
+  process.removeListener('SIGINT',close);process.removeListener('SIGTERM',close);
 }
-server.on('error', () => { fullReader.close(); quickReader.close(); process.exit(1); });
+server.on('error', () => {vault.close(); fullReader.close(); quickReader.close();detailReader.close(); process.exit(1); });
 server.listen(port, '127.0.0.1');
 process.once('SIGINT', close);
 process.once('SIGTERM', close);
+return {server,vault,close};
+}
+if(process.argv[1]&&path.resolve(process.argv[1])===fileURLToPath(import.meta.url))startOverviewServer();

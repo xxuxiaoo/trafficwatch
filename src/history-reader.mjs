@@ -6,7 +6,7 @@ export class HistoryReader {
   constructor(workerData, { timeoutMs = 45000, maxQueue = 8, createWorker } = {}) {
     this.workerData = workerData; this.timeoutMs = timeoutMs; this.maxQueue = maxQueue;
     this.createWorker = createWorker || (() => new Worker(new URL('./overview-data.mjs', import.meta.url), { workerData, resourceLimits: { maxOldGenerationSizeMb: 192 } }));
-    this.queue = []; this.sequence = 0; this.restarts = 0; this.completed = 0; this.closed = false;
+    this.queue = []; this.sequence = 0; this.restarts = 0; this.completed = 0; this.failed = 0; this.lastError = null; this.closed = false;
   }
   query(payload, { signal } = {}) {
     if (this.closed || signal?.aborted) return Promise.reject(new Error('request_cancelled'));
@@ -33,31 +33,39 @@ export class HistoryReader {
     if (this.closed || this.active || this.restarting || !this.queue.length) return;
     if (!this.worker) {
       const worker = this.worker = this.createWorker();
-      worker.on('message', ({ id, data, error }) => {
-        if (this.worker === worker && id === this.active?.id) { this.completed++; this.finish(error ? new Error(error) : null, data); }
+      worker.on('message', ({ id, data, error, event, stage, lane }) => {
+        if (this.worker !== worker || id !== this.active?.id) return;
+        if(event==='progress'){this.active.stage=stage;this.active.lane=lane;return;}
+        if(!error)this.completed++;
+        this.finish(error ? new Error(error) : null, data);
       });
       const failed = () => { if (this.worker === worker) this.finish(new Error('reader_unavailable'), undefined, true); };
       worker.on('error', failed); worker.on('exit', failed);
     }
     this.active = this.queue.shift();
+    this.active.startedAt=Date.now();this.active.stage='opening';
     this.timer = setTimeout(() => this.finish(new Error('history_timeout'), undefined, true), this.timeoutMs);
     this.worker.postMessage({ ...this.active.payload, id: this.active.id, now: Date.now() });
   }
   finish(error, data, replace = false) {
     clearTimeout(this.timer);
     const active = this.active; this.active = null;
+    if(active&&error&&error.message!=='request_cancelled'){this.failed++;this.lastError=error.message;}
+    else if(active&&!error)this.lastError=null;
     if (active) for (const subscriber of active.subscribers) {
       subscriber.cleanup(); error ? subscriber.reject(error) : subscriber.resolve(data);
     }
     if (replace && this.worker) {
       const worker = this.worker; this.worker = null; this.restarting = true; this.restarts++;
-      Promise.resolve(worker.terminate()).finally(() => { this.restarting = false; this.pump(); });
+      this.termination=Promise.resolve(worker.terminate()).finally(() => { this.restarting = false; this.pump(); });
     } else this.pump();
   }
-  stats() { return { active: Boolean(this.active), queued: this.queue.length, restarts: this.restarts, completed: this.completed }; }
+  stats() { return { active: Boolean(this.active), queued: this.queue.length, restarts: this.restarts, completed: this.completed, failed:this.failed,lastError:this.lastError,
+    ...(this.active?{stage:this.active.stage,lane:this.active.lane,elapsedMs:Date.now()-this.active.startedAt}:{}) }; }
   close() {
     this.closed = true;
     for (const task of this.queue.splice(0)) for (const subscriber of task.subscribers) { subscriber.cleanup(); subscriber.reject(new Error('request_cancelled')); }
     this.finish(new Error('request_cancelled'), undefined, true);
+    return this.termination;
   }
 }

@@ -1,4 +1,16 @@
+import {initializeVault,vaultHeaders,checkVaultResponse} from './vault-browser.mjs';
 const $ = (id) => document.getElementById(id);
+let vaultState;
+await initializeVault({overview:true,onStatus:value=>{
+  const previous=vaultState;vaultState=value;renderImportState();
+  if(previous&&(!previous.ready&&value.ready||previous.backgroundImport?.state==='running'&&value.backgroundImport?.state==='complete'))refresh(true);
+}});
+function renderImportState(){
+  const target=$('backgroundImportNotice');if(!target)return;
+  const importing=vaultState?.backgroundImport,state=importing?.state;
+  target.hidden=!['running','paused'].includes(state);
+  target.textContent=state==='paused'?'已有历史可以查看；部分新记录暂未补齐，后台将自动重试。采集仍在继续。':state==='running'?'已有历史已可查看；锁定期间的新记录正在后台分批补齐，统计会随之更新，采集继续运行。':'';
+}
 const pageNames = {
   overview: '流量总览',
   apps: '本机全部应用',
@@ -37,25 +49,7 @@ let snapshotWritePending = false;
 function saveSnapshot(key, value) {
   snapshotCache.delete(key); snapshotCache.set(key,value);
   while (snapshotCache.size > 6) snapshotCache.delete(snapshotCache.keys().next().value);
-  if (snapshotWritePending) return;
-  snapshotWritePending = true;
-  const write = () => {
-    snapshotWritePending = false;
-    try {
-      const content = JSON.stringify([...snapshotCache]);
-      if (content.length < 1200000) localStorage.setItem('trafficwatch-snapshots-v7',content);
-    } catch { /* A full or disabled browser store never prevents live history. */ }
-  };
-  // Storage serialization and synchronous disk-backed writes do not belong in
-  // the response/render task. Coalesce them when the main thread has idle time.
-  if ('requestIdleCallback' in window) requestIdleCallback(write, { timeout: 5000 });
-  else setTimeout(write, 1500);
 }
-try {
-  for (const [key,value] of JSON.parse(localStorage.getItem('trafficwatch-snapshots-v7') || '[]').slice(-6)) {
-    if (value?.machine?.range && value?.clash?.range) snapshotCache.set(key,value);
-  }
-} catch { /* Ignore a stale browser snapshot. */ }
 
 function readPreferences() {
   try {
@@ -134,12 +128,13 @@ async function api(url, options = {}) {
   const response = await fetch(url, {
     ...options,
     signal: options.signal ? AbortSignal.any([options.signal, AbortSignal.timeout(options.timeoutMs || 55000)]) : AbortSignal.timeout(options.timeoutMs || 55000),
-    headers: { 'X-Codex-Flow': '1', ...(options.body ? { 'Content-Type': 'application/json' } : {}), ...options.headers },
+    headers: { 'X-Codex-Flow': '1',...vaultHeaders(), ...(options.body ? { 'Content-Type': 'application/json' } : {}), ...options.headers },
   });
+  await checkVaultResponse(response);
   if (!response.ok) {
     const value = await response.json().catch(() => ({}));
-    const labels = { history_timeout: '历史查询超时，请重试', history_busy: '历史查询繁忙，请稍后重试', history_unavailable: '历史暂时不可读', invalid_range: '日期或时段无效' };
-    throw new Error(labels[value.error] || value.error || `本机服务响应 ${response.status}`);
+    const labels = { history_timeout: '历史查询超时，请重试', history_busy: '历史查询繁忙，请稍后重试', history_unavailable: '历史暂时不可读', invalid_range: '日期或时段无效',vault_migrating:'正在打开加密记录，完成后会自动加载。',vault_storage_busy:'正在回收数据库空页，完成后恢复查询；采集照常继续' };
+    throw Object.assign(new Error(labels[value.error] || value.error || `本机服务响应 ${response.status}`),{code:value.error});
   }
   return response.json();
 }
@@ -157,8 +152,12 @@ function rangeLabel() {
   if (range === 'all') return '全部已保留记录';
   return `最近 ${range === '24h' ? '24 小时' : range === '7d' ? '7 天' : '30 天'}`;
 }
-function setView(next) {
+function setView(next,{resumeDetails=true}={}) {
   if (!Object.hasOwn(pageNames, next)) return;
+  if(view!==next){
+    if(['apps','ladder'].includes(view)){detailAbort?.abort();detailSequence++;}
+    if(view==='harness'){harnessAbort?.abort();harnessSequence++;harnessLoadedKey='';}
+  }
   hideChartTooltip();
   for (const canvas of document.querySelectorAll('canvas')) {
     // Hidden pages need no GPU backing store. Their data will redraw on entry.
@@ -174,8 +173,8 @@ function setView(next) {
   $('pageTitle').textContent = view === 'overview' ? '流量总览' : pageNames[view];
   renderHeader();
   if (view === 'overview') renderOverview();
-  if (view === 'apps') renderApps();
-  if (view === 'ladder') renderLadder();
+  if (view === 'apps') {renderApps();if(resumeDetails&&activeAppDetail&&!appDetailData)loadAppDetail(activeAppDetail);}
+  if (view === 'ladder') {renderLadder();if(resumeDetails&&activeLadderDetail&&!ladderDetailData)loadLadderDetail(activeLadderDetail);}
   if (view === 'harness') { renderHarnessTabs(); if (harnessResult?.[0] === activeFamily) renderHarness(...harnessResult); if (dataKey === queryKey()) loadHarness(activeFamily); }
   if (view === 'investigate') renderInvestigation();
   if (view === 'settings') renderSettings();
@@ -214,6 +213,16 @@ function renderHeader() {
   setText($('updatedAt'), data?.generatedAt ? `最近更新 ${time(data.generatedAt, true)}` : '等待本机数据');
   setText($('historyStatus'), historyState === 'loading' ? (dataKey === queryKey() ? '正在更新统计…' : '正在读取所选时间…') : historyState === 'error' ? `更新未完成：${historyError}` : `${rangeLabel()} · ${data?.generatedAt ? time(data.generatedAt) + ' 更新' : '等待记录'}`);
   setAttribute($('refreshButton'), 'aria-busy', String(historyState === 'loading'));
+  renderPendingAttribution();
+}
+function renderPendingAttribution(){
+  if(dataKey!==queryKey()||data?.machine?.detailReady!==false)return;
+  const failed=historyState==='error';
+  setText($('overviewHarness'),failed?'暂未完成':'统计中');setText($('overviewUnknown'),failed?'暂未完成':'统计中');
+  setText($('overviewHarnessBreakdown'),failed?'应用归因查询失败，点击右上角刷新重试':'总量已就绪，应用归因正在加载');
+  setText($('overviewUnknownNote'),failed?'总量已保留；详细统计可重试':'详细统计加载后显示');
+  const target=$('topProcessRows'),label=failed?'应用统计暂未完成，请点击右上角刷新重试。':'正在汇总应用，当前总量已可查看…';
+  if(target.textContent!==label)target.replaceChildren(node('p',label,'empty-state'));
 }
 function renderTotals(target, row, onSelect) {
   target.replaceChildren();
@@ -493,8 +502,7 @@ function renderOverview() {
   $('overviewUnknown').textContent = bytes(unknownBytes);
   $('overviewUnknownNote').textContent = `待识别进程 ${bytes(total(familyTotals.unknown))} · 未归因差额 ${bytes(total(machine.unassigned))}`;
   if (machine.detailReady === false) {
-    $('overviewHarness').textContent = '统计中'; $('overviewUnknown').textContent = '统计中';
-    $('overviewHarnessBreakdown').textContent = '总量已就绪，应用归因正在加载'; $('overviewUnknownNote').textContent = '详细统计加载后显示';
+    renderPendingAttribution();
   }
   $('measurementNote').textContent = '本机总量来自 Windows 进程事件；梯子只计 Clash 已归因到代理节点的连接。两种位置分别记数，代理进程与应用可重复出现，不要相加当账单。';
 
@@ -506,7 +514,7 @@ function renderOverview() {
   });
   renderPeaks($('peakRows'), machine.peaks, 'machine');
   renderCompactPrograms($('topProcessRows'), machine.allPrograms, 6, (row) => selectApp(row));
-  if (machine.detailReady === false) $('topProcessRows').replaceChildren(node('p','正在汇总应用，当前总量已可查看…','empty-state'));
+  if (machine.detailReady === false) renderPendingAttribution();
   renderIntegrity(machine, clash);
   renderOverviewWarnings(machine, clash);
   renderBudgetStrip();
@@ -631,11 +639,9 @@ function openAppSelection(selection, remember = true) {
   if (remember && activeAppDetail) { detailHistory.push({ ...activeAppDetail }); if(detailHistory.length>20)detailHistory.shift(); }
   activeAppDetail = selection;
   appDetailData = null;
-  setView('apps');
+  setView('apps',{resumeDetails:false});
   $('appDetail').hidden = false;
   $('appDetailTitle').textContent = activeAppDetail.title;
-  $('appDetailMeta').textContent = '正在读取所选时段的分钟流量与目标…';
-  $('appDetailMetrics').replaceChildren(); $('appDestinations').replaceChildren(); $('appConnectionRows').replaceChildren();
   renderApps();
   loadAppDetail(activeAppDetail);
   $('appDetail').scrollIntoView({ behavior: 'smooth', block: 'start' });
@@ -644,6 +650,11 @@ async function loadAppDetail(selection, timeRange = null) {
   detailAbort?.abort(); detailAbort = new AbortController();
   const signal = detailAbort.signal, key = queryKey();
   const current = ++detailSequence;
+  appDetailData=null;
+  $('appDetailMeta').textContent = `${selection.from ? time(selection.from,true)+' 至 '+time(selection.to,true)+' · ' : ''}正在读取所选时段的分钟流量与目标…`;
+  $('appDetail').setAttribute('aria-busy','true');$('exportAppDetail').disabled=true;$('copyEvidence').disabled=true;$('appDetailRetry').hidden=true;
+  for(const id of ['appDetailMetrics','appDestinations','appConnectionRows','detailProcessRows','appPager'])$(id).replaceChildren();
+  releaseChart($('appDetailChart'));
   try {
     const { title, ...filters } = selection;
     if (timeRange) { filters.from = timeRange.from; filters.to = timeRange.to; }
@@ -651,9 +662,10 @@ async function loadAppDetail(selection, timeRange = null) {
     if (current !== detailSequence || key !== queryKey() || signal.aborted) return;
     if (!result.available) throw new Error('该采集源尚未建立历史记录');
     appDetailData = result;
+    $('appDetail').setAttribute('aria-busy','false');$('exportAppDetail').disabled=false;$('copyEvidence').disabled=false;$('appDetailRetry').hidden=true;
     if (view === 'apps') renderAppDetail(selection, result);
   } catch (error) {
-    if (current === detailSequence && !isCancelled(error)) $('appDetailMeta').textContent = `明细暂不可用：${error.message}。可再次点击应用重试。`;
+    if (current === detailSequence && !isCancelled(error)) {$('appDetail').setAttribute('aria-busy','false');$('appDetailMeta').textContent = `明细暂不可用：${error.message}。`;$('appDetailRetry').hidden=false;}
   }
 }
 function renderAppDetail(selection, result) {
@@ -702,6 +714,7 @@ function renderLadder() {
   }
   renderTotals($('routeSummary'), { ...data.clash.groups, unassigned: data.clash.unassigned }, (route) => {
     $('routeFilter').value = route;
+    detailAbort?.abort();detailSequence++;
     activeLadderDetail = null; ladderDetailData = null; $('ladderDetail').hidden = true;
     renderLadder();
   });
@@ -730,8 +743,12 @@ async function loadLadderDetail(selection) {
   ladderDetailData = null;
   $('ladderDetail').hidden = false;
   $('ladderDetailTitle').textContent = selection.title;
-  $('ladderDetailMeta').textContent = '正在读取代理连接与目标…';
-  $('ladderConnectionRows').replaceChildren();
+  $('ladderDetailMeta').textContent = `${selection.from ? time(selection.from,true)+' 至 '+time(selection.to,true)+' · ' : ''}正在读取这个范围的应用与连接…`;
+  $('ladderDetail').setAttribute('aria-busy','true');$('exportLadderDetail').disabled=true;$('ladderDetailRetry').hidden=true;
+  $('ladderConnectionRows').replaceChildren();$('ladderPager').replaceChildren();releaseChart($('ladderDetailChart'));
+  // Navigate as soon as the click is accepted. History work must not hold the
+  // user at the chart with no visible acknowledgement of the selected interval.
+  $('ladderDetail').scrollIntoView({behavior:'smooth',block:'start'});
   const current = ++detailSequence;
   try {
     const result = await requestDetail('clash', {
@@ -746,8 +763,9 @@ async function loadLadderDetail(selection) {
     if (current !== detailSequence || key !== queryKey() || signal.aborted) return;
     if (!result.available) throw new Error('该采集源尚未建立历史记录');
     ladderDetailData = result;
-    if (view === 'ladder') { renderLadderDetail(selection, result); $('ladderDetail').scrollIntoView({ behavior: 'smooth', block: 'start' }); }
-  } catch (error) { if(current === detailSequence && !isCancelled(error)) $('ladderDetailMeta').textContent = `连接明细暂不可用：${error.message}。请再次点击时段重试。`; }
+    $('ladderDetail').setAttribute('aria-busy','false');$('exportLadderDetail').disabled=false;$('ladderDetailRetry').hidden=true;
+    if (view === 'ladder') renderLadderDetail(selection, result);
+  } catch (error) { if(current === detailSequence && !isCancelled(error)) {$('ladderDetail').setAttribute('aria-busy','false');$('ladderDetailMeta').textContent = `连接明细暂不可用：${error.message}。`;$('ladderDetailRetry').hidden=false;} }
 }
 function renderLadderDetail(selection, result) {
   $('ladderDetail').hidden = false;
@@ -778,7 +796,7 @@ function renderHarnessTabs() {
 }
 async function loadHarness(family, force = false) {
   activeFamily = family;
-  const key = `${family}|${range}|${range === 'day' ? selectedDate : ''}|${JSON.stringify(apps)}`;
+  const key = `${family}|${queryKey()}|${JSON.stringify(apps)}`;
   if (!force && key === harnessLoadedKey && Date.now() - harnessLoadedAt < 60000) return;
   harnessAbort?.abort(); harnessAbort = new AbortController(); const signal=harnessAbort.signal, rangeKey=queryKey();
   harnessLoadedKey = key;
@@ -988,9 +1006,9 @@ function acceptOverview(next, key, quick) {
 function refresh(force = false) {
   if (document.hidden) return Promise.resolve();
   const key = queryKey();
-  if (refreshPromise && refreshKey === key) return refreshPromise;
+  if (refreshPromise && refreshKey === key && !force) return refreshPromise;
   historyAbort?.abort(); historyAbort = new AbortController();
-  const signal = historyAbort.signal, current = ++refreshSequence;
+  const signal = historyAbort.signal, current = ++refreshSequence;let preparing=false;
   clearTimeout(refreshTimer); refreshKey = key; historyState = 'loading'; historyError = '';
   if (dataKey !== key) {
     const snapshot = snapshotCache.get(key);
@@ -1011,7 +1029,7 @@ function refresh(force = false) {
           const quick = await api('/api/overview?' + params + '&quick=1' + (force ? '&fresh=1' : ''), { signal, timeoutMs:15000 });
           if (current !== refreshSequence || signal.aborted) return;
           acceptOverview(quick,key,true); quickOk = true;
-        } catch (error) { if(signal.aborted) return; }
+        } catch (error) { if(signal.aborted) return;if(error.code==='vault_migrating')throw error; }
       }
       // A visible, already loaded range needs one update, rather than replaying
       // cached quick/full responses and then rendering both a second time.
@@ -1025,13 +1043,13 @@ function refresh(force = false) {
       }
     } catch (error) {
       if (current !== refreshSequence || signal.aborted || isCancelled(error)) return;
-      historyState = 'error'; historyError = error.message;
+      preparing=error.code==='vault_migrating';historyState = preparing?'loading':'error'; historyError = error.message;
       $('globalNotice').hidden = false;
-      $('globalNotice').textContent = (quickOk ? '总量和趋势已加载，详细归因暂未完成。' : '历史更新暂未完成，已保留上次成功的记录。') + ' 点击右上角刷新可重试。';
+      $('globalNotice').textContent = preparing?'正在打开加密历史，完成后自动显示；后台采集继续，不需要重复输入密码。':(quickOk ? '总量和趋势已加载，详细归因暂未完成。' : '历史更新暂未完成，已保留上次成功的记录。') + ' 点击右上角刷新可重试。';
     } finally {
       if (current === refreshSequence) {
         refreshPromise = null; renderHeader();
-        if (!document.hidden) refreshTimer = setTimeout(()=>refresh(), data?.refreshing ? 5000 : range === 'day' && selectedDate < calendarDate() ? 300000 : 60000);
+        if (!document.hidden) refreshTimer = setTimeout(()=>refresh(),preparing?1500:data?.refreshing ? 5000 : range === 'day' && selectedDate < calendarDate() ? 300000 : 60000);
       }
     }
   };
@@ -1090,6 +1108,8 @@ $('exportApps').addEventListener('click', () => exportAppsCsv(data?.machine?.all
 $('exportAppDetail').addEventListener('click', () => exportAllConnections('windows', activeAppDetail, appDetailData, $('exportAppDetail')));
 $('exportLadder').addEventListener('click', () => exportAppsCsv(data?.clash?.programs || [], '梯子代理应用.csv'));
 $('exportLadderDetail').addEventListener('click', () => exportAllConnections('clash', activeLadderDetail, ladderDetailData, $('exportLadderDetail')));
+$('appDetailRetry').addEventListener('click',()=>{if(activeAppDetail)openAppSelection(activeAppDetail,false);});
+$('ladderDetailRetry').addEventListener('click',()=>{if(activeLadderDetail)loadLadderDetail(activeLadderDetail);});
 $('inspectRange').addEventListener('click', () => {
   const from = Date.parse(`${$('inspectFrom').value}:00+08:00`), to = Date.parse(`${$('inspectTo').value}:00+08:00`);
   if (!Number.isFinite(from) || !Number.isFinite(to) || to <= from || from > Date.now()) { showToast('请选择有效的开始和结束时间，结束需晚于开始。'); return; }
@@ -1097,7 +1117,7 @@ $('inspectRange').addEventListener('click', () => {
 });
 $('detailBack').addEventListener('click', () => { const previous = detailHistory.pop(); if (previous) openAppSelection(previous, false); });
 $('backToApps').addEventListener('click', () => {
-  detailSequence++; activeAppDetail = appDetailData = null; detailHistory=[];
+  detailAbort?.abort();detailSequence++; activeAppDetail = appDetailData = null; detailHistory=[];
   $('appDetail').hidden=true; $('appSearch').value=''; renderApps();
 });
 $('copyEvidence').addEventListener('click', async () => {
@@ -1141,10 +1161,16 @@ $('notificationsEnabled').addEventListener('change', async (event) => {
 });
 document.addEventListener('visibilitychange', () => {
   clearTimeout(refreshTimer); clearTimeout(liveTimer); hideChartTooltip();
-  if(document.hidden){historyAbort?.abort();liveAbort?.abort();detailAbort?.abort();harnessAbort?.abort();refreshSequence++;refreshPromise=null;for(const canvas of document.querySelectorAll('canvas'))releaseChart(canvas);}
-  else{renderCurrentView();refreshLive();refresh();if(activeAppDetail&&!appDetailData)loadAppDetail(activeAppDetail);if(activeLadderDetail&&!ladderDetailData)loadLadderDetail(activeLadderDetail);if(view==='harness'){harnessLoadedKey='';loadHarness(activeFamily);}}
+  if(document.hidden){historyAbort?.abort();liveAbort?.abort();detailAbort?.abort();harnessAbort?.abort();refreshSequence++;detailSequence++;harnessSequence++;harnessLoadedKey='';refreshPromise=null;for(const canvas of document.querySelectorAll('canvas'))releaseChart(canvas);}
+  else{renderCurrentView();refreshLive();refresh();if(view==='apps'&&activeAppDetail&&!appDetailData)loadAppDetail(activeAppDetail);if(view==='ladder'&&activeLadderDetail&&!ladderDetailData)loadLadderDetail(activeLadderDetail);}
 });
 let resizeFrame;
+window.addEventListener('trafficwatch-vault-locked',()=>{
+  clearTimeout(refreshTimer);clearTimeout(liveTimer);clearTimeout(searchTimer);cancelAnimationFrame(resizeFrame);
+  refreshSequence++;detailSequence++;harnessSequence++;refreshPromise=null;
+  historyAbort?.abort();liveAbort?.abort();detailAbort?.abort();harnessAbort?.abort();
+  for(const canvas of document.querySelectorAll('canvas'))releaseChart(canvas);
+});
 window.addEventListener('resize', () => {
   cancelAnimationFrame(resizeFrame);
   resizeFrame=requestAnimationFrame(()=>{
@@ -1158,6 +1184,10 @@ window.addEventListener('resize', () => {
 document.querySelector('.brand').addEventListener('click', (event) => { event.preventDefault(); setView('overview'); });
 renderBudgetSettingsStatus();
 const initialView = location.hash.slice(1);
+const initialParams=new URLSearchParams(location.search);
+if(initialParams.get('range')==='day'&&/^\d{4}-\d{2}-\d{2}$/.test(initialParams.get('date')||'')){
+  range='day';selectedDate=initialParams.get('date');$('range').value=range;$('selectedDate').value=selectedDate;$('selectedDate').hidden=false;
+}
 if (Object.hasOwn(pageNames, initialView)) setView(initialView);
 refreshLive();
 refresh(true);

@@ -80,24 +80,38 @@ foreach($name in $sdkFiles.Keys){Assert-BuildHash (Join-Path $stage $name) $sdkF
 @{version=$nodeVersion;archiveSha256=$nodeArchiveSha;executableSha256=$nodeExeSha;downloadUrl="$nodeBase/node-v$nodeVersion-win-x64.zip";license='NODE-LICENSE.txt'}|ConvertTo-Json|Set-Content -LiteralPath (Join-Path $stage 'runtime\runtime-manifest.json') -Encoding UTF8
 @{sdkVersion=$webviewVersion;packageSha256=$webviewSha;packageUrl=$webviewUrl;runtime='Microsoft Edge WebView2 Evergreen (installed separately)'}|ConvertTo-Json|Set-Content -LiteralPath (Join-Path $stage 'webview2-manifest.json') -Encoding UTF8
 # Explicit source allowlist. Personal configuration and records never enter the stage.
-foreach($name in @('src','public','docs','desktop','native','LICENSE','NOTICE.md','THIRD_PARTY_NOTICES.md','README.md','README.en.md','README.zh-CN.md','SECURITY.md','CHANGELOG.md','package.json','config.example.json','TrafficWatch-Supervisor.ps1')){
+foreach($name in @('src','public','docs','desktop','native','LICENSE','NOTICE.md','THIRD_PARTY_NOTICES.md','README.md','README.en.md','README.zh-CN.md','SECURITY.md','CHANGELOG.md','package.json','package-lock.json','config.example.json','TrafficWatch-Supervisor.ps1','TrafficWatch-AI.cmd')){
   if($name -eq 'native'){
     [IO.Directory]::CreateDirectory((Join-Path $stage 'native'))|Out-Null
     Copy-Item -LiteralPath (Join-Path $projectRoot 'native\NetworkCapture.cs') -Destination (Join-Path $stage 'native')
+    Copy-Item -LiteralPath (Join-Path $projectRoot 'native\VaultGuard.cs') -Destination (Join-Path $stage 'native')
+    Copy-Item -LiteralPath (Join-Path $projectRoot 'native\AiNetworkTrace.cs') -Destination (Join-Path $stage 'native')
+    Copy-Item -LiteralPath (Join-Path $projectRoot 'native\RelayProbe.cs') -Destination (Join-Path $stage 'native')
   }else{Copy-Item -LiteralPath (Join-Path $projectRoot $name) -Destination $stage -Recurse}
 }
+$cipherSource=Join-Path $projectRoot 'node_modules\better-sqlite3-multiple-ciphers'
+if(-not(Test-Path -LiteralPath (Join-Path $cipherSource 'prebuilds\win32-x64.node'))){throw 'Run npm ci --ignore-scripts before building.'}
+$cipherTarget=Join-Path $stage 'node_modules\better-sqlite3-multiple-ciphers'
+[IO.Directory]::CreateDirectory((Join-Path $cipherTarget 'prebuilds'))|Out-Null
+foreach($name in @('lib','package.json','LICENSE')){Copy-Item -LiteralPath (Join-Path $cipherSource $name) -Destination $cipherTarget -Recurse}
+Copy-Item -LiteralPath (Join-Path $projectRoot 'node_modules\node-addon-api\LICENSE.md') -Destination (Join-Path $cipherTarget 'NODE-ADDON-API-LICENSE.md')
+Copy-Item -LiteralPath (Join-Path $cipherSource 'prebuilds\win32-x64.node') -Destination (Join-Path $cipherTarget 'prebuilds')
+Copy-Item -LiteralPath (Join-Path $projectRoot 'node_modules\yaml') -Destination (Join-Path $stage 'node_modules') -Recurse
 [IO.Directory]::CreateDirectory((Join-Path $stage 'scripts'))|Out-Null
-foreach($name in @('build-native.ps1','windows-observer.ps1','TrafficWatch-Control.ps1','install-windows.ps1')){Copy-Item -LiteralPath (Join-Path $projectRoot ('scripts\'+$name)) -Destination (Join-Path $stage 'scripts')}
+foreach($name in @('build-native.ps1','build-diagnostics.ps1','windows-observer.ps1','TrafficWatch-Control.ps1','TrafficWatch-RelayRoutes.ps1','TrafficWatch-PktMon.ps1','TrafficWatch-Resources.ps1','install-windows.ps1')){Copy-Item -LiteralPath (Join-Path $projectRoot ('scripts\'+$name)) -Destination (Join-Path $stage 'scripts')}
 # Windows PowerShell 5.1 needs a BOM for Chinese source strings.
-foreach($name in @('TrafficWatch-Control.ps1','install-windows.ps1')){
+foreach($name in @('TrafficWatch-Control.ps1','TrafficWatch-RelayRoutes.ps1','TrafficWatch-PktMon.ps1','install-windows.ps1')){
   $scriptPath=Join-Path $stage ('scripts\'+$name)
   [IO.File]::WriteAllText($scriptPath,[IO.File]::ReadAllText($scriptPath,[Text.Encoding]::UTF8),[Text.UTF8Encoding]::new($true))
 }
 & (Join-Path $projectRoot 'scripts\build-native.ps1') -Destination (Join-Path $stage 'native\Codex-Netwatch-Capture.exe')
 if($LASTEXITCODE -ne 0){throw 'Native capture compilation failed.'}
+& (Join-Path $projectRoot 'scripts\build-diagnostics.ps1') -Destination (Join-Path $stage 'native')
 $icon=Join-Path $stageRoot 'Netwatch.ico'
 & (Join-Path $projectRoot 'desktop\make-icon.ps1') -Destination $icon
 $compiler=Join-Path $env:SystemRoot 'Microsoft.NET\Framework64\v4.0.30319\csc.exe'
+& $compiler /nologo /optimize+ /target:exe /platform:x64 /reference:System.dll /reference:System.Core.dll /reference:System.Security.dll /reference:System.Windows.Forms.dll ('/out:'+(Join-Path $stage 'native\TrafficWatch-VaultGuard.exe')) (Join-Path $projectRoot 'native\VaultGuard.cs')
+if($LASTEXITCODE -ne 0){throw 'Vault session guard compilation failed.'}
 $common=@('/nologo','/optimize+','/target:winexe','/platform:x64','/codepage:65001','/reference:System.dll','/reference:System.Core.dll','/reference:System.Windows.Forms.dll','/reference:System.Drawing.dll','/reference:System.Web.Extensions.dll',('/win32manifest:'+(Join-Path $projectRoot 'desktop\app.manifest')),('/win32icon:'+$icon))
 $trayArgs=$common+@('/reference:'+(Join-Path $stage 'Microsoft.Web.WebView2.Core.dll'))+@('/reference:'+(Join-Path $stage 'Microsoft.Web.WebView2.WinForms.dll'))+@('/resource:'+$icon+',Netwatch.ico')+@('/out:'+(Join-Path $stage 'TrafficWatch-Tray.exe'))
 $traySources=@('NetwatchTray.cs','DashboardWindow.cs','StartupRegistration.cs','MiniWindow.cs')|ForEach-Object {Join-Path $projectRoot ('desktop\'+$_)}

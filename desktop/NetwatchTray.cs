@@ -128,6 +128,13 @@ internal sealed class NetwatchTray : ApplicationContext
         if (options.AttachSuite) {
             menu.Items.Add("打开流量中心", null, delegate { OpenSuiteControl(true); });
             menu.Items.Add("打开流量采集控制台", null, delegate { OpenSuiteControl(false); });
+            menu.Items.Add("AI 连接诊断", null, delegate { LaunchDiagnosticControl("--diagnostics"); });
+            ToolStripMenuItem diagnosis=new ToolStripMenuItem("诊断与物理绕行控制");
+            diagnosis.DropDownItems.Add("启动 AI 持续诊断",null,delegate {LaunchDiagnosticControl("--action StartDiagnostics");});
+            diagnosis.DropDownItems.Add("停止 AI 持续诊断",null,delegate {LaunchDiagnosticControl("--action StopDiagnostics");});
+            diagnosis.DropDownItems.Add("启用中转物理绕行",null,delegate {LaunchDiagnosticControl("--action EnableBypass");});
+            diagnosis.DropDownItems.Add("恢复原 Clash DIRECT 路径",null,delegate {LaunchDiagnosticControl("--action RollbackBypass");});
+            menu.Items.Add(diagnosis);
             ToolStripMenuItem legacy = new ToolStripMenuItem("旧版详细界面（已备份）");
             legacy.DropDownItems.Add("旧版全机详情", null, delegate {
                 Process.Start(new ProcessStartInfo("http://127.0.0.1:43128/?legacy=1") { UseShellExecute = true });
@@ -252,6 +259,10 @@ internal sealed class NetwatchTray : ApplicationContext
     private void OpenBrowser()
     {
         Process.Start(new ProcessStartInfo(options.BaseUrl) { UseShellExecute = true });
+    }
+    private void LaunchDiagnosticControl(string arguments) {
+        try { using(Process process=Process.Start(new ProcessStartInfo(Path.Combine(options.Root,"TrafficWatch-Control.exe"),arguments){UseShellExecute=false,CreateNoWindow=true,WindowStyle=ProcessWindowStyle.Hidden})){} }
+        catch(Exception error){ShowFailure(error.Message);}
     }
     private void OpenSuiteControl(bool overview)
     {

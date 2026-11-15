@@ -5,6 +5,7 @@ import path from 'node:path';
 import fs from 'node:fs';
 import { readLane, readDetail } from '../src/overview-data.mjs';
 import { HistoryReader } from '../src/history-reader.mjs';
+import { initializeArchives,attachArchiveViews,setArchiveWindows } from '../src/history-archive.mjs';
 import { fixture, BASE, MINUTE, record, connection } from './history-synthetic-fixtures.mjs';
 const HOUR = 60 * MINUTE;
 function normalize(rows) {return [...rows].sort((a,b)=>JSON.stringify([a.process,a.scope,a.family]).localeCompare(JSON.stringify([b.process,b.scope,b.family])));}
@@ -53,6 +54,25 @@ test('a broken disposable cache falls back to source records without hiding hist
   assert.equal(result.available,true);assert.equal(result.allPrograms[0].up,11);assert.equal(result.cacheWarning,'summary_cache_unavailable');
 });
 
+test('large connection dictionaries return exact attribution without building an oversized cold cache',t=>{
+  const f=fixture(t),store=f.open('windows'),cacheRoot=path.join(f.root,'viewer-cache');initializeArchives(store);
+  const count=65001,at=BASE+MINUTE,insert=store.db.prepare('INSERT INTO connections VALUES(?,?,?,?,?,?,?,?,?,?)'),bucket=store.db.prepare('INSERT INTO buckets VALUES(?,?,?,?,?,?)');
+  store.db.exec('BEGIN');
+  for(let i=0;i<count;i++){const id='large-synthetic-'+i;insert.run(id,'synthetic.example.test','tcp',i%2?'codex.exe':'browser.exe',1,'other','etw',at,at,'{}');bucket.run(at,id,'other',2,3,at);}
+  store.db.prepare('INSERT INTO samples VALUES(?,?,?,?,?,?,?,?,?)').run(at,1000,0,0,count*2,count*3,0,0,'[]');store.db.exec('COMMIT');
+  const result=readLane(f.root,'windows','all',BASE+3*HOUR,{cacheRoot});
+  assert.equal(result.available,true);assert.equal(result.detailReady,true);assert.equal(result.allPrograms.reduce((n,r)=>n+r.up,0),count*2);
+  assert.equal(result.allPrograms.reduce((n,r)=>n+r.down,0),count*3);assert.equal(result.allPrograms.reduce((n,r)=>n+r.connections,0),count);
+  assert.equal(result.familyTotals.codex.up,Math.floor(count/2)*2);assert.equal(fs.existsSync(cacheRoot),false);
+});
+
+test('an empty archive uses the real bucket index for detail lookups',t=>{
+  const f=fixture(t),store=f.open('windows');initializeArchives(store);record(store,BASE+MINUTE,[connection('indexed-identity',1,2)]);
+  attachArchiveViews(store.db);setArchiveWindows(store.db,[{from:BASE,to:BASE+2*MINUTE}]);
+  const plan=store.db.prepare('EXPLAIN QUERY PLAN SELECT SUM(up) FROM buckets WHERE connection_id=? AND minute>=? AND minute<?').all('indexed-identity',BASE,BASE+2*MINUTE).map(r=>r.detail).join('\n');
+  assert.match(plan,/SEARCH .*buckets.*(connection|INDEX)/i);assert.doesNotMatch(plan,/UNION|MATERIALIZE|SCAN .*buckets/i);
+});
+
 class FakeWorker extends EventEmitter {
   sent=[];terminated=false;
   postMessage(value){this.sent.push(value);}
@@ -74,8 +94,9 @@ test('a query timeout terminates its worker and the next request recovers withou
   try{
     await assert.rejects(reader.query({range:'all'}),/history_timeout/);
     await new Promise(resolve=>setImmediate(resolve));assert.equal(workers[0].terminated,true);
+    assert.equal(reader.stats().lastError,'history_timeout');assert.equal(reader.stats().failed,1);
     const next=reader.query({range:'today'});workers[1].complete({recovered:true});assert.deepEqual(await next,{recovered:true});
-    assert.equal(reader.stats().restarts,1);
+    assert.equal(reader.stats().restarts,1);assert.equal(reader.stats().lastError,null);
   }finally{reader.close();}
 });
 test('canceling an active request stops SQL and a crashed reader recovers', async()=>{

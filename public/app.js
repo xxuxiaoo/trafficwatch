@@ -10,6 +10,9 @@ import {
 import { createStartupBridge, createMiniBridge } from './desktop.js';
 import { createHistoryPanels, createUpdatePanel } from './history.js';
 import { setupState, setupCopy } from './setup.js';
+const legacyLane=location.pathname==='/legacy'&&['windows','clash'].includes(new URLSearchParams(location.search).get('lane'))?new URLSearchParams(location.search).get('lane'):null;
+let privacy;
+if(legacyLane){privacy=await import('./vault-browser.mjs');await privacy.initializeVault({overview:true});}
 const browserLanguages = navigator.languages || [navigator.language];
 let systemLocale = null,
   desktopInstance = '';
@@ -116,6 +119,7 @@ function toast(message) {
 }
 
 async function api(url, options = {}) {
+  if(legacyLane)url='/api/legacy/'+legacyLane+url.slice(4);
   if (url === '/api/stop') {
     try {
       const health = await (
@@ -133,11 +137,13 @@ async function api(url, options = {}) {
     ...options,
     headers: {
       'X-Codex-Flow': '1',
+      ...(privacy?.vaultHeaders()||{}),
       ...(desktopInstance ? { 'X-Codex-Desktop-Token': desktopInstance } : {}),
       ...(options.body ? { 'Content-Type': 'application/json' } : {}),
       ...options.headers,
     },
   });
+  await privacy?.checkVaultResponse(response);
   if (!response.ok) {
     const error = await response.json().catch(() => ({}));
     throw new Error(t(error.error || '请求失败 ({status})', { status: response.status }));
@@ -1061,6 +1067,7 @@ syncNavigation();
 document.addEventListener('visibilitychange', () => {
   if (!document.hidden) refreshNow();
 });
+window.addEventListener('trafficwatch-vault-locked',()=>{stopped=true;refreshSequence++;clearTimeout(refresh.timer);cancelAnimationFrame(navigationFrame);});
 $('language').value = readLanguagePreference(safeStorage());
 $('language').addEventListener('change', () => {
   const preference = $('language').value;

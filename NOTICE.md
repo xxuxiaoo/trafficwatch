@@ -11,8 +11,8 @@ TrafficWatch is a modified distribution of [Codex Netwatch](https://github.com/G
 
 The MIT License permits modification and public redistribution, including commercial use, provided that the original copyright and permission notice accompany copies or substantial portions. Keep LICENSE and this attribution when redistributing TrafficWatch.
 
-TrafficWatch adds independent Windows and Mihomo histories, system boot collection, unlimited history retention, a suite controller, an asynchronous tray, a unified overview, process/harness classification, connection drill-down, and bounded/cancelable history queries with disposable read-side summaries. The interface and release tooling have been adapted for this fork. TrafficWatch is maintained separately; upstream does not endorse or maintain these changes.
+TrafficWatch adds independent Windows and Mihomo histories, system boot collection, unlimited history retention, a suite controller, an asynchronous tray, a unified overview, process/harness classification, connection drill-down, and bounded/cancelable history queries with disposable read-side summaries. Later changes add optional password-encrypted histories and scoped AI visitor cards, lossless historical archives and storage maintenance, AI connection diagnostics with local log adapters and TraceEvent/PktMon metadata, optional managed relay bypass, and persistent temporary owner sessions. The interface and release tooling have been adapted for this fork. TrafficWatch is maintained separately; upstream does not endorse or maintain these changes.
 
 The unmodified upstream documentation is archived under `docs/upstream/`. Its instructions and screenshots describe the original project. The root README and TrafficWatch build documentation describe this fork.
 
-Bundled runtime and WebView2 SDK materials have separate notices; see [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md).
+Bundled runtime, database, YAML, diagnostic and WebView2 SDK materials have separate notices; see [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md).

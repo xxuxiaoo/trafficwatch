@@ -22,8 +22,11 @@
           <button type="button" data-view-button="ladder"><span>⇄</span> 梯子流量</button>
           <button type="button" data-view-button="harness"><span>⌘</span> Harness</button>
           <button type="button" data-view-button="investigate"><span>⌁</span> 高峰与缺口</button>
+          <a href="/diagnostics"><span aria-hidden="true">◉</span> AI 连接诊断</a>
         </nav>
         <div class="sidebar-bottom">
+          <a class="settings-link" href="/storage"><span aria-hidden="true">▤</span> 存储管理</a>
+          <a class="settings-link" href="/security"><span aria-hidden="true">♧</span> 隐私与 AI 访客卡</a>
           <div class="collector-mark"><i id="sidebarCollectorDot"></i><span id="sidebarCollectorText">正在检查采集状态</span></div>
           <button type="button" class="settings-link" data-view-button="settings"><span>⚙</span> 设置与旧版备份</button>
           <small>数据保存在本机</small>
@@ -56,6 +59,7 @@
 
         <main id="mainContent">
           <div class="history-status-bar"><span id="historyStatus" role="status">正在读取本机历史…</span><span>实时采集状态显示在右上角</span></div>
+          <p id="backgroundImportNotice" class="measurement-note" role="status" hidden></p>
           <p id="globalNotice" class="warning-list has-warning" role="status" hidden></p>
           <section class="page-view" data-view="overview">
             <div class="view-heading">
@@ -109,7 +113,7 @@
             </div>
             <div id="appListPager" class="connection-pager"></div>
             <section id="appDetail" class="detail-region" hidden>
-              <div class="section-heading detail-heading"><div><h3 id="appDetailTitle">应用明细</h3><p id="appDetailMeta" class="muted"></p></div><div class="detail-actions"><button id="detailBack" class="quiet-button" type="button" hidden>返回上一层</button><button id="copyEvidence" class="quiet-button" type="button">复制排查摘要</button><button id="exportAppDetail" type="button" class="quiet-button">导出全部明细 CSV</button></div></div>
+              <div class="section-heading detail-heading"><div><h3 id="appDetailTitle">应用明细</h3><p id="appDetailMeta" class="muted" role="status"></p></div><div class="detail-actions"><button id="detailBack" class="quiet-button" type="button" hidden>返回上一层</button><button id="appDetailRetry" class="quiet-button" type="button" hidden>重新加载</button><button id="copyEvidence" class="quiet-button" type="button">复制排查摘要</button><button id="exportAppDetail" type="button" class="quiet-button">导出全部明细 CSV</button></div></div>
               <div class="detail-metrics" id="appDetailMetrics"></div>
               <section><h4>这个筛选范围内的应用 <small class="muted">点击应用继续筛选，保留当前时段</small></h4><div id="detailProcessRows" class="compact-list"></div></section>
               <div class="detail-grid"><section><h4>分钟 / 小时变化</h4><div class="chart-wrap short-chart"><canvas id="appDetailChart" aria-label="所选应用流量变化"></canvas></div></section><section><h4>访问目标</h4><div id="appDestinations" class="compact-list"></div></section></div>
@@ -130,7 +134,7 @@
               <section class="data-section"><div class="section-heading"><div><h3>经由节点的应用</h3><p>按代理出口连接归因</p></div></div><div id="ladderProcessRows" class="compact-list"></div></section>
               <section class="data-section"><div class="section-heading"><div><h3>代理目标</h3><p>节点流量可展开到域名或目标 IP</p></div></div><div id="ladderDomainRows" class="compact-list"></div><h4 class="subsection-title">出口节点</h4><div id="ladderNodeRows" class="compact-list"></div></section>
             </div>
-            <section id="ladderDetail" class="detail-region" hidden><div class="section-heading detail-heading"><div><h3 id="ladderDetailTitle">连接明细</h3><p id="ladderDetailMeta" class="muted"></p></div><button id="exportLadderDetail" type="button" class="quiet-button">导出全部明细 CSV</button></div><div class="chart-wrap short-chart"><canvas id="ladderDetailChart" aria-label="代理连接流量分钟变化"></canvas></div><div class="table-scroll"><table><thead><tr><th>最后活动</th><th>应用</th><th>目标</th><th>出口节点</th><th>上传</th><th>下载</th><th>合计</th></tr></thead><tbody id="ladderConnectionRows"></tbody></table></div><div id="ladderPager" class="connection-pager"></div></section>
+            <section id="ladderDetail" class="detail-region" hidden><div class="section-heading detail-heading"><div><h3 id="ladderDetailTitle">连接明细</h3><p id="ladderDetailMeta" class="muted" role="status"></p></div><div class="detail-actions"><button id="ladderDetailRetry" class="quiet-button" type="button" hidden>重新加载</button><button id="exportLadderDetail" type="button" class="quiet-button">导出全部明细 CSV</button></div></div><div class="chart-wrap short-chart"><canvas id="ladderDetailChart" aria-label="代理连接流量分钟变化"></canvas></div><div class="table-scroll"><table><thead><tr><th>最后活动</th><th>应用</th><th>目标</th><th>出口节点</th><th>上传</th><th>下载</th><th>合计</th></tr></thead><tbody id="ladderConnectionRows"></tbody></table></div><div id="ladderPager" class="connection-pager"></div></section>
             <p id="ladderAccountingNote" class="measurement-note"></p>
           </section>
 

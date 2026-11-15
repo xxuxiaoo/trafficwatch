@@ -1,6 +1,29 @@
 # TrafficWatch validation
 
-The active test suite combines the upstream regression tests with synthetic history, process-family and performance/recovery tests. The publication checkout completed 155 cases: 153 passed, 2 administrator-only ETW integration tests skipped, no failures. JavaScript and PowerShell syntax checks passed. The native helper self-test and the Windows tray/controller package build also passed using hash-verified offline dependencies. Run `npm run check`, `npm test`, and `npm run audit:publication`. CI runs source tests on Windows and Linux; Linux validates query/accounting behavior and does not provide Windows native capture.
+The active test suite combines the upstream regression tests with synthetic history, process-family, encryption, storage, diagnosis and performance/recovery tests. The 0.10.6 checkout completed 221 cases: 219 passed, 2 administrator-only ETW integration tests skipped, no failures. JavaScript and PowerShell syntax checks passed. The native helper self-test and the Windows tray/controller package build also passed using hash-verified dependencies. Run `npm run check`, `npm test`, and `npm run audit:publication`. CI runs source tests on Windows and Linux; Linux validates query/accounting behavior and does not provide Windows native capture.
+
+Publication checks also built the diagnostic helpers in an isolated source fixture without a dependency cache: both packages downloaded from the official NuGet API, matched their pinned SHA256 values and compiled successfully. A complete local Windows package built with verified Node.js/WebView2 inputs. No installed service or real history was changed by these build checks.
+
+## 0.10.5 query and interaction checks
+
+A controlled seven-day encrypted fixture contained 30,000 connections and 360,000 minute buckets per lane with approximately 1 KiB of rule metadata per connection. Before/after checks asserted equal totals, summaries and counts. Timings on the same local test host were:
+
+| Query | Before | After |
+| --- | ---: | ---: |
+| Quick overview, today | 2,101 ms | 323 ms |
+| Full overview, today | 4,705 ms | 388 ms |
+| Clash one-hour detail | 248 ms | 55 ms |
+| Application detail | 175 ms | 153 ms |
+| Full seven-day overview | 31,448 ms | 1,617 ms |
+| Harness seven-day overview | 503 ms | 630 ms |
+
+These are fixture-specific measurements; the Harness query was slightly slower. Independent workers prevent a full overview from blocking the interactive detail queue. Browser checks passed 14 scenario groups covering immediate interval selection before a held response, retries, pagination, navigation, foreground recovery, today/seven-day/30-day/all ranges and widths of 390, 1550 and 2048 pixels. During 16 refresh/navigation cycles over 66.7 seconds, reclaimed JS heap measured 3,300,300 to 3,418,768 bytes, DOM nodes stabilized around 3,000, and no task exceeded 50 ms. This is a short controlled observation, not a multi-day endurance result.
+
+## 0.10.6 temporary owner-session checks
+
+An isolated persistent headless Edge profile with encrypted synthetic history passed 11 scenario groups without page errors. Checks covered closing/reopening tabs and the browser, page navigation, migration of older tab-only sessions, retaining the original expiry, multiple windows, explicit lock, Windows lock while the browser was closed, expiry, viewer restart and logout. Each invalidation required a fresh owner unlock; separately authorized AI lock-continuation scope remained enforced. The browser retained only the temporary credential/expiry and did not persist history snapshots or history keys.
+
+## Earlier TrafficWatch checks
 
 The 0.7.0 unified viewer was locally exercised with actual collected history for today, 24 hours, 7 days, 30 days, a selected date and all history. Retained history was shorter than a complete 7/30-day window. A 160-cycle refresh/scroll test used synthetic responses to check browser resource growth; page nodes and canvas pixels stayed constant and collected JS heap approached a plateau. A separate six-minute actual-data run completed 36 refreshes without content disappearing or an accumulating query queue. Neither is a completed multi-day endurance test.
 

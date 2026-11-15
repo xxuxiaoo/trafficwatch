@@ -35,7 +35,7 @@ Write-Host ('Owner: '+$identity.Name)
 $createdTasks=@()
 try{
   [IO.Directory]::CreateDirectory($installRoot)|Out-Null
-  foreach($name in @('src','public','docs','desktop','native','runtime','scripts','LICENSE','NOTICE.md','THIRD_PARTY_NOTICES.md','README.md','README.en.md','README.zh-CN.md','SECURITY.md','CHANGELOG.md','package.json','config.example.json','TrafficWatch-Supervisor.ps1','TrafficWatch-Tray.exe','TrafficWatch-Tray.exe.config','TrafficWatch-Control.exe','TrafficWatch-Control.exe.config','Codex-Netwatch.exe','Codex-Netwatch.exe.config','Microsoft.Web.WebView2.Core.dll','Microsoft.Web.WebView2.WinForms.dll','WebView2Loader.dll','WEBVIEW2-LICENSE.txt','WEBVIEW2-NOTICE.txt','webview2-manifest.json','release-manifest.json')){
+  foreach($name in @('src','public','docs','desktop','native','runtime','scripts','node_modules','LICENSE','NOTICE.md','THIRD_PARTY_NOTICES.md','README.md','README.en.md','README.zh-CN.md','SECURITY.md','CHANGELOG.md','package.json','package-lock.json','config.example.json','TrafficWatch-Supervisor.ps1','TrafficWatch-AI.cmd','TrafficWatch-Tray.exe','TrafficWatch-Tray.exe.config','TrafficWatch-Control.exe','TrafficWatch-Control.exe.config','Codex-Netwatch.exe','Codex-Netwatch.exe.config','Microsoft.Web.WebView2.Core.dll','Microsoft.Web.WebView2.WinForms.dll','WebView2Loader.dll','WEBVIEW2-LICENSE.txt','WEBVIEW2-NOTICE.txt','webview2-manifest.json','release-manifest.json')){
     Copy-Item -LiteralPath (Join-Path $packageRoot $name) -Destination $installRoot -Recurse
   }
   [IO.Directory]::CreateDirectory($DataRoot)|Out-Null
@@ -60,6 +60,11 @@ try{
   $traySettings=New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -ExecutionTimeLimit ([TimeSpan]::Zero) -MultipleInstances IgnoreNew -StartWhenAvailable
   Register-ScheduledTask -TaskName $trayTask -Action $trayAction -Trigger $trayTrigger -Principal $trayPrincipal -Settings $traySettings -Description 'TrafficWatch user-session tray; exiting the tray keeps collectors running.'|Out-Null
   $createdTasks+=,$trayTask
+  foreach($diagComponent in @(@{task='TrafficWatch - AI diagnostics';script='ai-diagnostic-daemon.mjs'},@{task='TrafficWatch - Relay physical bypass';script='relay-bypass.mjs'})){
+    $diagAction=New-ScheduledTaskAction -Execute (Join-Path $installRoot 'runtime\node.exe') -Argument ('--disable-warning=ExperimentalWarning "'+(Join-Path $installRoot ('src\'+$diagComponent.script))+'"') -WorkingDirectory $installRoot
+    Register-ScheduledTask -TaskName $diagComponent.task -Action $diagAction -Trigger $trigger -Principal $systemPrincipal -Settings $taskSettings -Description 'TrafficWatch independent encrypted diagnostics / physical relay routing; no business forwarding.'|Out-Null
+    $createdTasks+=,$diagComponent.task
+  }
   $desktop=[Environment]::GetFolderPath('DesktopDirectory')
   $shortcutFile=Join-Path $desktop 'TrafficWatch.lnk'
   if(-not(Test-Path -LiteralPath $shortcutFile)){

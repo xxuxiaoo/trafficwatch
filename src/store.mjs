@@ -1,14 +1,15 @@
 import fs from 'node:fs';
 import path from 'node:path';
-import { DatabaseSync } from 'node:sqlite';
+import { DatabaseSync } from './database.mjs';
 import { DEFAULT_BUDGET, createBudgetCalendar, budgetPeriod } from './budgets.mjs';
 import { calendarSummary, reportSummary } from './reports.mjs';
+import { historyBounds } from './history-archive.mjs';
 
 export class Store {
-  constructor(dir) {
+  constructor(dir, { filename = 'monitor.sqlite', encryptionKey } = {}) {
     fs.mkdirSync(dir, { recursive: true });
     this.excludedSessions = new Set();
-    this.db = new DatabaseSync(path.join(dir, 'monitor.sqlite'));
+    this.db = new DatabaseSync(path.join(dir, filename), { encryptionKey });
     const version = this.db.prepare('PRAGMA user_version').get().user_version;
     if (version > 4) {
       this.db.close();
@@ -109,8 +110,9 @@ export class Store {
       } catch (error) { this.db.exec('ROLLBACK'); this.db.close(); throw error; }
     } else this.db.exec('PRAGMA user_version=4');
   }
-  record(sample) {
-    this.db.exec('BEGIN');
+  record(sample, { transaction = true } = {}) {
+    if (this.archivedSampleExists?.(sample.at)) return false;
+    if (transaction) this.db.exec('BEGIN');
     try {
       const inserted = this.insertSample.run(
         sample.at,
@@ -124,7 +126,7 @@ export class Store {
         JSON.stringify(sample.activeSessions),
       );
       if (!inserted.changes) {
-        this.db.exec('COMMIT');
+        if (transaction) this.db.exec('COMMIT');
         return false;
       }
       this.insertDaily.run(this.calendar.day(sample.at), sample.codexUp, sample.codexDown, sample.allUp, sample.allDown, sample.at, sample.at);
@@ -157,10 +159,10 @@ export class Store {
             sample.at,
           );
       }
-      this.db.exec('COMMIT');
+      if (transaction) this.db.exec('COMMIT');
       return true;
     } catch (error) {
-      this.db.exec('ROLLBACK');
+      if (transaction) this.db.exec('ROLLBACK');
       throw error;
     }
   }
@@ -252,7 +254,7 @@ export class Store {
     return row ? JSON.parse(row.value) : fallback;
   }
   firstAt() {
-    return this.db.prepare('SELECT MIN(at) AS at FROM samples').get().at;
+    return historyBounds(this.db).firstAt;
   }
   budgetSummary(now = Date.now(), settings = this.get('budget', DEFAULT_BUDGET), includePeaks = true) {
     const day = this.calendar.day(now), month = day.slice(0, 7);
@@ -295,7 +297,7 @@ export class Store {
     } catch (error) { this.db.exec('ROLLBACK'); throw error; }
   }
   lastAt() {
-    return this.db.prepare('SELECT MAX(at) AS at FROM samples').get().at;
+    return historyBounds(this.db).lastAt;
   }
   openGap(reason, from) {
     if (

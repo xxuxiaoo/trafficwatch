@@ -1,18 +1,31 @@
 import fs from 'node:fs';
 import path from 'node:path';
-import { DatabaseSync } from 'node:sqlite';
+import { DatabaseSync } from './database.mjs';
 import { createHash } from 'node:crypto';
+import { historyBounds,archiveIntersects } from './history-archive.mjs';
+import { prepareCacheFile, limitCacheConnection, cacheFailed } from './storage-files.mjs';
 
 const HOUR = 3600000;
 // Disposable read-side summaries. The collector database is always read-only;
 // exact connection/scope identities are retained, including historical unknowns.
 export function programRollup(source, cacheRoot, range, firstAt, now, defs, aggregate) {
+  // An hourly builder would repeatedly scan compressed rows. Old ranges use one
+  // exact streaming aggregation; only the ordinary online range builds a cache.
+  if(archiveIntersects(source,range))return null;
   const from = Math.ceil(Math.max(range.from, firstAt ?? range.to) / HOUR) * HOUR;
   const to = Math.floor(Math.min(range.to, now - 120000) / HOUR) * HOUR;
   if (!cacheRoot || to <= from) return null;
+  // Cold caches must never duplicate an unbounded connection dictionary before
+  // returning the first result. Above these conservative budgets an exact
+  // source aggregation costs less than building/overflowing the bounded cache.
+  if(source.prepare('SELECT 1 FROM connections LIMIT 1 OFFSET 64000').get()||
+    source.prepare('SELECT 1 FROM buckets WHERE minute>=? AND minute<? LIMIT 1 OFFSET 200000').get(range.from,range.to))return null;
   fs.mkdirSync(cacheRoot, { recursive: true });
-  const db = new DatabaseSync(path.join(cacheRoot, 'windows-programs-v2.sqlite'));
+  const file=path.join(cacheRoot, 'windows-programs-v2.sqlite');
+  if(!prepareCacheFile(file))return null;
+  const db = new DatabaseSync(file);
   try {
+    limitCacheConnection(db);
     db.exec(`PRAGMA journal_mode=WAL; PRAGMA synchronous=NORMAL; PRAGMA busy_timeout=800;
       PRAGMA cache_size=-16384; PRAGMA temp_store=MEMORY;
       CREATE TABLE IF NOT EXISTS hours (hour INTEGER PRIMARY KEY);
@@ -29,11 +42,12 @@ export function programRollup(source, cacheRoot, range, firstAt, now, defs, aggr
       CREATE INDEX IF NOT EXISTS base_members_identity ON base_members(connection_id) WHERE scope<>'unknown';
       CREATE TABLE IF NOT EXISTS state (key TEXT PRIMARY KEY,value INTEGER);
       CREATE TEMP TABLE edge_usage (connection_id TEXT,scope TEXT,up INTEGER,down INTEGER,minute INTEGER,last_at INTEGER);`);
-    const latest = source.prepare('SELECT MAX(at) at FROM samples').get().at || 0;
-    const earliest = source.prepare('SELECT MIN(at) at FROM samples').get().at || 0;
+    const bounds=historyBounds(source),latest=bounds.lastAt||0,earliest=bounds.firstAt||0;
     const previous = db.prepare("SELECT value FROM state WHERE key='metadataAt'").get()?.value || 0;
     const previousFirst = db.prepare("SELECT value FROM state WHERE key='firstAt'").get()?.value;
-    if (latest < previous || (previousFirst !== undefined && previousFirst !== earliest)) {
+    const revision=source.prepare("SELECT value FROM settings WHERE key='vaultDataRevision'").get()?.value||'0';
+    const oldRevision=db.prepare("SELECT value FROM state WHERE key='revision'").get()?.value;
+    if (latest < previous || (previousFirst !== undefined && previousFirst !== earliest)||oldRevision!==undefined&&String(oldRevision)!==String(revision)) {
       db.exec('DELETE FROM hours; DELETE FROM usage_hourly; DELETE FROM connections; DELETE FROM connection_families; DELETE FROM state; DELETE FROM program_bases; DELETE FROM base_members;');
     }
     const metadataAt = db.prepare("SELECT value FROM state WHERE key='metadataAt'").get()?.value || 0;
@@ -47,7 +61,7 @@ export function programRollup(source, cacheRoot, range, firstAt, now, defs, aggr
     const inBase = db.prepare("SELECT 1 FROM base_members WHERE connection_id=? AND scope<>'unknown' LIMIT 1");
     let identityChanged = false;
     db.exec('BEGIN');
-    for (const c of source.prepare(`SELECT c.*${hasFamilies ? ',f.family,f.root_process,f.updated_at' : ''} FROM connections c
+    for (const c of source.prepare(`SELECT c.id,c.process,c.evidence,c.last_seen${hasFamilies ? ',f.family,f.root_process,f.updated_at' : ''} FROM connections c
       ${hasFamilies ? 'LEFT JOIN connection_families f ON f.connection_id=c.id' : ''} WHERE c.last_seen>=?`).iterate(Math.max(0, metadataAt - 120000))) {
       if (metadataAt) {
         const old = oldIdentity.get(c.id);
@@ -58,7 +72,7 @@ export function programRollup(source, cacheRoot, range, firstAt, now, defs, aggr
       if (c.family) updateFamily.run(c.id,c.family,c.root_process,c.updated_at);
     }
     const saveState = db.prepare('INSERT INTO state VALUES(?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value');
-    saveState.run('metadataAt', latest); saveState.run('firstAt', earliest);
+    saveState.run('metadataAt', latest); saveState.run('firstAt', earliest);saveState.run('revision',Number(revision));
     if(identityChanged) db.exec('DELETE FROM program_bases; DELETE FROM base_members;');
     db.exec('COMMIT');
     const ready = new Set(db.prepare('SELECT hour FROM hours WHERE hour>=? AND hour<?').all(from,to).map(x=>x.hour));
@@ -117,17 +131,17 @@ export function programRollup(source, cacheRoot, range, firstAt, now, defs, aggr
           UNION ALL SELECT * FROM edge_usage) GROUP BY connection_id,scope)`,
       params: [from,to],
     } };
-  } catch (error) { db.close(); throw error; }
+  } catch (error) { db.close(); cacheFailed(file,error);throw error; }
 }
 
 export function codexScopeCandidates(source, cacheRoot, range) {
-  const ids = new Set(), first = source.prepare('SELECT MIN(at) at FROM samples').get().at;
+  const ids = new Set(), first = historyBounds(source).firstAt;
   const from = Math.max(range.from, Math.floor((first ?? range.to)/60000)*60000), to = range.to;
   const intervals = [];
   let db;
   try {
     const file = cacheRoot && path.join(cacheRoot,'windows-programs-v2.sqlite');
-    if(file && fs.existsSync(file)) {
+    if(file && fs.existsSync(file)&&!archiveIntersects(source,range)) {
       db=new DatabaseSync(file,{readOnly:true});
       if(db.prepare("SELECT value FROM state WHERE key='firstAt'").get()?.value !== first) {db.close();db=null;}
     }

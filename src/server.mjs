@@ -7,6 +7,9 @@ import { createDiagnostics } from './diagnostics.mjs';
 import { validateBudget } from './budgets.mjs';
 import { UpdateManager } from './update.mjs';
 import { trafficRates } from './traffic-route.mjs';
+import { sealPacket,packetFormat } from './vault-crypto.mjs';
+import { commandVerifier } from './vault-commands.mjs';
+import crypto from 'node:crypto';
 
 export function parseRange(url, now, firstAt) {
   const ranges = {
@@ -73,6 +76,7 @@ function readBody(req, limit = 4096) {
   });
 }
 export function createServer(config, store, monitor, shutdown) {
+  let verifyCommand;
   const updater = new UpdateManager(config);
   let insightCache = null;
   let budgetCache = null;
@@ -115,6 +119,9 @@ export function createServer(config, store, monitor, shutdown) {
       return json(403, { error: 'Cross-origin requests are not allowed' });
     try {
       const url = new URL(req.url, `http://${expectedHost}`);
+      if(store.sealed&&req.method==='GET'&&url.pathname==='/'){
+        res.writeHead(302,{Location:`http://127.0.0.1:43131/legacy?lane=${store.lane}`});res.end();return;
+      }
       if (req.method === 'GET' && (url.pathname === '/overview' ||
           url.pathname === '/' && config.unifiedDashboard && url.searchParams.get('legacy') !== '1')) {
         const overviewUrl = 'http://127.0.0.1:43131';
@@ -146,12 +153,17 @@ export function createServer(config, store, monitor, shutdown) {
           systemLocale: config.systemLocale || Intl.DateTimeFormat().resolvedOptions().locale,
           state: monitor.state,
           demo: config.demo,
+          sealedStorage: store.sealed===true,
         });
       if (url.pathname.startsWith('/api/')) {
         if (req.headers['x-codex-flow'] !== '1')
           return json(403, { error: 'Missing local client header' });
         if (req.method === 'POST') {
           const body = await readBody(req);
+          if(store.sealed&&!['/api/stop','/api/capture'].includes(url.pathname)){
+            verifyCommand??=commandVerifier(store.metadata.commandPublicKey);
+            if(!verifyCommand(req.headers['x-trafficwatch-command'],url.pathname,JSON.parse(body||'{}')))return json(403,{error:'vault_command_required'});
+          }
           if (url.pathname === '/api/update/install') {
             if (!config.desktopToken || req.headers['x-codex-desktop-token'] !== config.desktopToken)
               return json(403, { error: 'Desktop instance marker required' });
@@ -210,14 +222,16 @@ export function createServer(config, store, monitor, shutdown) {
           return json(200, url.searchParams.get('check') === '1' ? await updater.check() : updater.status());
         if (url.pathname === '/api/overview-live') {
           const status = monitor.status();
-          return json(200, {
+          const live = {
             app: 'trafficwatch-live',
             state: status.state, capture: status.capture, lastAt: status.lastAt,
             intervalMs: status.intervalMs,
             allUpRate: status.allUpRate, allDownRate: status.allDownRate,
             routeRates: trafficRates(monitor.latest, Number.isFinite(status.allUpRate)),
-          });
+          };
+          return json(200,store.sealed?{app:'trafficwatch-sealed-live',packet:sealPacket(live,store.metadata.publicKey,{format:packetFormat,vault:store.metadata.id,lane:store.lane,id:crypto.randomUUID()})}:live);
         }
+        if(store.sealed)return json(423,{error:'vault_history_protected',url:'http://127.0.0.1:43131/'});
         if (url.pathname === '/api/harness-apps') return json(200, { apps: monitor.harnessApps });
         if (url.pathname === '/api/mini') {
           if (!config.desktopToken || req.headers['x-codex-desktop-token'] !== config.desktopToken)

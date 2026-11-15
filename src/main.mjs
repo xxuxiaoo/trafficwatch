@@ -1,7 +1,7 @@
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { loadConfig } from './config.mjs';
-import { Store } from './store.mjs';
+import { createCaptureStore } from './switching-store.mjs';
 import { Monitor } from './monitor.mjs';
 import { createServer } from './server.mjs';
 import { acquireInstance } from './instance.mjs';
@@ -18,7 +18,7 @@ try {
 let instance, store;
 try {
   instance = acquireInstance(config.dataDir);
-  store = new Store(config.dataDir);
+  store = createCaptureStore(config.dataDir);
 } catch (error) {
   instance?.release();
   console.error(`Startup failed: ${error.message}`);

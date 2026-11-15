@@ -1,11 +1,13 @@
 ﻿param(
-    [ValidateSet('Status','Start','Stop','EnableStartup','DisableStartup')]
+    [ValidateSet('Status','Start','Stop','EnableStartup','DisableStartup','StartDiagnostics','StopDiagnostics','EnableBypass','RollbackBypass')]
     [string]$Action='Status'
 )
 $ErrorActionPreference='Stop'
 $controlRoot=[IO.Path]::GetFullPath((Join-Path $env:ProgramFiles 'TrafficWatch'))
 $controlTask='TrafficWatch - Open-source Netwatch'
 $controlTrayTask='TrafficWatch - Tray'
+$controlDiagnosticTask='TrafficWatch - AI diagnostics'
+$controlBypassTask='TrafficWatch - Relay physical bypass'
 $controlSettings=Get-Content -LiteralPath (Join-Path $controlRoot 'suite-settings.json') -Raw | ConvertFrom-Json
 $controlData=[IO.Path]::GetFullPath([string]$controlSettings.DataRoot)
 $controlStopSignal=Join-Path $controlData 'stop.request'
@@ -14,6 +16,9 @@ $controlObserver=Join-Path $controlRoot 'scripts\windows-observer.ps1'
 $controlExpectedExecutables=@(
     (Join-Path $controlRoot 'runtime\node.exe'),
     (Join-Path $controlRoot 'native\Codex-Netwatch-Capture.exe'),
+    (Join-Path $controlRoot 'native\TrafficWatch-VaultGuard.exe'),
+    (Join-Path $controlRoot 'native\TrafficWatch-AiTrace.exe'),
+    (Join-Path $controlRoot 'native\TrafficWatch-RelayProbe.exe'),
     (Join-Path $controlRoot 'TrafficWatch-Tray.exe')
 )
 
@@ -36,11 +41,11 @@ function Read-ControlHealth([int]$Port) {
 }
 
 function Get-ControlProcesses {
-    @(Get-CimInstance Win32_Process -Filter "Name='node.exe' OR Name='powershell.exe' OR Name='pwsh.exe' OR Name='TrafficWatch-Tray.exe' OR Name='Codex-Netwatch-Capture.exe'" | Where-Object {
+    @(Get-CimInstance Win32_Process -Filter "Name='node.exe' OR Name='powershell.exe' OR Name='pwsh.exe' OR Name='TrafficWatch-Tray.exe' OR Name='Codex-Netwatch-Capture.exe' OR Name='TrafficWatch-VaultGuard.exe' OR Name='TrafficWatch-AiTrace.exe' OR Name='TrafficWatch-RelayProbe.exe'" | Where-Object {
         if ($controlExpectedExecutables -contains $_.ExecutablePath) { return $true }
         if ($_.Name -in @('powershell.exe','pwsh.exe')) {
             $line=[string]$_.CommandLine
-            foreach ($scriptPath in @($controlSupervisor,$controlObserver)) {
+            foreach ($scriptPath in @($controlSupervisor,$controlObserver,(Join-Path $controlRoot 'scripts\TrafficWatch-RelayRoutes.ps1'),(Join-Path $controlRoot 'scripts\TrafficWatch-PktMon.ps1'),(Join-Path $controlRoot 'scripts\TrafficWatch-Resources.ps1'))) {
                 # Match a complete, fixed script path, not a process name or an arbitrary substring.
                 $quoted='(?i)(?:^|\s)-File\s+(?:"'+[regex]::Escape($scriptPath)+'"|'+[regex]::Escape($scriptPath)+'(?=\s|$))'
                 if ($line -match $quoted) { return $true }
@@ -53,6 +58,8 @@ function Get-ControlProcesses {
 function Get-ControlState {
     $task=Get-ScheduledTask -TaskName $controlTask
     $trayTask=Get-ScheduledTask -TaskName $controlTrayTask
+    $diagnosticHealth=$null
+    try{$diagnosticHealth=Invoke-RestMethod -Uri 'http://127.0.0.1:43132/api/health' -TimeoutSec 1}catch{}
     [ordered]@{
         at=(Get-Date).ToString('o')
         taskState=[string]$task.State
@@ -61,6 +68,7 @@ function Get-ControlState {
         machine=Read-ControlHealth 43128
         clash=Read-ControlHealth 43130
         overview=Read-ControlHealth 43131
+        diagnostics=$diagnosticHealth
         processes=@(Get-ControlProcesses | Select-Object Name,ProcessId,ParentProcessId,ExecutablePath)
     }
 }
@@ -112,6 +120,7 @@ function Stop-ControlSuite {
 
     if ($task.State -eq 'Running') { Stop-ScheduledTask -TaskName $controlTask }
     if ((Get-ScheduledTask -TaskName $controlTrayTask).State -eq 'Running') { Stop-ScheduledTask -TaskName $controlTrayTask }
+    foreach($controlExtraTask in @($controlDiagnosticTask,$controlBypassTask)){if((Get-ScheduledTask -TaskName $controlExtraTask -ErrorAction SilentlyContinue).State -eq 'Running'){Stop-ScheduledTask -TaskName $controlExtraTask}}
     foreach ($target in @(Get-ControlProcesses)) {
         $current=Get-CimInstance Win32_Process -Filter ('ProcessId='+$target.ProcessId) -ErrorAction SilentlyContinue
         if (-not $current -or $current.CreationDate -ne $target.CreationDate) { continue }
@@ -143,6 +152,40 @@ try {
     $principal=[Security.Principal.WindowsPrincipal]::new([Security.Principal.WindowsIdentity]::GetCurrent())
     if (-not $principal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)) { throw 'Administrator approval is required.' }
     switch ($Action) {
+        'StartDiagnostics' {
+            $diagFlag=Join-Path $controlData 'diagnostics\disabled'
+            if(Test-Path -LiteralPath $diagFlag){Remove-Item -LiteralPath $diagFlag -Force}
+            if(Test-Path -LiteralPath $controlStopSignal){Remove-Item -LiteralPath $controlStopSignal -Force}
+            Start-ScheduledTask -TaskName $controlDiagnosticTask
+        }
+        'StopDiagnostics' {
+            [IO.Directory]::CreateDirectory((Join-Path $controlData 'diagnostics'))|Out-Null
+            [IO.File]::WriteAllText((Join-Path $controlData 'diagnostics\disabled'),'disabled')
+            # The daemon notices this within three seconds and disposes its own ETW session.
+            $diagDeadline=(Get-Date).AddSeconds(12)
+            do{try{$diagHealth=Invoke-RestMethod -Uri 'http://127.0.0.1:43132/api/health' -TimeoutSec 1}catch{$diagHealth=$null};if(-not $diagHealth){break};Start-Sleep -Milliseconds 400}while((Get-Date) -lt $diagDeadline)
+            if($diagHealth){Stop-ScheduledTask -TaskName $controlDiagnosticTask}
+            & (Join-Path $controlRoot 'scripts\TrafficWatch-PktMon.ps1') -Action Stop|Out-Null
+        }
+        'EnableBypass' {
+            $bypassFlag=Join-Path $controlData 'relay-bypass\disabled'
+            if(Test-Path -LiteralPath $bypassFlag){Remove-Item -LiteralPath $bypassFlag -Force}
+            if(Test-Path -LiteralPath $controlStopSignal){Remove-Item -LiteralPath $controlStopSignal -Force}
+            Start-ScheduledTask -TaskName $controlBypassTask
+        }
+        'RollbackBypass' {
+            [IO.Directory]::CreateDirectory((Join-Path $controlData 'relay-bypass'))|Out-Null
+            [IO.File]::WriteAllText((Join-Path $controlData 'relay-bypass\disabled'),'disabled')
+            if((Get-ScheduledTask -TaskName $controlBypassTask -ErrorAction SilentlyContinue).State -eq 'Running'){Stop-ScheduledTask -TaskName $controlBypassTask}
+            $bypassDeadline=(Get-Date).AddSeconds(25)
+            do{
+                $bypassProcesses=@(Get-ControlProcesses|Where-Object {$_.Name -eq 'node.exe' -and $_.CommandLine -match 'src[/\\]relay-bypass\.mjs'})
+                if(-not $bypassProcesses){break};Start-Sleep -Milliseconds 500
+            }while((Get-Date) -lt $bypassDeadline)
+            foreach($bypassProcess in $bypassProcesses){Stop-Process -Id $bypassProcess.ProcessId -ErrorAction SilentlyContinue}
+            & (Join-Path $controlRoot 'runtime\node.exe') --disable-warning=ExperimentalWarning (Join-Path $controlRoot 'src\relay-bypass.mjs') --rollback
+            if($LASTEXITCODE -ne 0){throw 'Bypass rollback did not complete. Original DIRECT rules remain.'}
+        }
         'Stop' { Stop-ControlSuite }
         'Start' {
             $task=Get-ScheduledTask -TaskName $controlTask
@@ -166,12 +209,14 @@ try {
         'EnableStartup' {
             Enable-ScheduledTask -TaskName $controlTask | Out-Null
             Enable-ScheduledTask -TaskName $controlTrayTask | Out-Null
+            foreach($controlExtraTask in @($controlDiagnosticTask,$controlBypassTask)){Enable-ScheduledTask -TaskName $controlExtraTask|Out-Null}
         }
         'DisableStartup' {
             # Disabling scheduled triggers alone does not stop an already-running task.
             Stop-ControlSuite
             Disable-ScheduledTask -TaskName $controlTask | Out-Null
             Disable-ScheduledTask -TaskName $controlTrayTask | Out-Null
+            foreach($controlExtraTask in @($controlDiagnosticTask,$controlBypassTask)){Disable-ScheduledTask -TaskName $controlExtraTask|Out-Null}
         }
     }
     $logDir=Join-Path $controlRoot 'logs'
