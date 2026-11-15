@@ -4,6 +4,8 @@ The active test suite combines the upstream regression tests with synthetic hist
 
 Publication checks also built the diagnostic helpers in an isolated source fixture without a dependency cache: both packages downloaded from the official NuGet API, matched their pinned SHA256 values and compiled successfully. A complete local Windows package built with verified Node.js/WebView2 inputs. No installed service or real history was changed by these build checks.
 
+The first publication CI run exposed a test-fixture clock dependency: a local-wall-time legacy log could fall after `Date.now()` on the UTC runner and be correctly excluded by the query. Diagnostic replay tests now set explicit fixture ranges rather than using the current time. The full local suite passed in UTC; all six replay tests also passed in Asia/Shanghai, America/Los_Angeles and Pacific/Kiritimati with `Date.now()` fixed to 2020, before their fixture dates. The Windows and Linux CI jobs run independently so a failure on one does not cancel the other.
+
 ## 0.10.5 query and interaction checks
 
 A controlled seven-day encrypted fixture contained 30,000 connections and 360,000 minute buckets per lane with approximately 1 KiB of rule metadata per connection. Before/after checks asserted equal totals, summaries and counts. Timings on the same local test host were:

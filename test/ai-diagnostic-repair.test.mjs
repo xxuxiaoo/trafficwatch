@@ -31,7 +31,8 @@ test('same-provider retries survive encrypted import, repeated snapshots and del
   const rows=normalizeMagpieRequest(raw),legacy={...rows[1],id:rows[1].legacyId,schemaVersion:1};
   assert.notEqual(rows[0].id,rows[1].id);assert.equal(rows[0].legacyId,rows[1].legacyId);
   spool.append([legacy]);history.drain();
-  const query=()=>history.query({windows:[{from:0,to:Date.now()+1}],kind:'request'});
+  const period={from:Date.parse(raw.time),to:Date.parse(raw.time)+3600000};
+  const query=()=>history.query({windows:[period],...period,kind:'request'});
   assert.equal(query().quality.legacyRequests,1);
   spool.append(rows);history.drain();
   let result=query();assert.equal(result.rows.length,2);assert.equal(new Set(result.rows.map(row=>row.requestId)).size,1);
@@ -78,8 +79,11 @@ test('opening a real legacy encrypted schema flags unknown log time and supports
   history.db.exec('ALTER TABLE events DROP COLUMN schema_version;ALTER TABLE events DROP COLUMN time_source;DROP TABLE superseded_events');history.close();
   const upgraded=new DiagnosticHistory(dir,metadata,secrets);
   try{
-    let result=upgraded.query({windows:[{from:0,to:Date.now()+1}],owner:true});assert.equal(result.quality.unknownLogTimes,1);
-    upgraded.put(row);result=upgraded.query({windows:[{from:0,to:Date.now()+1}],owner:true});assert.equal(result.quality.unknownLogTimes,0);assert.equal(result.rows[0].at,row.at);
+    // Cover both fixture timestamps regardless of the runner's clock or zone.
+    const period={from:row.at,to:row.at+2*3600000};
+    const query=()=>upgraded.query({windows:[period],...period,owner:true});
+    let result=query();assert.equal(result.quality.unknownLogTimes,1);
+    upgraded.put(row);result=query();assert.equal(result.quality.unknownLogTimes,0);assert.equal(result.rows[0].at,row.at);
   }finally{upgraded.close();}
 }));
 
