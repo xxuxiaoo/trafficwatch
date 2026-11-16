@@ -9,8 +9,11 @@ import {sealPacket,openPacket,packetFormat,purposeKey} from './vault-crypto.mjs'
 import {containsTime,containsInterval,intersectWindows} from './vault-grants.mjs';
 import {diagnosticTriggers} from './ai-diagnostic-events.mjs';
 import {DiagnosticFilters} from './ai-diagnostic-filters.mjs';
+import {drainSealedQueue} from './sealed-queue.mjs';
+import {correctTcpCategory} from './ai-tcp-events.mjs';
 
 function correctProbeCompatibility(event){
+  if(event.kind==='tcp')return correctTcpCategory(event);
   if(event.kind==='log'&&!event.timeSource)return {...event,timeSource:'unknown',observedAt:event.at,fault:false,legacyTimeUncertain:true};
   if(event.kind==='probe'&&event.errorType==='ArgumentException')return {...event,originalCategory:event.category,category:'probe_error',fault:false,collectorIssue:'framework_tls_probe_compatibility'};
   if(event.kind==='incident'&&event.evidence){
@@ -59,13 +62,8 @@ export class DiagnosticHistory {
     }
     this.filters=new DiagnosticFilters(this.db);
   }
-  drainBatch({limit=32,maxMs=Infinity}={}){
-    const file=path.join(this.dataRoot,'diagnostics','ingest.sqlite');if(!fs.existsSync(file))return {count:0,pending:false};
-    const spool=new PlainDatabase(file);let count=0;const started=performance.now();
-    try{
-      spool.exec('PRAGMA busy_timeout=1000');
-      for(const row of spool.prepare('SELECT id,payload FROM envelopes ORDER BY sequence LIMIT ?').all(limit)){
-        if(count&&performance.now()-started>=maxMs)break;
+  drainBatch({limit=32,...options}={}){
+    return drainSealedQueue(path.join(this.dataRoot,'diagnostics','ingest.sqlite'),this.db,row=>{
         const digest=crypto.createHash('sha256').update(row.payload).digest('hex'),previous=this.db.prepare('SELECT digest FROM imports WHERE id=?').get(row.id);
         if(previous&&previous.digest!==digest)throw new Error('ingest_id_conflict');
         if(!previous){
@@ -73,14 +71,11 @@ export class DiagnosticHistory {
           if(packet.header?.id!==row.id||packet.header?.vault!==this.metadata.id||packet.header?.lane!=='diagnostics')throw new Error('ingest_header_mismatch');
           const events=openPacket(packet,this.secrets.privateKey,this.metadata.capturePublicKey);
           if(!Array.isArray(events)||events.length>1024)throw new Error('invalid_diagnostic_batch');
-          this.db.exec('BEGIN IMMEDIATE');
-          try{for(const event of events)this.put(event);this.db.prepare('INSERT INTO imports VALUES (?,?)').run(row.id,digest);this.db.exec('COMMIT');}
-          catch(error){this.db.exec('ROLLBACK');throw error;}
+          this.db.exec('SAVEPOINT diagnostic_import_envelope');
+          try{for(const event of events)this.put(event);this.db.prepare('INSERT INTO imports VALUES (?,?)').run(row.id,digest);this.db.exec('RELEASE diagnostic_import_envelope');}
+          catch(error){this.db.exec('ROLLBACK TO diagnostic_import_envelope;RELEASE diagnostic_import_envelope');throw error;}
         }
-        spool.prepare('DELETE FROM envelopes WHERE id=?').run(row.id);count++;
-      }
-      return {count,pending:Boolean(spool.prepare('SELECT 1 FROM envelopes LIMIT 1').get())};
-    }finally{spool.close();}
+    },{limit,...options});
   }
   drain(limit=32){return this.drainBatch({limit}).count;}
   put(event){

@@ -102,7 +102,7 @@ export class VaultService {
     writer.on('message',message=>{
       if(this.writer!==writer)return;
       if(message.event==='ready'){this.ready=true;this.progress=null;this.initialization=null;this.backgroundImport=message.backgroundImport||null;this.audit('owner','unlock');}
-      else if(message.event==='import-progress')this.backgroundImport={state:message.state,lane:message.lane};
+      else if(message.event==='import-progress'){const {event,...progress}=message;this.backgroundImport=progress;}
       else if(message.event==='progress'){
         this.initialization={phase:message.phase||'migration',lane:message.lane,table:message.table};
         this.progress=this.initialization.phase==='migration'?{...this.initialization}:null;

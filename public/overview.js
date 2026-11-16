@@ -1,4 +1,4 @@
-import {initializeVault,vaultHeaders,checkVaultResponse} from './vault-browser.mjs';
+import {initializeVault,vaultHeaders,checkVaultResponse,importProgressText} from './vault-browser.mjs';
 const $ = (id) => document.getElementById(id);
 let vaultState;
 await initializeVault({overview:true,onStatus:value=>{
@@ -7,9 +7,8 @@ await initializeVault({overview:true,onStatus:value=>{
 }});
 function renderImportState(){
   const target=$('backgroundImportNotice');if(!target)return;
-  const importing=vaultState?.backgroundImport,state=importing?.state;
-  target.hidden=!['running','paused'].includes(state);
-  target.textContent=state==='paused'?'已有历史可以查看；部分新记录暂未补齐，后台将自动重试。采集仍在继续。':state==='running'?'已有历史已可查看；锁定期间的新记录正在后台分批补齐，统计会随之更新，采集继续运行。':'';
+  const text=importProgressText(vaultState?.backgroundImport);
+  target.hidden=!text;if(target.textContent!==text)target.textContent=text;
 }
 const pageNames = {
   overview: '流量总览',
@@ -1049,7 +1048,7 @@ function refresh(force = false) {
     } finally {
       if (current === refreshSequence) {
         refreshPromise = null; renderHeader();
-        if (!document.hidden) refreshTimer = setTimeout(()=>refresh(),preparing?1500:data?.refreshing ? 5000 : range === 'day' && selectedDate < calendarDate() ? 300000 : 60000);
+        if (!document.hidden) refreshTimer = setTimeout(()=>refresh(),preparing?1500:data?.refreshing ? 5000 : ['running','paused'].includes(vaultState?.backgroundImport?.state)?10000:range === 'day' && selectedDate < calendarDate() ? 300000 : 60000);
       }
     }
   };

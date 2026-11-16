@@ -1,4 +1,4 @@
-import {initializeVault,vaultHeaders,setVaultToken,hasVaultToken,safeReturnTarget} from './vault-browser.mjs';
+import {initializeVault,vaultHeaders,setVaultToken,hasVaultToken,safeReturnTarget,importProgressText} from './vault-browser.mjs';
 const $=id=>document.getElementById(id),dates=new Set(),windows=[];
 const returnTarget=safeReturnTarget(new URLSearchParams(location.search).get('return'));
 let status,requestSignature='',setupNonce=new URLSearchParams(location.hash.slice(1)).get('setup')||'',recoveryPending=false;
@@ -14,7 +14,7 @@ function renderState(){
   const locked=status.locked||!hasVaultToken();
   const phase=status.initialization?.phase||(status.migration?'migration':'opening');
   $('stateLine').textContent=!status.configured?'尚未启用加密；原有记录仍是明文。':locked?'流量记录已锁定。':status.ready?status.plaintextCleanupPending?'历史已加密；旧明文仍待验证和清理。':'流量记录已解锁，加密保护正常。':phase==='migration'?'首次加密正在迁移原有历史…':phase==='import'?'正在导入锁定期间采集的加密记录…':'正在打开已加密的流量记录…';
-  if(status.ready&&!locked&&status.backgroundImport?.state==='running')$('stateLine').textContent='流量记录已解锁，可以查看；新记录正在后台分批补齐。';
+  if(status.ready&&!locked&&importProgressText(status.backgroundImport))$('stateLine').textContent=importProgressText(status.backgroundImport);
   $('loginPanel').hidden=(!locked&&status.configured)||recoveryPending;
   $('managePanel').hidden=locked||!status.configured||recoveryPending;
   $('confirmLabel').hidden=status.configured;$('recoveryLabel').hidden=!status.configured;$('setupHint').hidden=status.configured;

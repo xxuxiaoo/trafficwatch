@@ -1,10 +1,24 @@
 # TrafficWatch validation
 
-The active test suite combines the upstream regression tests with synthetic history, process-family, encryption, storage, diagnosis and performance/recovery tests. The 0.10.6 checkout completed 221 cases: 219 passed, 2 administrator-only ETW integration tests skipped, no failures. JavaScript and PowerShell syntax checks passed. The native helper self-test and the Windows tray/controller package build also passed using hash-verified dependencies. Run `npm run check`, `npm test`, and `npm run audit:publication`. CI runs source tests on Windows and Linux; Linux validates query/accounting behavior and does not provide Windows native capture.
+The active test suite combines the upstream regression tests with synthetic history, process-family, encryption, storage, diagnosis and performance/recovery tests. The 0.10.8 checkout completed 234 cases: 232 passed, 2 administrator-only ETW integration tests skipped, no failures. JavaScript and PowerShell syntax checks passed. The native helper self-test and the Windows tray/controller package build also passed using hash-verified dependencies. Run `npm run check`, `npm test`, and `npm run audit:publication`. CI runs source tests on Windows and Linux; Linux validates query/accounting behavior and does not provide Windows native capture.
 
 Publication checks also built the diagnostic helpers in an isolated source fixture without a dependency cache: both packages downloaded from the official NuGet API, matched their pinned SHA256 values and compiled successfully. A complete local Windows package built with verified Node.js/WebView2 inputs. No installed service or real history was changed by these build checks.
 
 The first publication CI run exposed a test-fixture clock dependency: a local-wall-time legacy log could fall after `Date.now()` on the UTC runner and be correctly excluded by the query. Diagnostic replay tests now set explicit fixture ranges rather than using the current time. The full local suite passed in UTC; all six replay tests also passed in Asia/Shanghai, America/Los_Angeles and Pacific/Kiritimati with `Date.now()` fixed to 2020, before their fixture dates. The Windows and Linux CI jobs run independently so a failure on one does not cancel the other.
+
+## 0.10.8 relay target and TCP retry checks
+
+Seven focused regressions cover the observed Magpie provider schema, selected API endpoints, aliases and conflicting labels, per-attempt fallback targets, same-target TCP coverage, retry triggers, background/probe exclusions, socket summaries, and exact visitor-date enforcement through encrypted import. An HTTP regression walks the diagnostics browser-module dependency graph and checks that every imported module is served with a JavaScript content type.
+
+An isolated Edge browser with encrypted synthetic history passed six new scenario groups: four retries grouped into one socket, bounded full-timeline pagination and key-evidence switching, desktop/390-pixel layouts, saved Reconnect compatibility, retry filtering without increasing HTTP error counts, and relay-host/coverage display. All 23 existing diagnostics browser scenarios also passed, including filtering races, recovery, navigation, seven-day ranges, owner lock and visitor restrictions. Twelve refreshes retained 387 DOM nodes; reclaimed JavaScript heap measured 2,585,624 to 2,589,116 bytes, with no page errors. These checks use synthetic history; current provider configuration is not used to invent past request destinations.
+
+## 0.10.7 encrypted backlog checks
+
+A synthetic fixture queued 600 encrypted capture packets per traffic lane, each with 12 connection rows. Existing histories became queryable before importing the queue. Import completion took 51,780 ms before the change and 15,029 ms after it on the same local host, approximately 3.45 times faster; exact sample counts, import ledgers and connection/sample byte totals matched. Owner requests were also serviced during import. Individual filesystem waits can exceed the scheduling slice, so the slice is not a hard latency guarantee.
+
+Regression checks cover a rejected packet after a valid packet, rollback of partial packet operations, retained source packets, signed diagnostic import, process exit after durable history commit but before queue acknowledgement, replay without duplicate bytes, explicit queue notices and invalidation of completed-hour summaries after late imports. Encryption and durable history-before-acknowledgement ordering remain enabled.
+
+An isolated Edge browser with encrypted synthetic history passed eight progress/interface scenarios: per-source counts and rate, polling updates, shared diagnosis progress, explicit paused/validation errors, privacy-page state, completion, suppressing tiny live queues and a 390-pixel layout. The existing eleven owner-session/lock scenarios also passed. Upgrade regression checks deliberately create an incomplete old summary and verify that its first read rebuilds it from history.
 
 ## 0.10.5 query and interaction checks
 

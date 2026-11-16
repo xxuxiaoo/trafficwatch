@@ -1,5 +1,17 @@
 # Changelog
 
+## 0.10.8 — 2026-11-16
+
+- Resolve Magpie relay targets from its selected Responses, Chat or Anthropic endpoint, along with generic and nested endpoint settings. Match stable provider ids, names and former names, preserve per-attempt fallback targets, and leave conflicting labels or unmanaged endpoints unmapped. Never use a website or credential field as a request destination.
+- Classify Windows TCP Reconnect as a connection retry, preserve surrounding evidence for known AI relay traffic and keep retries separate from failed HTTP request counts. Correct the display/API category of previously saved Reconnect evidence without inventing old triggers.
+- Show relay hostnames in request details and group connection retries by socket, process, destination and time. Open incident details with key evidence, retain the complete timeline and bounded pagination, and highlight connection retries.
+
+## 0.10.7 — 2026-11-16
+
+- Import locked capture queues using bounded grouped history commits and grouped acknowledgements, with round-robin scheduling for Windows, Clash and diagnostics. Keep per-packet savepoints, signed validation and replay ledgers so a rejected packet cannot leave partial records and a crash after commit cannot double byte counts.
+- Show remaining capture batches, imported batches, throughput and a sanitized failure reason. Hide routine tiny live queues, refresh overviews more often during catch-up and refresh on completion.
+- Invalidate completed-hour program summaries when late capture is imported. Use exact source queries during catch-up so partially built caches cannot leave application or Harness totals incomplete.
+
 ## 0.10.6 — 2026-11-15
 
 - Preserve a temporary owner session across closed/reopened tabs and browser restarts within the same browser profile. Validate the session with an owner-only API before restoring the interface, migrate existing tab-only sessions and retain the original server expiry without storing a password or history key.

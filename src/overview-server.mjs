@@ -191,6 +191,7 @@ const assets = new Map([
   ['/storage.css', ['storage.css','text/css; charset=utf-8']],
   ['/diagnostics', ['diagnostics.html','text/html; charset=utf-8']],
   ['/diagnostics.js', ['diagnostics.js','text/javascript; charset=utf-8']],
+  ['/tcp-evidence.mjs', ['tcp-evidence.mjs','text/javascript; charset=utf-8']],
   ['/diagnostics.css', ['diagnostics.css','text/css; charset=utf-8']],
   ['/icon.svg', ['icon.svg', 'image/svg+xml']],
   ['/legacy',['index.html','text/html; charset=utf-8']],
@@ -240,6 +241,7 @@ const server = http.createServer(async (req, res) => {
         if(vault.storageBusy)return json(503,{error:'vault_storage_busy'});
       }
       const authorization=actor&&!actor.owner?{authorizedWindows:actor.windows,allowedLanes:actor.lanes}:{};
+      if(actor?.owner&&['running','paused'].includes(vault.backgroundImport?.state))authorization.skipRollup=true;
       if(url.pathname.startsWith('/api/legacy/')){
         if(vault.configured)vault.owner(bearer);
         const match=/^\/api\/legacy\/(windows|clash)\/(dashboard|calendar|report|correlation|export|settings|capture|stop|update|diagnostics)$/.exec(url.pathname);

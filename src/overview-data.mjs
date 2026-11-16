@@ -220,7 +220,7 @@ export function readLane(dataRoot, lane, rangeName, now = Date.now(), options = 
     report('programs');
     const quick = options.quick === true;
     if(lane==='clash')selectUsage(db,defs,range);
-    if (!quick && lane === 'windows' && options.cacheRoot) {
+    if (!quick && lane === 'windows' && options.cacheRoot && !options.skipRollup) {
       try { rolled = programRollup(db, options.cacheRoot, range, totals.firstAt, now, defs, (cache,filter)=>programs(cache,defs,filter,null)); }
       catch { cacheWarning = 'summary_cache_unavailable'; }
     }
@@ -320,6 +320,7 @@ export function readSavedApps(dataRoot) {
 if(workerData?.keyEntries)configureDatabaseKeys(workerData.keyEntries);
 if (parentPort) parentPort.on('message', ({ id, type = 'overview', range, date, now, options = {} }) => {
   if(options.authorizedWindows)options={...options,cacheRoot:undefined};
+  const queryCache=options.authorizedWindows||options.skipRollup?undefined:workerData.cacheRoot;
   try {
     if (type === 'apps') { parentPort.postMessage({ id, data: { apps: readSavedApps(workerData.dataRoot) } }); return; }
     if(type==='legacy'){
@@ -328,9 +329,9 @@ if (parentPort) parentPort.on('message', ({ id, type = 'overview', range, date, 
       try{parentPort.postMessage({id,data:readLegacy(db,options.route,options.params,options.live,now)});}finally{db.close();}return;
     }
     const data = {};
-    if (type === 'detail') data.detail = readDetail(workerData.dataRoot, options.lane, range, now, { ...options, cacheRoot: !options.authorizedWindows&&options.lane === 'windows' ? workerData.cacheRoot : undefined,report:progress=>parentPort.postMessage({id,event:'progress',...progress}) });
+    if (type === 'detail') data.detail = readDetail(workerData.dataRoot, options.lane, range, now, { ...options, cacheRoot: options.lane === 'windows' ? queryCache : undefined,report:progress=>parentPort.postMessage({id,event:'progress',...progress}) });
     else for (const [role, lane] of [['machine', 'windows'], ['clash', 'clash']]) {
-      try { data[role] = readLane(workerData.dataRoot, lane, range, now, { ...options, cacheRoot: options.authorizedWindows?undefined:workerData.cacheRoot, date,report:progress=>parentPort.postMessage({id,event:'progress',...progress}) }); }
+      try { data[role] = readLane(workerData.dataRoot, lane, range, now, { ...options, cacheRoot:queryCache, date,report:progress=>parentPort.postMessage({id,event:'progress',...progress}) }); }
       catch (error) { if (error instanceof RangeError) throw error; data[role] = { available: false, error: error.code || 'database_unavailable' }; }
     }
     parentPort.postMessage({ id, data });

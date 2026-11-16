@@ -4,6 +4,7 @@ import crypto from 'node:crypto';
 import { DatabaseSync as PlainDatabase } from 'node:sqlite';
 import { sealPacket, openPacket, packetFormat } from './vault-crypto.mjs';
 import { dpapi } from './vault-platform.mjs';
+import {drainSealedQueue} from './sealed-queue.mjs';
 
 // Only capture preferences are public. Observed process names, domains, session
 // titles and byte counts always go inside the encrypted envelope.
@@ -74,13 +75,17 @@ export function importEnvelope(store, envelope, metadata, secrets) {
   if (packet.header?.vault !== metadata.id || packet.header?.id !== envelope.id || packet.header?.lane !== store.vaultLane) throw new Error('ingest_header_mismatch');
   const operations = openPacket(packet, secrets.privateKey,metadata.capturePublicKey);
   if (!Array.isArray(operations) || operations.length > 1024) throw new Error('invalid_ingest_operations');
-  store.db.exec('BEGIN IMMEDIATE');
+  store.db.exec('SAVEPOINT vault_import_envelope');
   try {
+    let backfilled=false;
     for (const { method, args } of operations) {
       if (!Array.isArray(args)) throw new Error('invalid_ingest_operation');
       const timestamp=method==='record'?args[0]?.at:method==='saveSession'?args[0]?.activity:method==='alert'?args[0]:method==='anomaly'?args[0]?.to:undefined;
       if(timestamp!==undefined&&store.db.prepare('SELECT 1 FROM vault_deletions WHERE ?>=start_at AND ?<end_at LIMIT 1').get(timestamp,timestamp))continue;
-      if (method === 'record') store.record(args[0], { transaction: false });
+      if (method === 'record') {
+        const inserted=store.record(args[0], { transaction: false });
+        if(inserted!==false&&timestamp<Math.floor((Date.now()-120000)/3600000)*3600000)backfilled=true;
+      }
       else if (['saveSession', 'set', 'alert', 'anomaly', 'closeOpenGaps'].includes(method)) store[method](...args);
       else if (method === 'openGap') {
         const gap = store.openGap(args[1], args[2]);
@@ -90,25 +95,15 @@ export function importEnvelope(store, envelope, metadata, secrets) {
         if (gap) store.closeGap(gap.gap_id, args[1]);
       } else throw new Error('invalid_ingest_operation');
     }
+    // Completed-hour summaries can have been built while this older queue was
+    // still importing. Invalidate them in the same transaction as late bytes.
+    if(backfilled)store.set('vaultDataRevision',store.get('vaultDataRevision',0)+1);
     store.db.prepare('INSERT INTO vault_imports VALUES (?,?)').run(envelope.id, digest);
-    store.db.exec('COMMIT'); return true;
-  } catch (error) { store.db.exec('ROLLBACK'); throw error; }
+    store.db.exec('RELEASE vault_import_envelope'); return true;
+  } catch (error) { store.db.exec('ROLLBACK TO vault_import_envelope;RELEASE vault_import_envelope'); throw error; }
 }
 
-export function drainIngestBatch(store, metadata, secrets, { limit = 120, maxMs = Infinity } = {}) {
-  const file = path.join(store.vaultDir, 'ingest.sqlite');
-  if (!fs.existsSync(file)) return {count:0,pending:false};
-  const spool = new PlainDatabase(file); let count = 0;const started=performance.now();
-  try {
-    spool.exec('PRAGMA busy_timeout=1000');
-    for (const envelope of spool.prepare('SELECT id,payload FROM envelopes ORDER BY sequence LIMIT ?').all(limit)) {
-      if(count&&performance.now()-started>=maxMs)break;
-      importEnvelope(store, envelope, metadata, secrets);
-      // Crash between commit and deletion is safe: import ids are committed
-      // together with the bytes, so the next import cannot double the totals.
-      spool.prepare('DELETE FROM envelopes WHERE id=?').run(envelope.id); count++;
-    }
-    return {count,pending:Boolean(spool.prepare('SELECT 1 FROM envelopes LIMIT 1').get())};
-  } finally { spool.close(); }
+export function drainIngestBatch(store, metadata, secrets, options = {}) {
+  return drainSealedQueue(path.join(store.vaultDir,'ingest.sqlite'),store.db,envelope=>importEnvelope(store,envelope,metadata,secrets),options);
 }
 export function drainIngest(store, metadata, secrets, options) {return drainIngestBatch(store,metadata,secrets,options).count;}

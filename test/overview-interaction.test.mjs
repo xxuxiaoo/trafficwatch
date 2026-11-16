@@ -8,6 +8,24 @@ import {fixture} from './history-synthetic-fixtures.mjs';
 
 async function freePort(){const server=net.createServer();await new Promise(resolve=>server.listen(0,'127.0.0.1',resolve));const port=server.address().port;await new Promise(resolve=>server.close(resolve));return port;}
 
+test('diagnostics serves its complete browser module dependency graph with JavaScript content types',async t=>{
+  const f=fixture(t),port=await freePort(),app=startOverviewServer({historyRoot:f.root,listenPort:port,sourcePorts:[await freePort(),await freePort()],suiteSettings:{},guardFactory:()=>({start(){},close(){}})});
+  t.after(()=>app.close());
+  await new Promise(resolve=>app.server.listening?resolve():app.server.once('listening',resolve));
+  const base='http://127.0.0.1:'+port,visited=new Set(),pending=['/diagnostics.js'];
+  while(pending.length){
+    const route=pending.pop();if(visited.has(route))continue;visited.add(route);
+    const response=await fetch(base+route);
+    assert.equal(response.status,200,route+' must load before the vault redirect can run');
+    assert.match(response.headers.get('content-type'),/javascript/);
+    const source=await response.text();
+    for(const match of source.matchAll(/\bfrom\s*['"]([^'"]+)['"]/g)){
+      if(match[1].startsWith('.'))pending.push(new URL(match[1],base+route).pathname);
+    }
+  }
+  assert(visited.has('/tcp-evidence.mjs'));assert(visited.has('/vault-browser.mjs'));
+});
+
 test('an interactive detail finishes while a whole-range overview is still running',async t=>{
   const f=fixture(t),readers=new Map();let overviewStarted,releaseOverview;
   const started=new Promise(resolve=>overviewStarted=resolve);

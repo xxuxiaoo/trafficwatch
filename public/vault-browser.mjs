@@ -12,6 +12,24 @@ function sharedSession(){
 let token=sharedSession()?.token||stored('sessionStorage',tabSessionKey),configured=false,protectedPage=false,redirecting=false;
 export const vaultHeaders=()=>token?{Authorization:`Bearer ${token}`} : {};
 export const hasVaultToken=()=>Boolean(token);
+export function importProgressText(progress){
+  if(!progress||!['running','paused'].includes(progress.state))return '';
+  if(progress.state==='running'&&Number.isSafeInteger(progress.remaining)&&progress.remaining<16)return '';
+  const names={windows:'本机',clash:'梯子',diagnostics:'AI 诊断'},parts=[];
+  for(const [lane,name]of Object.entries(names)){
+    const remaining=progress.lanes?.[lane]?.remaining;
+    if(Number.isSafeInteger(remaining)&&remaining>0)parts.push(name+' '+remaining.toLocaleString('zh-CN')+' 批');
+  }
+  const queue=parts.length?'待补齐：'+parts.join('、')+'。':'新记录正在后台补齐。';
+  if(progress.state==='paused'){
+    const problem=progress.lanes?.[progress.lane]?.error;
+    const reason=problem==='database_busy'?'数据库暂时繁忙':problem==='packet_validation_failed'?'采集包校验未通过':'导入暂时受阻';
+    return queue+(names[progress.lane]||'部分来源')+reason+'，后台将自动重试；原采集包继续加密保留。';
+  }
+  const processed=Number.isSafeInteger(progress.processed)&&progress.processed>0?'已补齐 '+progress.processed.toLocaleString('zh-CN')+' 批':'',speed=Number.isFinite(progress.packetsPerSecond)&&progress.packetsPerSecond>0?'约 '+Math.round(progress.packetsPerSecond)+' 批/秒':'';
+  const detail=[processed,speed].filter(Boolean).join('，');
+  return '采集持续运行，正在将加密记录补入历史。'+queue+(detail?detail+'。':'')+'图表暂缺的时段会自动补齐。';
+}
 export function setVaultToken(value,expiresAt){
   token=value||'';store('sessionStorage',tabSessionKey,token);
   if(token){

@@ -1,4 +1,6 @@
 import path from 'node:path';
+import fs from 'node:fs';
+import {DatabaseSync as PlainDatabase} from 'node:sqlite';
 import { parentPort,workerData } from 'node:worker_threads';
 import { migrateLane,vaultKeyEntries } from './vault-migration.mjs';
 import { initializeImport,drainIngestBatch } from './sealed-store.mjs';
@@ -15,26 +17,42 @@ const entries=vaultKeyEntries(dataRoot,secrets);
 let compacting=false,storageTask=null,stopArchive=false,storageJob=null,lastSnapshot=null;
 let diagnostics;
 function diagnosticStore(){return diagnostics??=new DiagnosticHistory(dataRoot,metadata,secrets);}
-const importLanes=['windows','clash','diagnostics'],importStates=new Map(importLanes.map(lane=>[lane,{pending:true,retryAt:0}]));
-let importTimer,importIndex=0,lastImportStatus='',initialArchivePending=true;
+const importLanes=['windows','clash','diagnostics'],importStates=new Map(importLanes.map(lane=>[lane,{pending:true,retryAt:0,remaining:null,processed:0,error:null}]));
+// At most three source handles per unlocked writer. Reopening and closing on
+// every slice can repeatedly checkpoint an otherwise idle source queue.
+const importConnections=new Map();
+function importConnection(lane){
+  if(!importConnections.has(lane)){
+    const file=path.join(dataRoot,lane,'ingest.sqlite');
+    if(fs.existsSync(file))importConnections.set(lane,new PlainDatabase(file));
+  }
+  return importConnections.get(lane);
+}
+let importTimer,importIndex=0,lastImportStatus='',lastImportReport=0,initialArchivePending=true,importStarted=performance.now();
+const importError=error=>['SQLITE_BUSY','SQLITE_LOCKED'].includes(error.code)?'database_busy':/^(ingest_|invalid_(?:encrypted_packet|packet_signature|ingest_|diagnostic_))/.test(error.message)?'packet_validation_failed':'import_failed';
 function importTick(){
   if(compacting||storageTask){importTimer=setTimeout(importTick,500);return;}
   const lane=importLanes[importIndex++%importLanes.length],state=importStates.get(lane);
   if(Date.now()>=state.retryAt){
     try{
-      const batch=lane==='diagnostics'?diagnosticStore().drainBatch({limit:16,maxMs:40}):drainIngestBatch(stores.get(lane),metadata,secrets,{limit:16,maxMs:40});
-      state.pending=batch.pending;state.retryAt=0;
+      const options={limit:64,maxMs:25,includeRemaining:true,connection:importConnection(lane)};
+      const batch=lane==='diagnostics'?diagnosticStore().drainBatch(options):drainIngestBatch(stores.get(lane),metadata,secrets,options);
+      state.pending=batch.pending;state.remaining=batch.remaining;state.processed+=batch.count;state.retryAt=0;state.error=null;
       if(batch.count&&lane!=='diagnostics')stores.get(lane).checkBudgets();
-    }catch{
-      state.pending=true;state.retryAt=Date.now()+60000;
+    }catch(error){
+      state.pending=true;state.retryAt=Date.now()+60000;state.error=importError(error);state.processed+=error.importedCount||0;if(Number.isSafeInteger(error.remaining))state.remaining=error.remaining;
     }
   }
   const failed=importLanes.find(name=>importStates.get(name).retryAt>Date.now()),pending=importLanes.find(name=>importStates.get(name).pending&&!importStates.get(name).retryAt);
   const status={state:failed?'paused':pending?'running':'complete',lane:failed||pending||null};
-  const signature=JSON.stringify(status);
-  if(signature!==lastImportStatus){parentPort.postMessage({event:'import-progress',...status});lastImportStatus=signature;}
+  const signature=JSON.stringify(status),now=performance.now();
+  if(signature!==lastImportStatus||now-lastImportReport>=1000){
+    const lanes=Object.fromEntries(importLanes.map(name=>{const value=importStates.get(name);return [name,{remaining:value.remaining,processed:value.processed,error:value.error}];}));
+    const processed=importLanes.reduce((sum,name)=>sum+importStates.get(name).processed,0),remaining=importLanes.every(name=>importStates.get(name).remaining!==null)?importLanes.reduce((sum,name)=>sum+importStates.get(name).remaining,0):null;
+    parentPort.postMessage({event:'import-progress',...status,lanes,processed,remaining,packetsPerSecond:Math.round(processed/Math.max(1,(now-importStarted)/1000)),updatedAt:Date.now()});lastImportStatus=signature;lastImportReport=now;
+  }
   if(status.state==='complete'&&initialArchivePending){initialArchivePending=false;setImmediate(()=>runArchive({automatic:true}).catch(()=>{}));}
-  importTimer=setTimeout(importTick,pending?50:500);
+  importTimer=setTimeout(importTick,pending?10:500);
 }
 const emitStorage=value=>{
   storageJob={...storageJob,...value,updatedAt:Date.now()};
@@ -70,6 +88,7 @@ try {
   // Existing history is queryable as soon as its databases are open. Never
   // make an unlock wait for a queue that active collectors keep appending to.
   parentPort.postMessage({event:'ready',backgroundImport:{state:'running',lane:'windows'}});
+  importStarted=performance.now();
   const autoStart=setTimeout(()=>runArchive({automatic:true}).catch(()=>{}),15000);
   const maintenanceTimer=setInterval(()=>{if(!compacting)runArchive({automatic:true}).catch(()=>{});},6*3600000);
   importTimer=setTimeout(importTick,25);
@@ -177,5 +196,5 @@ try {
       parentPort.postMessage({id,result});
     }catch(error){parentPort.postMessage({id,error:error.message});}
   });
-  parentPort.on('close',()=>{clearTimeout(importTimer);clearInterval(maintenanceTimer);clearTimeout(autoStart);diagnostics?.close();for(const store of stores.values())store.close();for(const [,key] of entries)key.fill(0);});
+  parentPort.on('close',()=>{clearTimeout(importTimer);clearInterval(maintenanceTimer);clearTimeout(autoStart);for(const source of importConnections.values())source.close();diagnostics?.close();for(const store of stores.values())store.close();for(const [,key] of entries)key.fill(0);});
 }catch(error){parentPort.postMessage({event:'failed',error:error.message});process.exitCode=1;}

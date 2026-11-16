@@ -6,6 +6,7 @@ import { historyBounds,archiveIntersects } from './history-archive.mjs';
 import { prepareCacheFile, limitCacheConnection, cacheFailed } from './storage-files.mjs';
 
 const HOUR = 3600000;
+const CACHE_FORMAT=3;
 // Disposable read-side summaries. The collector database is always read-only;
 // exact connection/scope identities are retained, including historical unknowns.
 export function programRollup(source, cacheRoot, range, firstAt, now, defs, aggregate) {
@@ -47,7 +48,8 @@ export function programRollup(source, cacheRoot, range, firstAt, now, defs, aggr
     const previousFirst = db.prepare("SELECT value FROM state WHERE key='firstAt'").get()?.value;
     const revision=source.prepare("SELECT value FROM settings WHERE key='vaultDataRevision'").get()?.value||'0';
     const oldRevision=db.prepare("SELECT value FROM state WHERE key='revision'").get()?.value;
-    if (latest < previous || (previousFirst !== undefined && previousFirst !== earliest)||oldRevision!==undefined&&String(oldRevision)!==String(revision)) {
+    const oldFormat=db.prepare("SELECT value FROM state WHERE key='format'").get()?.value;
+    if (oldFormat!==CACHE_FORMAT||latest < previous || (previousFirst !== undefined && previousFirst !== earliest)||oldRevision!==undefined&&String(oldRevision)!==String(revision)) {
       db.exec('DELETE FROM hours; DELETE FROM usage_hourly; DELETE FROM connections; DELETE FROM connection_families; DELETE FROM state; DELETE FROM program_bases; DELETE FROM base_members;');
     }
     const metadataAt = db.prepare("SELECT value FROM state WHERE key='metadataAt'").get()?.value || 0;
@@ -72,7 +74,7 @@ export function programRollup(source, cacheRoot, range, firstAt, now, defs, aggr
       if (c.family) updateFamily.run(c.id,c.family,c.root_process,c.updated_at);
     }
     const saveState = db.prepare('INSERT INTO state VALUES(?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value');
-    saveState.run('metadataAt', latest); saveState.run('firstAt', earliest);saveState.run('revision',Number(revision));
+    saveState.run('metadataAt', latest); saveState.run('firstAt', earliest);saveState.run('revision',Number(revision));saveState.run('format',CACHE_FORMAT);
     if(identityChanged) db.exec('DELETE FROM program_bases; DELETE FROM base_members;');
     db.exec('COMMIT');
     const ready = new Set(db.prepare('SELECT hour FROM hours WHERE hour>=? AND hour<?').all(from,to).map(x=>x.hour));

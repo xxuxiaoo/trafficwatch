@@ -15,6 +15,8 @@ import {productionController,controllerCall} from './relay-clash-overlay.mjs';
 import {commandVerifier} from './vault-commands.mjs';
 import {DiagnosticLogSources} from './ai-log-sources.mjs';
 import {requestCoverage,collectionSnapshot} from './ai-diagnostic-quality.mjs';
+import {buildProviderTargets,mappedProviderHost} from './ai-provider-targets.mjs';
+import {normalizeTcpEvent} from './ai-tcp-events.mjs';
 
 export async function startAiDiagnostics({settings=readSettings()}={}){
   const dataRoot=settings.DataRoot,dir=path.join(dataRoot,'diagnostics');fs.mkdirSync(dir,{recursive:true});
@@ -45,10 +47,10 @@ export async function startAiDiagnostics({settings=readSettings()}={}){
     observe(event);
   }});
   function acceptRequest(raw,{historicalImport=false}={}){
-    for(const event of normalizeMagpieRequest(raw)){
+    for(const event of normalizeMagpieRequest(raw,{providerTargets:providerMap})){
       const signature=JSON.stringify(event);if(seen.get(event.id)===signature)continue;seen.delete(event.id);seen.set(event.id,signature);while(seen.size>20000)seen.delete(seen.keys().next().value);
       metrics.requests++;if(event.fault)metrics.faults++;event.observedAt=Date.now();event.historicalImport=historicalImport;
-      const host=providerMap.get(event.provider.toLowerCase());if(host){activeHost=host;event.host=host;}observe(withCoverage(event));
+      if(event.host)activeHost=event.host;observe(withCoverage(event));
     }
   }
   function acceptFeed(raw){
@@ -56,7 +58,7 @@ export async function startAiDiagnostics({settings=readSettings()}={}){
     const at=Date.parse(raw.t);if(!Number.isSafeInteger(at)||typeof raw.id!=='string')return;
     const status=Number(raw.status)||0,category=errorCategory('',status),id=eventId('magpie-feed',raw.id);
     const event={kind:'status',id,at,end:status>0&&Number.isFinite(raw.ms)?at+Math.round(raw.ms):null,category:'magpie_feed_summary',result:category,status,gateway:'magpie',provider:String(raw.providerName||raw.provider||'').slice(0,96),harness:String(raw.agent||'').slice(0,40),durationMs:Number.isFinite(raw.ms)?raw.ms:null,fault:[502,504].includes(status),phaseEvidence:'unavailable'};
-    const host=settings.RelayHosts.find(host=>raw.host===host)||providerMap.get(String(raw.provider||raw.providerName||'').toLowerCase());if(host){event.host=host;activeHost=host;}
+    const host=settings.RelayHosts.find(host=>raw.host===host)||mappedProviderHost(providerMap,raw.provider)||mappedProviderHost(providerMap,raw.providerName);if(host){event.host=host;activeHost=host;}
     const signature=JSON.stringify(event);if(seen.get(id)===signature)return;seen.set(id,signature);while(seen.size>20000)seen.delete(seen.keys().next().value);observe(event);
   }
   const routingDir=path.join(settings.OwnerProfile,'.config','magpie','routing'),appLog=path.join(settings.OwnerProfile,'AppData','Local','magpie','logs','app.log');
@@ -66,12 +68,8 @@ export async function startAiDiagnostics({settings=readSettings()}={}){
     lastProviderRefresh=Date.now();
     try{
       const value=JSON.parse(fs.readFileSync(path.join(settings.OwnerProfile,'.config','magpie','providers.json'),'utf8'));
-      const next=new Map();
-      // Use only endpoint hostnames and provider labels. Never copy credential objects into events.
-      const visit=(node,label='',depth=0)=>{if(!node||typeof node!=='object'||depth>5)return;for(const [key,item]of Object.entries(node)){
-        if(typeof item==='string'&&/^(base_?url|api_?base|baseAPI|endpoint|url)$/i.test(key))try{const host=new URL(item.includes('://')?item:'https://'+item).hostname;if(settings.RelayHosts.includes(host))for(const id of [node.name,node.id,label].filter(Boolean))next.set(String(id).slice(0,96).toLowerCase(),host);}catch{}
-        else if(item&&typeof item==='object'&&!/key|secret|token|credential/i.test(key))visit(item,/^\d+$/.test(key)?label:key,depth+1);
-      }};visit(value);providerMap.clear();for(const [label,host]of next)providerMap.set(label,host);
+      const next=buildProviderTargets(value,settings.RelayHosts);
+      providerMap.clear();for(const [label,host]of next)providerMap.set(label,host);
     }catch{}
   }
   loadProviders();
@@ -117,7 +115,7 @@ export async function startAiDiagnostics({settings=readSettings()}={}){
           lastTraceAt=Date.now();
           if(row.eventsLost>lost||row.boundedDrops>localDrops)gap('trace_dropped_events');lost=row.eventsLost;localDrops=row.boundedDrops;metrics.traceEventsLost=lost;metrics.boundedDrops=localDrops;
           const currentTargets=targetState()?.targets||[];
-          for(const raw of row.events||[]){if(typeof raw.operation!=='string')continue;const synthetic=raw.process==='TrafficWatch-RelayProbe',event={id:crypto.randomUUID(),kind:'tcp',...raw,synthetic,category:/Retransmit/i.test(raw.operation)?'retransmit':/Fail/i.test(raw.operation)?'tcp_fail':'socket',fault:/Fail/i.test(raw.operation)};engine.observe(event);if(!synthetic){const target=currentTargets.find(target=>target.ips.includes(raw.source)||target.ips.includes(raw.destination));if(target)activeHost=target.host;}}
+          for(const raw of row.events||[]){const event=normalizeTcpEvent(raw,{targets:currentTargets});if(!event)continue;engine.observe(event);if(!event.synthetic&&event.host)activeHost=event.host;}
         }else if(row.kind==='error')traceState='unavailable';
       }catch{gap('trace_invalid_event');}
     });
@@ -185,7 +183,7 @@ export async function startAiDiagnostics({settings=readSettings()}={}){
     const snapshot=collectionSnapshot({sources:[magpie,...logSources.snapshot()],traceState,lastTraceAt,pktmonState,pktmonCheckedAt,metrics,queuePending:pending.length>1024});
     observe(snapshot);flush();logSources.resetCounters();magpieParseFailures=0;metrics.unknownLogTimes=0;lastCollectionCheck=Date.now();
   }
-  const health=()=>({app:'trafficwatch-ai-diagnostics',pid:process.pid,state:stopping?'stopped':'recording',at:Date.now(),trace:traceState,pktmon:pktmonState,metrics:{traceEventsLost:metrics.traceEventsLost,boundedDrops:metrics.boundedDrops,unknownLogTimes:metrics.unknownLogTimes||0},resources:{rssBytes:process.memoryUsage().rss,ringBytes:engine.ring.bytes},features:{magpie:'incremental_files',requestFeed:feedState,traceEvent:'2.0.77',pktmonPayload:false,eventSchema:DIAGNOSTIC_SCHEMA_VERSION,slowRequestCapture:true,logAdapters:['magpie','cc-switch','codex','claude','dsh'],collectionChecks:true},encrypted:true});
+  const health=()=>({app:'trafficwatch-ai-diagnostics',pid:process.pid,state:stopping?'stopped':'recording',at:Date.now(),trace:traceState,pktmon:pktmonState,metrics:{traceEventsLost:metrics.traceEventsLost,boundedDrops:metrics.boundedDrops,unknownLogTimes:metrics.unknownLogTimes||0},resources:{rssBytes:process.memoryUsage().rss,ringBytes:engine.ring.bytes},features:{magpie:'incremental_files',requestFeed:feedState,traceEvent:'2.0.77',pktmonPayload:false,eventSchema:DIAGNOSTIC_SCHEMA_VERSION,slowRequestCapture:true,logAdapters:['magpie','cc-switch','codex','claude','dsh'],collectionChecks:true,providerTargetMapping:2,tcpConnectRetry:true},encrypted:true});
   const server=http.createServer(async(req,res)=>{
     const json=(code,data)=>{res.writeHead(code,{'content-type':'application/json','cache-control':'no-store'});res.end(JSON.stringify(data));};
     if(req.headers.host!=='127.0.0.1:43132'||req.headers.origin&&req.headers.origin!=='http://127.0.0.1:43132')return json(403,{error:'local_origin_required'});

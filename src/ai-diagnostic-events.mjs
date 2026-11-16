@@ -1,4 +1,5 @@
 import crypto from 'node:crypto';
+import {mappedProviderHost} from './ai-provider-targets.mjs';
 
 const text=(value,max=96)=>typeof value==='string'?value.replace(/[\r\n\x00-\x1f]/g,' ').slice(0,max):'';
 const number=value=>value!==null&&value!==undefined&&Number.isFinite(Number(value))&&Number(value)>=0?Number(value):null;
@@ -22,7 +23,7 @@ export function errorCategory(error,status) {
   if(value)return 'unknown_error';
   return status>=200&&status<400?'success':'pending';
 }
-export function normalizeMagpieRequest(raw) {
+export function normalizeMagpieRequest(raw,{providerTargets=new Map()}={}) {
   if(!raw||typeof raw!=='object')return [];
   const at=stamp(raw.time);if(!Number.isSafeInteger(at)||at<0)return [];
   const requestId=eventId('magpie',raw.id??raw.seq,at);
@@ -39,8 +40,10 @@ export function normalizeMagpieRequest(raw) {
     if(networkErrors.includes(category))captureReasons.push(category);
     for(const [key,threshold,reason]of [['connect',5000,'slow_connect'],['tls',5000,'slow_tls'],['send',10000,'slow_send'],['wait',15000,'slow_response']])if(timings[key]>threshold)captureReasons.push(reason);
     if(number(attempt.ttft)>30000&&category!=='cancelled')captureReasons.push('slow_first_content');
+    const attemptProvider=[attempt.provider,attempt.id].find(value=>mappedProviderHost(providerTargets,value));
+    const provider=text(attemptProvider||raw.provider||'unknown'),host=mappedProviderHost(providerTargets,provider);
     return {id:eventId('magpie-try-v2',requestId,index),legacyId:eventId(requestId,attempt.id??index),schemaVersion:DIAGNOSTIC_SCHEMA_VERSION,kind:'request',at:start,end,requestId,attempt:index+1,
-      harness:text(raw.agent||'unknown',40),gateway:'magpie',provider:text(raw.provider||'unknown'),
+      harness:text(raw.agent||'unknown',40),gateway:'magpie',provider,...(host?{host,targetEvidence:'provider_configuration'}:{}),
       status,category,done,durationMs:duration,ttftMs:number(attempt.ttft),reused:typeof net.reused==='boolean'?net.reused:null,timings,
       phaseEvidence:Object.values(timings).some(value=>value!==null)?'gateway_trace':'unavailable',
       // Error text, sessions, URLs, prompts and arbitrary nested fields are intentionally never copied.
