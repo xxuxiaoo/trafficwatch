@@ -12,13 +12,22 @@ function sharedSession(){
 let token=sharedSession()?.token||stored('sessionStorage',tabSessionKey),configured=false,protectedPage=false,redirecting=false;
 export const vaultHeaders=()=>token?{Authorization:`Bearer ${token}`} : {};
 export const hasVaultToken=()=>Boolean(token);
+function durationText(value){
+  if(!Number.isFinite(value)||value<0)return '';
+  const seconds=Math.max(1,Math.ceil(value));
+  if(seconds<60)return seconds+' 秒';
+  const minutes=Math.ceil(seconds/60);if(minutes<60)return minutes+' 分钟';
+  if(minutes<48*60){const hours=Math.floor(minutes/60),rest=minutes%60;return hours+' 小时'+(rest?' '+rest+' 分钟':'');}
+  const hours=Math.ceil(minutes/60);
+  return Math.ceil(hours/24)+' 天';
+}
 export function importProgressText(progress){
   if(!progress||!['running','paused'].includes(progress.state))return '';
-  if(progress.state==='running'&&Number.isSafeInteger(progress.remaining)&&progress.remaining<16)return '';
+  if(progress.state==='running'&&Number.isSafeInteger(progress.remaining)&&progress.remaining<16&&!progress.stalled)return '';
   const names={windows:'本机',clash:'梯子',diagnostics:'AI 诊断'},parts=[];
   for(const [lane,name]of Object.entries(names)){
     const remaining=progress.lanes?.[lane]?.remaining;
-    if(Number.isSafeInteger(remaining)&&remaining>0)parts.push(name+' '+remaining.toLocaleString('zh-CN')+' 批');
+    if(Number.isSafeInteger(remaining)&&remaining>0){const eta=progress.lanes?.[lane]?.etaSeconds;parts.push(name+' '+remaining.toLocaleString('zh-CN')+' 批'+(Number.isFinite(eta)?'（约 '+durationText(eta)+'）':''));}
   }
   const queue=parts.length?'待补齐：'+parts.join('、')+'。':'新记录正在后台补齐。';
   if(progress.state==='paused'){
@@ -26,9 +35,11 @@ export function importProgressText(progress){
     const reason=problem==='database_busy'?'数据库暂时繁忙':problem==='packet_validation_failed'?'采集包校验未通过':'导入暂时受阻';
     return queue+(names[progress.lane]||'部分来源')+reason+'，后台将自动重试；原采集包继续加密保留。';
   }
-  const processed=Number.isSafeInteger(progress.processed)&&progress.processed>0?'已补齐 '+progress.processed.toLocaleString('zh-CN')+' 批':'',speed=Number.isFinite(progress.packetsPerSecond)&&progress.packetsPerSecond>0?'约 '+Math.round(progress.packetsPerSecond)+' 批/秒':'';
-  const detail=[processed,speed].filter(Boolean).join('，');
-  return '采集持续运行，正在将加密记录补入历史。'+queue+(detail?detail+'。':'')+'图表暂缺的时段会自动补齐。';
+  const imported=Number.isSafeInteger(progress.processed)&&progress.processed>0?'已补齐 '+progress.processed.toLocaleString('zh-CN')+' 批。':'',measurement=Number(progress.measurementSeconds)||0;
+  const speed=measurement>=5&&Number.isFinite(progress.packetsPerSecond)?'近 '+Math.round(measurement)+' 秒导入 '+Math.round(progress.packetsPerSecond)+' 批/秒'+(progress.arrivingPerSecond>0?'，采集新增 '+Math.round(progress.arrivingPerSecond)+' 批/秒':'')+(Number.isFinite(progress.netPerSecond)?'，净减少 '+Math.round(progress.netPerSecond)+' 批/秒':'')+'。':'正在测算导入速度。';
+  if(progress.stalled)return '采集持续运行；统计尚未完整，图表只包含已补齐数据。'+queue+imported+'最近 30 秒待补齐量没有净减少，请查看队列状态；已采集密文仍保留。';
+  const eta=Number.isFinite(progress.etaSeconds)&&progress.etaSeconds>=0?'按当前净速度预计约 '+durationText(progress.etaSeconds)+' 补齐。':'队列减少后将显示预计时间。';
+  return '采集持续运行；统计尚未完整，图表只包含已补齐数据。'+queue+imported+speed+eta;
 }
 export function setVaultToken(value,expiresAt){
   token=value||'';store('sessionStorage',tabSessionKey,token);

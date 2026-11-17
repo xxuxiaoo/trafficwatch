@@ -11,13 +11,14 @@ import { initializeArchives,attachArchiveViews,detachArchiveViews,deleteArchived
 import { storageSnapshot,saveStoragePolicy,storagePolicy,archiveOldHistory,tidyBackupStaging } from './storage-manager.mjs';
 import { compactHistory } from './storage-compaction.mjs';
 import { DiagnosticHistory } from './ai-diagnostic-store.mjs';
+import {importBudgetMs,measureImportProgress} from './import-progress.mjs';
 
 const {dataRoot,metadata,secrets}=workerData,stores=new Map();
 const entries=vaultKeyEntries(dataRoot,secrets);
 let compacting=false,storageTask=null,stopArchive=false,storageJob=null,lastSnapshot=null;
 let diagnostics;
 function diagnosticStore(){return diagnostics??=new DiagnosticHistory(dataRoot,metadata,secrets);}
-const importLanes=['windows','clash','diagnostics'],importStates=new Map(importLanes.map(lane=>[lane,{pending:true,retryAt:0,remaining:null,processed:0,error:null}]));
+const importLanes=['windows','clash','diagnostics'],importStates=new Map(importLanes.map(lane=>[lane,{pending:true,retryAt:0,remaining:null,processed:0,error:null,samples:[]}]));
 // At most three source handles per unlocked writer. Reopening and closing on
 // every slice can repeatedly checkpoint an otherwise idle source queue.
 const importConnections=new Map();
@@ -30,26 +31,34 @@ function importConnection(lane){
 }
 let importTimer,importIndex=0,lastImportStatus='',lastImportReport=0,initialArchivePending=true,importStarted=performance.now();
 const importError=error=>['SQLITE_BUSY','SQLITE_LOCKED'].includes(error.code)?'database_busy':/^(ingest_|invalid_(?:encrypted_packet|packet_signature|ingest_|diagnostic_))/.test(error.message)?'packet_validation_failed':'import_failed';
+function recordImportSample(state,now){
+  if(state.remaining===null)return;
+  const previous=state.samples.at(-1);if(previous&&now-previous.at<500)return;
+  state.samples.push({at:now,remaining:state.remaining,processed:state.processed});
+  while(state.samples.length>64||state.samples.length>2&&now-state.samples[0].at>30000)state.samples.shift();
+}
 function importTick(){
   if(compacting||storageTask){importTimer=setTimeout(importTick,500);return;}
   const lane=importLanes[importIndex++%importLanes.length],state=importStates.get(lane);
   if(Date.now()>=state.retryAt){
     try{
-      const options={limit:64,maxMs:25,includeRemaining:true,connection:importConnection(lane)};
+      const options={limit:128,maxMs:importBudgetMs(state.remaining),includeRemaining:true,connection:importConnection(lane)};
       const batch=lane==='diagnostics'?diagnosticStore().drainBatch(options):drainIngestBatch(stores.get(lane),metadata,secrets,options);
       state.pending=batch.pending;state.remaining=batch.remaining;state.processed+=batch.count;state.retryAt=0;state.error=null;
       if(batch.count&&lane!=='diagnostics')stores.get(lane).checkBudgets();
     }catch(error){
       state.pending=true;state.retryAt=Date.now()+60000;state.error=importError(error);state.processed+=error.importedCount||0;if(Number.isSafeInteger(error.remaining))state.remaining=error.remaining;
     }
+    recordImportSample(state,performance.now());
   }
   const failed=importLanes.find(name=>importStates.get(name).retryAt>Date.now()),pending=importLanes.find(name=>importStates.get(name).pending&&!importStates.get(name).retryAt);
   const status={state:failed?'paused':pending?'running':'complete',lane:failed||pending||null};
   const signature=JSON.stringify(status),now=performance.now();
   if(signature!==lastImportStatus||now-lastImportReport>=1000){
-    const lanes=Object.fromEntries(importLanes.map(name=>{const value=importStates.get(name);return [name,{remaining:value.remaining,processed:value.processed,error:value.error}];}));
+    const lanes=Object.fromEntries(importLanes.map(name=>{const value=importStates.get(name),rate=measureImportProgress(value.samples,now,value.remaining);return [name,{remaining:value.remaining,processed:value.processed,error:value.error,...rate}];}));
     const processed=importLanes.reduce((sum,name)=>sum+importStates.get(name).processed,0),remaining=importLanes.every(name=>importStates.get(name).remaining!==null)?importLanes.reduce((sum,name)=>sum+importStates.get(name).remaining,0):null;
-    parentPort.postMessage({event:'import-progress',...status,lanes,processed,remaining,packetsPerSecond:Math.round(processed/Math.max(1,(now-importStarted)/1000)),updatedAt:Date.now()});lastImportStatus=signature;lastImportReport=now;
+    const measured=Object.values(lanes).filter(value=>Number.isFinite(value.importedPerSecond)),packetsPerSecond=measured.length?Number(measured.reduce((sum,value)=>sum+value.importedPerSecond,0).toFixed(1)):null,arrivingPerSecond=measured.length?Number(measured.reduce((sum,value)=>sum+value.arrivingPerSecond,0).toFixed(1)):null,netPerSecond=measured.length?Number(measured.reduce((sum,value)=>sum+value.netPerSecond,0).toFixed(1)):null,etaSeconds=remaining>0&&netPerSecond>0?Math.ceil(remaining/netPerSecond):null;
+    parentPort.postMessage({event:'import-progress',...status,lanes,processed,remaining,packetsPerSecond,arrivingPerSecond,netPerSecond,etaSeconds,measurementSeconds:measured.length?Math.min(30,...measured.map(value=>value.measurementSeconds)):0,stalled:measured.some(value=>value.stalled),averagePacketsPerSecond:Math.round(processed/Math.max(1,(now-importStarted)/1000)),updatedAt:Date.now()});lastImportStatus=signature;lastImportReport=now;
   }
   if(status.state==='complete'&&initialArchivePending){initialArchivePending=false;setImmediate(()=>runArchive({automatic:true}).catch(()=>{}));}
   importTimer=setTimeout(importTick,pending?10:500);

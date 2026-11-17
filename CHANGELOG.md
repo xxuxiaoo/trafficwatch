@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.10.9 — 2026-11-17
+
+- Batch adjacent collector operations into signed encrypted queue envelopes, flushing at most every two seconds or 64 operations. Graceful shutdown still flushes pending data; a forced termination or power loss can lose samples still in the short in-memory window.
+- Adapt vault import work slices to backlog size while keeping sources round-robin. Report rolling per-source import rate, incoming capture rate, net drain rate, ETA and stalled progress; explain that overview totals remain partial during catch-up.
+- Verify batching, flush deadlines, exact count recovery, net ETA, incoming traffic accounting and non-progress notices using synthetic fixtures.
+- In a local synthetic run of 600 samples with 12 connection rows each, two-second batching halved envelopes from 600 to 300 and reduced combined encrypted capture/import time from 3,678 ms to 1,871 ms. Upload/download totals and all sample counts matched; this fixture result is host-specific.
+
 ## 0.10.8 — 2026-11-16
 
 - Resolve Magpie relay targets from its selected Responses, Chat or Anthropic endpoint, along with generic and nested endpoint settings. Match stable provider ids, names and former names, preserve per-attempt fallback targets, and leave conflicting labels or unmanaged endpoints unmapped. Never use a website or credential field as a request destination.

@@ -9,10 +9,13 @@ import {drainSealedQueue} from './sealed-queue.mjs';
 // Only capture preferences are public. Observed process names, domains, session
 // titles and byte counts always go inside the encrypted envelope.
 const PREFERENCES = new Set(['harnessApps', 'captureMode', 'retentionDays', 'alertMBPerMinute', 'budget']);
+export const SEALED_FLUSH_INTERVAL_MS=2000;
+export const SEALED_MAX_PENDING_OPERATIONS=64;
 export class SealedStore {
-  constructor(dir, metadata) {
+  constructor(dir, metadata,{flushIntervalMs=SEALED_FLUSH_INTERVAL_MS,maxPendingOperations=SEALED_MAX_PENDING_OPERATIONS}={}) {
     this.dir = dir; this.metadata = metadata; this.sealed = true;
     this.lane = path.basename(dir); this.pending = []; this.preferences = {};
+    if(!Number.isSafeInteger(flushIntervalMs)||flushIntervalMs<10||flushIntervalMs>SEALED_FLUSH_INTERVAL_MS||!Number.isSafeInteger(maxPendingOperations)||maxPendingOperations<1||maxPendingOperations>SEALED_MAX_PENDING_OPERATIONS)throw new Error('invalid_sealed_batch_policy');
     const signingFile=path.join(path.dirname(dir),'vault','capture-signing.dpapi');
     this.signingKey=metadata.capturePublicKey ? dpapi(fs.readFileSync(signingFile),{scope:'machine',decrypt:true}) : undefined;
     if (!['windows', 'clash'].includes(this.lane)) throw new Error('invalid_vault_lane');
@@ -23,11 +26,12 @@ export class SealedStore {
     this.db.exec(`PRAGMA journal_mode=WAL;PRAGMA synchronous=FULL;PRAGMA busy_timeout=3000;
       CREATE TABLE IF NOT EXISTS envelopes(sequence INTEGER PRIMARY KEY,id TEXT UNIQUE NOT NULL,payload BLOB NOT NULL);`);
     this.append = this.db.prepare('INSERT INTO envelopes(id,payload) VALUES (?,?)');
-    this.flushTimer=setInterval(()=>{try{this.flush();}catch{process.stderr.write('Encrypted capture storage failed.\n');process.exit(1);}},2000).unref();
+    this.flushTimer=setInterval(()=>{try{this.flush();}catch{process.stderr.write('Encrypted capture storage failed.\n');process.exit(1);}},flushIntervalMs).unref();
+    this.maxPendingOperations=maxPendingOperations;
   }
   queue(method, args) {
     this.pending.push({ method, args });
-    if (this.pending.length >= 128) this.flush();
+    if (this.pending.length >= this.maxPendingOperations) this.flush();
   }
   flush() {
     if (!this.pending.length) return;
@@ -36,7 +40,7 @@ export class SealedStore {
     this.append.run(id, Buffer.from(JSON.stringify(packet)));
     this.pending = [];
   }
-  record(sample) { this.queue('record', [sample]); this.last = sample.at; this.first ??= sample.at; this.flush(); return true; }
+  record(sample) { this.queue('record', [sample]); this.last = sample.at; this.first ??= sample.at; return true; }
   saveSession(...args) { this.queue('saveSession', args); }
   excludeSessions() {}
   set(key, value) {

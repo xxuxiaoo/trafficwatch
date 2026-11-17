@@ -21,7 +21,7 @@ test('plaintext history migrates without changing totals and sealed capture impo
     const key=vaultKeyEntries(dir,secrets)[0][1];
     encrypted=await migrateLane(dir,'windows',key);encrypted.vaultLane='windows';encrypted.vaultDir=lane;initializeImport(encrypted);
     assert.equal(encrypted.totals(0,Date.now()).all_up,17);
-    sealed=new SealedStore(lane,metadata);const gap=sealed.openGap('collector_restart',1770000001000);sealed.closeGap(gap,1770000002000);sealed.record(sample(1770000002000));
+    sealed=new SealedStore(lane,metadata);const gap=sealed.openGap('collector_restart',1770000001000);sealed.closeGap(gap,1770000002000);sealed.record(sample(1770000002000));sealed.flush();
     const spool=new PlainDatabase(path.join(lane,'ingest.sqlite'));
     const envelope=spool.prepare('SELECT * FROM envelopes LIMIT 1').get();spool.close();
     assert.equal(importEnvelope(encrypted,envelope,metadata,secrets),true);
@@ -76,9 +76,9 @@ test('a timed import slice leaves resumable envelopes and does not double totals
   try{
     const {metadata,secrets}=await createVaultKeys('synthetic-slice-password');const key=vaultKeyEntries(dir,secrets)[0][1];
     store=await migrateLane(dir,'windows',key);store.vaultLane='windows';store.vaultDir=path.join(dir,'windows');initializeImport(store);
-    captured=new SealedStore(store.vaultDir,metadata);for(let i=0;i<4;i++)captured.record(sample(1770000000000+i*1000));captured.close();captured=null;
+    captured=new SealedStore(store.vaultDir,metadata,{maxPendingOperations:2});for(let i=0;i<4;i++)captured.record(sample(1770000000000+i*1000));captured.close();captured=null;
     assert.deepEqual(drainIngestBatch(store,metadata,secrets,{limit:4,maxMs:0}),{count:1,pending:true});
-    assert.deepEqual(drainIngestBatch(store,metadata,secrets,{limit:4,maxMs:1000}),{count:3,pending:false});
+    assert.deepEqual(drainIngestBatch(store,metadata,secrets,{limit:4,maxMs:1000}),{count:1,pending:false});
     assert.equal(store.totals(0,Date.now()).all_up,4*17);
   }finally{captured?.close();store?.close();fs.rmSync(dir,{recursive:true,force:true,maxRetries:10,retryDelay:100});}
 });
