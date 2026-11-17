@@ -24,15 +24,27 @@ export function patchProfileScript(source,hosts,ips){
   let clean=source.replace(expression,'\n');
   if(!hosts.length)return clean;
   if(!/return\s+config\s*;/.test(clean))throw new Error('clash_profile_script_unsupported');
-  const block=`\n  ${start}\n  config.dns = config.dns || {};\n  if (config.dns['fake-ip-filter-mode'] === 'whitelist') throw new Error('TrafficWatch requires a blacklist fake-ip filter');\n  config.dns['fake-ip-filter'] = Array.from(new Set([...(config.dns['fake-ip-filter'] || []), ...${JSON.stringify(hosts)}]));\n  config.tun = config.tun || {};\n  config.tun['route-exclude-address'] = Array.from(new Set([...(config.tun['route-exclude-address'] || []), ...${JSON.stringify(ips.map(ip=>ip+'/32'))}]));\n  ${end}\n  `;
+  const block=`\n  ${start}\n  config.dns = config.dns || {};\n  if (config.dns['fake-ip-filter-mode'] === 'whitelist') throw new Error('TrafficWatch requires a blacklist fake-ip filter');\n  config.dns['fake-ip-filter'] = Array.from(new Set([...(config.dns['fake-ip-filter'] || []), ...${JSON.stringify(hosts)}]));\n  config.tun = config.tun || {};\n  config.tun['route-exclude-address'] = Array.from(new Set([...(config.tun['route-exclude-address'] || []), ...${JSON.stringify(ips.map(ip=>ip+'/32'))}]));\n  config.rules = [...${JSON.stringify(hosts.map(host=>'DOMAIN,'+host+',DIRECT'))}, ...(config.rules || [])];\n  ${end}\n  `;
   return clean.replace(/return\s+config\s*;/,block+'return config;');
+}
+export function reconcileRelayRules(currentRules,previousOwnership,hosts){
+  const previous=previousOwnership||{},ownership=previous.ruleOwnership||{},oldHosts=Object.keys(ownership);
+  let rules=Array.isArray(currentRules)?[...currentRules]:[];
+  // Original user rules remain in place underneath this exact managed prefix.
+  // Only remove the known inserted copy, never all matching rules.
+  for(let index=oldHosts.length-1;index>=0;index--){
+    const host=oldHosts[index],entry=ownership[host],managed='DOMAIN,'+host+',DIRECT';
+    if(entry?.inserted&&rules[index]===managed)rules.splice(index,1);
+  }
+  const ruleOwnership=Object.fromEntries(hosts.map(host=>[host,{inserted:true}]));
+  return {rules:[...hosts.map(host=>'DOMAIN,'+host+',DIRECT'),...rules],ruleOwnership};
 }
 export async function applyClashOverlay(settings,{hosts,ips,rollback=false,stateDir}){
   const script=path.resolve(settings.BypassProfileScript||'');
   const parent=path.resolve(path.dirname(settings.ClashConfigPath),'profiles');
   if(path.dirname(script)!==parent||!script.endsWith('.js'))throw new Error('clash_profile_script_not_configured');
   const source=fs.readFileSync(script,'utf8'),next=patchProfileScript(source,rollback?[]:hosts,ips);
-  const markerFile=path.join(stateDir,'clash-overlay.json');let state=fs.existsSync(markerFile)?JSON.parse(fs.readFileSync(markerFile,'utf8')):{ips:[],hosts:[]};
+  const markerFile=path.join(stateDir,'clash-overlay.json');let state=fs.existsSync(markerFile)?JSON.parse(fs.readFileSync(markerFile,'utf8')):{ips:[],hosts:[]};const previousState=state;
   const runtimeText=fs.readFileSync(settings.ClashConfigPath,'utf8'),runtime=parse(runtimeText);
   if(!runtime.dns||!Array.isArray(runtime.dns['fake-ip-filter'])||runtime.dns['fake-ip-filter-mode']==='whitelist')throw new Error('clash_dns_filter_unsupported');
   const oldIps=state.ips||[],oldHosts=state.hosts||[];
@@ -49,14 +61,14 @@ export async function applyClashOverlay(settings,{hosts,ips,rollback=false,state
   const directReady=hosts.every(host=>rules.rules?.find(rule=>String(rule.type).toLowerCase()==='domain'&&rule.payload===host)?.proxy==='DIRECT');
   const exclusionsReady=!rollback&&hosts.every(host=>effectiveFilters.includes(host))&&ips.every(ip=>effectiveExcludes.includes(ip+'/32'));
   if(source===next&&exclusionsReady&&directReady)return {state:'unchanged',hosts:hosts.length,ips:ips.length};
-  if(!rollback)runtime.rules=[...hosts.map(host=>'DOMAIN,'+host+',DIRECT'),...(runtime.rules||[]).filter(rule=>!hosts.some(host=>String(rule).startsWith('DOMAIN,'+host+',')))];
+  const reconciled=reconcileRelayRules(runtime.rules,state,rollback?[]:hosts);runtime.rules=reconciled.rules;
   if(source!==next)fs.writeFileSync(script,next);
   try{
     // Persist ownership before reload, so a crash cannot orphan additions.
-    state={ips:ownIps,hosts:ownHosts,updatedAt:Date.now()};fs.writeFileSync(markerFile,JSON.stringify(state));
+    state={ips:rollback?[]:ownIps,hosts:rollback?[]:ownHosts,ruleOwnership:reconciled.ruleOwnership,updatedAt:Date.now()};fs.writeFileSync(markerFile,JSON.stringify(state));
     const payload=stringify(runtime);
     fs.writeFileSync(settings.ClashConfigPath,payload);
     await controllerCall(target.candidate,'/configs?force=false','PUT',{payload});
-  }catch(error){if(source!==next)fs.writeFileSync(script,source);fs.writeFileSync(settings.ClashConfigPath,runtimeText);fs.writeFileSync(markerFile,JSON.stringify({ips:oldIps,hosts:oldHosts}));throw error;}
+  }catch(error){if(source!==next)fs.writeFileSync(script,source);fs.writeFileSync(settings.ClashConfigPath,runtimeText);fs.writeFileSync(markerFile,JSON.stringify(previousState));throw error;}
   return {state:'applied',hosts:hosts.length,ips:ips.length,rollback};
 }

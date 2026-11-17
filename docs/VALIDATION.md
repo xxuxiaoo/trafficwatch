@@ -1,6 +1,12 @@
 # TrafficWatch validation
 
-The active test suite combines the upstream regression tests with synthetic history, process-family, encryption, storage, diagnosis and performance/recovery tests. The 0.10.9 checkout completed 236 cases: 234 passed, 2 administrator-only ETW integration tests skipped, no failures. JavaScript and PowerShell syntax checks passed. The native helper self-test and the Windows tray/controller package build also passed using hash-verified dependencies. Run `npm run check`, `npm test`, and `npm run audit:publication`. CI runs source tests on Windows and Linux; Linux validates query/accounting behavior and does not provide Windows native capture.
+The active test suite combines the upstream regression tests with synthetic history, process-family, encryption, storage, diagnosis and performance/recovery tests. The 0.10.10 checkout completed 241 cases: 239 passed, 2 administrator-only ETW integration tests skipped, no failures. JavaScript and PowerShell syntax checks passed. The native helper self-test and the Windows tray/controller package build also passed using hash-verified dependencies. Run `npm run check`, `npm test`, and `npm run audit:publication`. CI runs source tests on Windows and Linux; Linux validates query/accounting behavior and does not provide Windows native capture.
+
+## 0.10.10 relay management checks
+
+The relay manager regressions cover stable migration of the existing list, domain and URL validation, reserved-IP rejection, automatic restore points, stale-editor revision conflicts, original-rule preservation, fresh physical-path checks after target changes, retaining the last applied set when a new domain cannot resolve, and complete managed rollback after disabling the final target. An isolated Windows registry mock verifies that removing old `NO_PROXY` entries and rolling back only affect manager-owned values. HTTP tests reject anonymous and AI-visitor routing access and exercise owner list changes and restore operations.
+
+An isolated Edge browser with an encrypted synthetic vault passed nine scenario groups: owner unlock and return to the page; add and URL-host extraction; edit and new path verification; per-target disable/enable; duplicate validation and recovery; delete and backup restore; complete bypass withdrawal; desktop and 390-pixel layout; and owner lock clearing. There were no browser page errors. Native routing, DNS and Clash calls in this browser fixture are synthetic; production-path checks are separate from interface verification.
 
 ## 0.10.9 encrypted catch-up performance
 

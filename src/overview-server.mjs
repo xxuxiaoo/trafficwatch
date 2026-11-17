@@ -10,6 +10,7 @@ import { signCommand } from './vault-commands.mjs';
 import { csvCell } from './server.mjs';
 import { VERSION } from './version.mjs';
 import { diagnosticRoute } from './ai-diagnostic-router.mjs';
+import {readRelayTargetConfig,listRelayTargetBackups,saveRelayTargets,restoreRelayTargets,requestRelayReconcile,relayHostRevision} from './relay-targets.mjs';
 
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 export function startOverviewServer({guardFactory,listenPort,suiteSettings,historyRoot,sourcePorts,readerFactory=(data,options)=>new HistoryReader(data,options)}={}){
@@ -25,6 +26,11 @@ const collectorPorts=sourcePorts||[Number(process.env.TRAFFICWATCH_MACHINE_PORT|
 if(collectorPorts.some(value=>!Number.isInteger(value)||value<1024||value>65535))throw new Error('Invalid collector port');
 const cacheRoot = process.env.TRAFFICWATCH_CACHE_ROOT || path.join(dataRoot, 'viewer-cache');
 const encryptedCacheRoot=path.join(cacheRoot,'encrypted-v1');
+function queueRelayReconcile(){
+  const config=readRelayTargetConfig(dataRoot,settings.RelayHosts);
+  if(config.targets.some(target=>target.enabled))try{fs.unlinkSync(path.join(dataRoot,'relay-bypass','disabled'));}catch(error){if(error.code!=='ENOENT')throw error;}
+  return requestRelayReconcile(dataRoot);
+}
 const makeReader=(role,keyEntries)=>readerFactory({dataRoot,...(role==='history'?{cacheRoot:keyEntries?encryptedCacheRoot:cacheRoot}:{}),...(keyEntries?{keyEntries}:{})},{timeoutMs:role==='quick'?12000:role==='detail'?20000:45000},role);
 let fullReader=makeReader('history'),quickReader=makeReader('quick'),detailReader=makeReader('detail');
 const cache = new Map(), updating = new Set();
@@ -193,6 +199,9 @@ const assets = new Map([
   ['/diagnostics.js', ['diagnostics.js','text/javascript; charset=utf-8']],
   ['/tcp-evidence.mjs', ['tcp-evidence.mjs','text/javascript; charset=utf-8']],
   ['/diagnostics.css', ['diagnostics.css','text/css; charset=utf-8']],
+  ['/relays', ['relays.html','text/html; charset=utf-8']],
+  ['/relays.js', ['relays.js','text/javascript; charset=utf-8']],
+  ['/relays.css', ['relays.css','text/css; charset=utf-8']],
   ['/icon.svg', ['icon.svg', 'image/svg+xml']],
   ['/legacy',['index.html','text/html; charset=utf-8']],
   ...['app.js','i18n.js','desktop.js','history.js','setup.js'].map(file=>['/'+file,[file,'text/javascript; charset=utf-8']]),
@@ -226,6 +235,35 @@ const server = http.createServer(async (req, res) => {
       if (req.headers['x-codex-flow'] !== '1') return json(403, { error: 'local_header_required' });
       if(await vaultRoute({req,url,json,vault,readJson,clearCache}))return;
       if(await diagnosticRoute({req,url,json,vault,readJson,dataRoot,token:bearer}))return;
+      if(url.pathname==='/api/relay-targets'){
+        vault.owner(bearer);
+        if(req.method==='GET'){
+          const config=readRelayTargetConfig(dataRoot,settings.RelayHosts),backups=listRelayTargetBackups(dataRoot);
+          const relayDir=path.join(dataRoot,'relay-bypass');let status=null,applied=null;
+          try{status=JSON.parse(fs.readFileSync(path.join(relayDir,'status.json'),'utf8'));if(Date.now()-status.at>150000)status={...status,state:'stale'};}catch{}
+          try{applied=JSON.parse(fs.readFileSync(path.join(relayDir,'targets.json'),'utf8'));}catch{}
+          const disabled=fs.existsSync(path.join(relayDir,'disabled'))||fs.existsSync(path.join(dataRoot,'stop.request'));
+          const pending=relayHostRevision(config.targets.filter(target=>target.enabled).map(target=>target.host))!==applied?.hostRevision;
+          return json(200,{...config,backups,status,applied,disabled,pending});
+        }
+        if(req.method!=='POST')return json(405,{error:'method_not_allowed'});
+        const body=await readJson(req,65536);vault.owner(bearer);let result;
+        const saveOptions={legacyHosts:settings.RelayHosts,expectedRevision:body.revision};
+        if(body.action==='save')result=saveRelayTargets(dataRoot,body.targets,saveOptions);
+        else if(body.action==='delete'){
+          const current=readRelayTargetConfig(dataRoot,settings.RelayHosts);
+          if(typeof body.id!=='string'||!current.targets.some(target=>target.id===body.id))throw new Error('relay_target_not_found');
+          result=saveRelayTargets(dataRoot,current.targets.filter(target=>target.id!==body.id),saveOptions);
+        }else if(body.action==='restore')result=restoreRelayTargets(dataRoot,body.id,saveOptions);
+        else if(body.action==='disable-all')result=saveRelayTargets(dataRoot,readRelayTargetConfig(dataRoot,settings.RelayHosts).targets.map(target=>({...target,enabled:false})),saveOptions);
+        else if(body.action==='apply'){
+          const at=queueRelayReconcile();
+          vault.actor(bearer,{operation:'update'});vault.audit('owner','relay-targets-apply',{at});
+          return json(202,{queued:true,at});
+        }else return json(400,{error:'invalid_relay_action'});
+        const at=queueRelayReconcile();vault.actor(bearer,{operation:'update'});vault.audit('owner','relay-targets-'+body.action,{count:result.targets.length,at});
+        return json(200,{...result,at,queued:true});
+      }
       if (req.method === 'POST' && url.pathname === '/api/stop') {
         json(200, { ok: true }); setTimeout(close, 100); return;
       }
@@ -323,7 +361,7 @@ const server = http.createServer(async (req, res) => {
     fs.createReadStream(path.join(root, 'public', asset[0])).on('error', () => res.destroy()).pipe(res);
   } catch (error) {
     if (res.destroyed || error.message === 'request_cancelled') return;
-    if (!res.headersSent) json(['vault_migrating','vault_busy','vault_storage_busy'].includes(error.message)?503:/^(vault_|grant_)/.test(error.message)?423:error.message === 'Invalid range' || error.message === 'Invalid date' || error.message === 'invalid_range' ? 400 : 503, { error: /^(vault_|grant_)/.test(error.message)||['invalid_range','history_busy','history_timeout'].includes(error.message) ? error.message : 'history_unavailable' });
+    if (!res.headersSent) json(['vault_migrating','vault_busy','vault_storage_busy'].includes(error.message)?503:/^(vault_|grant_)/.test(error.message)?423:/^(relay_|invalid_relay|duplicate_relay)/.test(error.message)||['invalid_range','Invalid range','Invalid date'].includes(error.message)?400:503, { error: /^(vault_|grant_|relay_|invalid_relay|duplicate_relay)/.test(error.message)||['invalid_range','history_busy','history_timeout'].includes(error.message) ? error.message : 'history_unavailable' });
     else res.end();
   }
 });

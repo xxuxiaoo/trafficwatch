@@ -11,6 +11,7 @@ import {DiagnosticSpool} from './ai-diagnostic-store.mjs';
 import {normalizeMagpieRequest,normalizeMagpieLog,IncidentEngine,eventId,errorCategory,DIAGNOSTIC_SCHEMA_VERSION} from './ai-diagnostic-events.mjs';
 import {IncrementalTail} from './ai-log-tail.mjs';
 import {appRoot,readSettings,discoverPhysical,physicalDns,probeRelay,runNetworkScript} from './ai-windows.mjs';
+import {activeRelayHosts} from './relay-targets.mjs';
 import {productionController,controllerCall} from './relay-clash-overlay.mjs';
 import {commandVerifier} from './vault-commands.mjs';
 import {DiagnosticLogSources} from './ai-log-sources.mjs';
@@ -19,6 +20,7 @@ import {buildProviderTargets,mappedProviderHost} from './ai-provider-targets.mjs
 import {normalizeTcpEvent} from './ai-tcp-events.mjs';
 
 export async function startAiDiagnostics({settings=readSettings()}={}){
+  const baseSettings=settings;settings={...settings,RelayHosts:activeRelayHosts(settings)};
   const dataRoot=settings.DataRoot,dir=path.join(dataRoot,'diagnostics');fs.mkdirSync(dir,{recursive:true});
   if(fs.existsSync(path.join(dir,'disabled'))||fs.existsSync(path.join(dataRoot,'stop.request')))return;
   if(!fs.existsSync(path.join(dataRoot,'vault','vault.json')))return;
@@ -126,7 +128,7 @@ export async function startAiDiagnostics({settings=readSettings()}={}){
   async function connectivity(){
     let adapter;try{adapter=await discoverPhysical();}catch{gap('physical_adapter_unavailable');return;}
     const state=targetState();
-    const selected=activeHost?[activeHost]:settings.RelayHosts.slice(0,1),others=metrics.polls%5===0?settings.RelayHosts.filter(host=>!selected.includes(host)):[];
+    const selected=settings.RelayHosts.includes(activeHost)?[activeHost]:settings.RelayHosts.slice(0,1),others=metrics.polls%5===0?settings.RelayHosts.filter(host=>!selected.includes(host)):[];
     for(const host of [...selected,...others]){
       let ip=state?.targets.find(target=>target.host===host)?.ips?.[0];
       if(!ip)try{ip=(await physicalDns(host,adapter)).records[0].ip;}catch{gap('physical_dns_unavailable');continue;}
@@ -206,6 +208,8 @@ export async function startAiDiagnostics({settings=readSettings()}={}){
     if(stopping)return;
     if(fs.existsSync(path.join(dir,'disabled'))||fs.existsSync(path.join(dataRoot,'stop.request'))){await stop();return;}
     try{
+      const nextHosts=activeRelayHosts(baseSettings);
+      if(JSON.stringify(nextHosts)!==JSON.stringify(settings.RelayHosts)){settings.RelayHosts=nextHosts;loadProviders();}
       await pollLogs();await pollFeed();engine.tick();startTrace();
       if(Date.now()>=pktNextCheck&&!pktBusy){pktNextCheck=Date.now()+60000;const signature=JSON.stringify([...new Set(targetState()?.targets.flatMap(target=>target.ips)||[])].sort());if(pktmonState!=='recording'||signature!==pktTargetsSignature)await startPktmon();else try{const [row]=await runNetworkScript('TrafficWatch-PktMon.ps1','Status');pktmonState=row?.state||'unavailable';pktmonCheckedAt=Date.now();}catch{pktmonState='unavailable';}}
       if(Date.now()-lastCollectionCheck>=60000)checkCollection();

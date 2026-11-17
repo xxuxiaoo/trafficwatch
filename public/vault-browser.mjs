@@ -60,7 +60,7 @@ export function safeReturnTarget(value){
   if(typeof value!=='string'||!value.startsWith('/')||value.startsWith('//')||value.includes('\\'))return '';
   try{
     const url=new URL(value,location.origin);
-    return url.origin===location.origin&&['/','/overview','/storage','/legacy','/diagnostics'].includes(url.pathname)?url.pathname+url.search+url.hash:'';
+    return url.origin===location.origin&&['/','/overview','/storage','/legacy','/diagnostics','/relays'].includes(url.pathname)?url.pathname+url.search+url.hash:'';
   }catch{return '';}
 }
 export function clearPrivatePage(){

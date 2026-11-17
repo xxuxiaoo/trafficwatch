@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.10.10 — 2026-11-17
+
+- Add a protected relay-management page inside the traffic center. Add, edit, enable, disable and remove relay hostnames; save a restore point before each list change; restore a selected prior list or disable all managed bypass entries.
+- Validate public DNS hostnames and resolved IPv4 addresses, accept pasted HTTP(S) API URLs by their hostname, reconcile the list through the existing physical-DNS and exact-route verifier, and trigger an immediate background recheck after edits. Unmanaged IPv6 addresses prevent a verified status.
+- Remove stale manager-owned IPv4 routes and proxy exceptions when a relay is removed. Track the managed Clash rule prefix while retaining original rules underneath it, so removal and rollback preserve user rules. Keep existing relay entries on first migration and back them up before the first edit.
+- Require the unlocked owner session for every relay-list operation; AI visitor cards cannot view or change routing settings.
+
 ## 0.10.9 — 2026-11-17
 
 - Batch adjacent collector operations into signed encrypted queue envelopes, flushing at most every two seconds or 64 operations. Graceful shutdown still flushes pending data; a forced termination or power loss can lose samples still in the short in-memory window.

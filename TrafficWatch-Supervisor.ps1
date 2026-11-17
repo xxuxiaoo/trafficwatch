@@ -99,7 +99,7 @@ function Ensure-SuiteViewer {
 function Ensure-SuiteDiagnostics {
     if(-not(Test-Path -LiteralPath (Join-Path $suiteData 'vault\vault.json'))){return}
     foreach($suiteComponent in @('diagnostics','relay-bypass')){
-        if($suiteComponent -eq 'relay-bypass' -and -not $suiteOwnerSettings.RelayHosts){continue}
+        if($suiteComponent -eq 'relay-bypass' -and -not $suiteOwnerSettings.RelayHosts -and -not(Test-Path -LiteralPath (Join-Path $suiteData 'relay-bypass\managed-targets.json'))){continue}
         $suiteDisabled=Join-Path $suiteData ($suiteComponent+'\disabled')
         if(Test-Path -LiteralPath $suiteDisabled){continue}
         $suiteTaskName=if($suiteComponent -eq 'diagnostics'){'TrafficWatch - AI diagnostics'}else{'TrafficWatch - Relay physical bypass'}
@@ -110,7 +110,7 @@ function Ensure-SuiteDiagnostics {
         if($suiteComponent -eq 'diagnostics'){
             try{$suiteStatus=Invoke-RestMethod -Uri 'http://127.0.0.1:43132/api/health' -TimeoutSec 1;$suiteLive=$suiteStatus.app -eq 'trafficwatch-ai-diagnostics'}catch{}
         }else{
-            if(-not $suiteOwnerSettings.RelayHosts){continue}
+            if(-not $suiteOwnerSettings.RelayHosts -and -not(Test-Path -LiteralPath (Join-Path $suiteData 'relay-bypass\managed-targets.json'))){continue}
             $suiteBypassState=Join-Path $suiteData 'relay-bypass\status.json'
             try{$suiteStatus=Get-Content -LiteralPath $suiteBypassState -Raw|ConvertFrom-Json;$suiteLive=$suiteStatus.state -notin @('stopped','rolled_back') -and ([DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds()-$suiteStatus.at -lt 150000) -and [bool](Get-Process -Id $suiteStatus.pid -ErrorAction SilentlyContinue)}catch{}
         }

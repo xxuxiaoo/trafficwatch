@@ -2,6 +2,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import {spawn} from 'node:child_process';
 import {fileURLToPath} from 'node:url';
+import {isPublicIPv4} from './relay-targets.mjs';
 
 export const appRoot=path.resolve(path.dirname(fileURLToPath(import.meta.url)),'..');
 export function runJson(file,args=[],input,{timeout=20000,onRow}={}) {
@@ -19,7 +20,7 @@ export async function discoverPhysical(){const [value]=await runJson(networkHelp
 export const physicalDns=async(host,adapter)=>{
   for(const resolver of ['223.5.5.5','1.1.1.1'])try{
     const [row]=await runJson(networkHelper(),[],{mode:'dns',host,localAddress:adapter.address,interfaceIndex:adapter.index,resolver},{timeout:7000});
-    const valid=row.records?.filter(record=>record.type==='A'&&/^(?!0\.|10\.|127\.|169\.254\.|192\.168\.|198\.1[89]\.)\d{1,3}(?:\.\d{1,3}){3}$/.test(record.ip));
+    const valid=row.records?.filter(record=>record.type==='A'&&isPublicIPv4(record.ip));
     if(valid?.length)return {...row,records:valid.slice(0,8),ipv6Records:row.records.filter(record=>record.type==='AAAA')};
   }catch{}
   throw new Error('physical_dns_unavailable');

@@ -11,14 +11,19 @@ $relayEnd='# END TrafficWatch relay physical bypass'
 $relayState=if(Test-Path -LiteralPath $relayStateFile){Get-Content -LiteralPath $relayStateFile -Raw|ConvertFrom-Json}else{[pscustomobject]@{routes=@();block='';at=0}}
 $relayEnvFile=Join-Path $relayDir 'no-proxy-ownership.json'
 $relayEnvPath='Registry::HKEY_USERS\'+$relaySettings.OwnerSid+'\Environment'
-function Set-RelayNoProxy([bool]$Rollback){
+function Set-RelayNoProxy([bool]$Rollback,[string[]]$Hosts){
   if(-not(Test-Path -LiteralPath $relayEnvPath)){return 'owner_not_logged_in'}
   $relayEnvItem=Get-ItemProperty -LiteralPath $relayEnvPath -Name 'NO_PROXY' -ErrorAction SilentlyContinue
   $relayEnvCurrent=if($relayEnvItem){[string]$relayEnvItem.NO_PROXY}else{''}
   $relayEnvParts=@($relayEnvCurrent.Split(',')|ForEach-Object {$_.Trim()}|Where-Object {$_})
   $relayEnvOwned=if(Test-Path -LiteralPath $relayEnvFile){Get-Content -LiteralPath $relayEnvFile -Raw|ConvertFrom-Json}else{[pscustomobject]@{added=@();existed=[bool]$relayEnvItem}}
   if($Rollback){$relayEnvParts=@($relayEnvParts|Where-Object {$relayEnvOwned.added -notcontains $_});$relayEnvOwned.added=@()}
-  else{foreach($relayEnvHost in @($relaySettings.RelayHosts)){if($relayEnvParts -notcontains $relayEnvHost){$relayEnvParts+=,$relayEnvHost;$relayEnvOwned.added=@($relayEnvOwned.added)+@($relayEnvHost)}}}
+  else{
+    $removed=@($relayEnvOwned.added|Where-Object {$Hosts -notcontains $_})
+    $relayEnvParts=@($relayEnvParts|Where-Object {$removed -notcontains $_})
+    $relayEnvOwned.added=@($relayEnvOwned.added|Where-Object {$Hosts -contains $_})
+    foreach($relayEnvHost in $Hosts){if($relayEnvParts -notcontains $relayEnvHost){$relayEnvParts+=,$relayEnvHost;$relayEnvOwned.added=@($relayEnvOwned.added)+@($relayEnvHost)}}
+  }
   [IO.File]::WriteAllText($relayEnvFile,($relayEnvOwned|ConvertTo-Json -Depth 4),[Text.UTF8Encoding]::new($false))
   $relayEnvNext=$relayEnvParts -join ','
   if($relayEnvNext -ne $relayEnvCurrent){
@@ -28,7 +33,7 @@ function Set-RelayNoProxy([bool]$Rollback){
   return 'domain_exceptions_set'
 }
 function Save-RelayState { [IO.File]::WriteAllText($relayStateFile,($relayState|ConvertTo-Json -Depth 8),[Text.UTF8Encoding]::new($false)) }
-function Test-RelayIp([string]$value){$relayIp=$null;return [Net.IPAddress]::TryParse($value,[ref]$relayIp) -and $relayIp.AddressFamily -eq [Net.Sockets.AddressFamily]::InterNetwork -and $value -notmatch '^(0\.|10\.|127\.|169\.254\.|172\.(1[6-9]|2\d|3[01])\.|192\.168\.|198\.1[89]\.|22[4-9]\.|23\d\.|24\d\.|25[0-5]\.)'}
+function Test-RelayIp([string]$value){$relayIp=$null;return [Net.IPAddress]::TryParse($value,[ref]$relayIp) -and $relayIp.AddressFamily -eq [Net.Sockets.AddressFamily]::InterNetwork -and $value -notmatch '^(0\.|10\.|100\.(6[4-9]|[7-9]\d|1[01]\d|12[0-7])\.|127\.|169\.254\.|172\.(1[6-9]|2\d|3[01])\.|192\.(0\.(0\.|2\.)|88\.99\.|168\.)|198\.(1[89]\.|51\.100\.)|203\.0\.113\.|22[4-9]\.|23\d\.|24\d\.|25[0-5]\.)'}
 try{
   if($Action -eq 'Status'){@{ok=$true;at=$relayState.at;routes=@($relayState.routes).Count}|ConvertTo-Json -Compress;exit 0}
   $relayPrincipal=[Security.Principal.WindowsPrincipal]::new([Security.Principal.WindowsIdentity]::GetCurrent())
@@ -39,7 +44,7 @@ try{
   if($relayMatch.Success -and $relayMatch.Value.TrimEnd() -ne ([string]$relayState.block).TrimEnd()){throw 'managed_hosts_modified'}
   $relayClean=[regex]::Replace($relayHosts,$relayPattern,'')
   if($Action -eq 'Rollback'){
-    $relayEnvironment=Set-RelayNoProxy $true
+    $relayEnvironment=Set-RelayNoProxy $true @()
     if($relayMatch.Success){[IO.File]::WriteAllText($relayHostsFile,$relayClean,[Text.UTF8Encoding]::new($false))}
     foreach($relayRoute in @($relayState.routes)){
       if($relayRoute.owned -and (Test-RelayIp $relayRoute.ip)){
@@ -51,15 +56,22 @@ try{
     @{ok=$true;state='rolled_back';environment=$relayEnvironment}|ConvertTo-Json -Compress;exit 0
   }
   $relayInput=Get-Content -LiteralPath $InputFile -Raw -Encoding UTF8|ConvertFrom-Json
+  if([IO.Path]::GetFullPath($InputFile) -ne [IO.Path]::GetFullPath((Join-Path $relayDir 'routes-input.json'))){throw 'invalid_relay_input'}
   $relayAdapter=$relayInput.adapter
   $relayActual=Get-NetIPConfiguration -InterfaceIndex ([int]$relayAdapter.index)
   if($relayActual.IPv4Address.IPAddress -notcontains $relayAdapter.address -or $relayActual.IPv4DefaultGateway.NextHop -notcontains $relayAdapter.gateway -or $relayActual.InterfaceAlias -match 'Meta|Mihomo|Clash|TUN'){throw 'physical_adapter_changed'}
   $relayNow=[DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds()
-  $relayAllowed=@($relaySettings.RelayHosts)
-  if($relayAllowed.Count -eq 0 -or @($relayInput.targets).Count -gt 32){throw 'invalid_relay_targets'}
+  $relayManagedFile=Join-Path $relayDir 'managed-targets.json'
+  $relayAllowed=if(Test-Path -LiteralPath $relayManagedFile){
+    $relayManaged=Get-Content -LiteralPath $relayManagedFile -Raw -Encoding UTF8|ConvertFrom-Json
+    if($relayManaged.version -ne 1){throw 'invalid_relay_config'}
+    @($relayManaged.targets|Where-Object {$_.enabled -eq $true}|ForEach-Object {[string]$_.host})
+  }else{@($relaySettings.RelayHosts)}
+  if($relayAllowed.Count -eq 0 -or $relayAllowed.Count -gt 64){throw 'invalid_relay_targets'}
+  if(@($relayInput.targets).Count -ne $relayAllowed.Count){throw 'relay_targets_changed'}
   $relayLines=@();$relayDesired=@()
   foreach($relayTarget in $relayInput.targets){
-    if($relayAllowed -notcontains [string]$relayTarget.host){throw 'invalid_relay_host'}
+    if($relayAllowed -notcontains [string]$relayTarget.host -or [string]$relayTarget.host -notmatch '^(?=.{1,253}$)[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?(?:\.[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?)+$'){throw 'invalid_relay_host'}
     if($relayClean -match ('(?im)^\s*[^#\r\n]+\s'+[regex]::Escape($relayTarget.host)+'(?:\s|$)')){throw 'existing_hosts_conflict'}
     foreach($relayIp in @($relayTarget.ips)){
       if(-not(Test-RelayIp $relayIp)){throw 'invalid_relay_ip'}
@@ -82,12 +94,12 @@ try{
   if($relayMatch.Value -ne $relayBlock){[IO.File]::WriteAllText($relayHostsFile,($relayClean.TrimEnd()+"`r`n"+$relayBlock),[Text.UTF8Encoding]::new($false));Clear-DnsClientCache}
   $relayKeep=@()
   foreach($relayRoute in @($relayState.routes)){
-    $relayExpired=$relayNow-[long]$relayRoute.lastWanted -gt 900000
+    $relayExpired=($relayDesired -notcontains [string]$relayRoute.ip) -or ([int]$relayRoute.index -ne [int]$relayAdapter.index) -or ([string]$relayRoute.gateway -ne [string]$relayAdapter.gateway)
     if($relayExpired -and $relayRoute.owned){Get-NetRoute -DestinationPrefix ($relayRoute.ip+'/32') -InterfaceIndex $relayRoute.index -NextHop $relayRoute.gateway -PolicyStore ActiveStore -ErrorAction SilentlyContinue|Remove-NetRoute -Confirm:$false}
     else{$relayKeep+=,$relayRoute}
   }
   $relayState.routes=$relayKeep;$relayState.at=$relayNow;Save-RelayState
-  $relayEnvironment=Set-RelayNoProxy $false
+  $relayEnvironment=Set-RelayNoProxy $false $relayAllowed
   $relayChecks=@($relayDesired|ForEach-Object{$relayFound=@(Find-NetRoute -RemoteIPAddress $_);$relaySource=$relayFound|Where-Object {$_.IPAddress}|Select-Object -First 1;[pscustomobject]@{ip=$_;interfaceIndex=[int]$relaySource.InterfaceIndex;source=[string]$relaySource.IPAddress;physical=($relaySource.InterfaceIndex -eq $relayAdapter.index -and $relaySource.IPAddress -eq $relayAdapter.address)}})
   @{ok=(@($relayChecks|Where-Object {-not $_.physical}).Count -eq 0);state='applied';at=$relayNow;checks=$relayChecks;environment=$relayEnvironment}|ConvertTo-Json -Depth 6 -Compress
 }catch{[Console]::WriteLine((@{ok=$false;code=if($_.Exception.Message -match '^[a-z_]+$'){$_.Exception.Message}else{'relay_routes_failed'}}|ConvertTo-Json -Compress));exit 1}

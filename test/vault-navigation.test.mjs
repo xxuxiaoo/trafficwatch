@@ -6,7 +6,7 @@ globalThis.location={origin:'http://127.0.0.1:43131'};
 const {safeReturnTarget,clearPrivatePage,setVaultToken,initializeVault,checkVaultResponse,hasVaultToken}=await import('../public/vault-browser.mjs');
 
 test('unlock destinations preserve local views and dates while refusing external redirects',()=>{
-  for(const destination of ['/','/overview?range=day&date=2026-11-12#ladder','/storage#backups','/legacy?lane=clash'])assert.equal(safeReturnTarget(destination),destination);
+  for(const destination of ['/','/overview?range=day&date=2026-11-12#ladder','/storage#backups','/legacy?lane=clash','/relays'])assert.equal(safeReturnTarget(destination),destination);
   for(const destination of [null,'https://example.test/','//example.test/','/\\example.test/','/security?return=/','/api/stop','/unknown','javascript:alert(1)','/overview/../../evil'])assert.equal(safeReturnTarget(destination),'');
 });
 
