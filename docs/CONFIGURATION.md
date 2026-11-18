@@ -12,6 +12,8 @@ Choose the network source in **Settings → Traffic capture source**: Automatic,
 
 Automatic mode uses an authorized native helper when available, otherwise attempts a Mihomo / Clash-compatible local controller with a compatible `/connections` response. `captureMode` in config can be `auto` (default), `native`, or `mihomo`; a saved Settings selection takes precedence. `CODEX_NETWATCH_CAPTURE_MODE` configures the startup default. The rest of the controller-specific instructions below apply when using Mihomo.
 
+Automatic controller discovery supports local Clash Verge configurations/production pipes and FlClash. For FlClash, enable **Tools → General → External controller**. TrafficWatch reads the endpoint and secret from its local preferences, including live changes which have not yet rewritten its generated YAML. Automatic discovery repeats every ten seconds, prefers the live TUN to an idle installed client, and ignores Verge validation sidecars. An active FlClash with its controller closed is reported explicitly; Windows native capture remains independent. Explicitly configured controllers retain their own endpoint/secret selection.
+
 ## First connection
 
 Open **Connection help** at the top of the dashboard. New profiles without measured Codex traffic see it automatically; it can be collapsed and reopened. Its status distinguishes an unreachable controller, a 401/403 secret mismatch, an incompatible controller response, unavailable process evidence, and waiting for fresh Codex requests. A working controller with no Codex traffic is not reported as a connection failure.

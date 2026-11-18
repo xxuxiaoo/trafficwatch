@@ -11,6 +11,8 @@ import { csvCell } from './server.mjs';
 import { VERSION } from './version.mjs';
 import { diagnosticRoute } from './ai-diagnostic-router.mjs';
 import {readRelayTargetConfig,listRelayTargetBackups,saveRelayTargets,restoreRelayTargets,requestRelayReconcile,relayHostRevision} from './relay-targets.mjs';
+import {BackgroundHistoryRefreshes} from './history-background-refresh.mjs';
+import {normalizeAirportGroups} from './airport-groups.mjs';
 
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 export function startOverviewServer({guardFactory,listenPort,suiteSettings,historyRoot,sourcePorts,readerFactory=(data,options)=>new HistoryReader(data,options)}={}){
@@ -33,9 +35,9 @@ function queueRelayReconcile(){
 }
 const makeReader=(role,keyEntries)=>readerFactory({dataRoot,...(role==='history'?{cacheRoot:keyEntries?encryptedCacheRoot:cacheRoot}:{}),...(keyEntries?{keyEntries}:{})},{timeoutMs:role==='quick'?12000:role==='detail'?20000:45000},role);
 let fullReader=makeReader('history'),quickReader=makeReader('quick'),detailReader=makeReader('detail');
-const cache = new Map(), updating = new Set();
+const cache = new Map(), backgroundRefreshes = new BackgroundHistoryRefreshes();
 let appsCache = null, appsPending = null, liveCache = null, livePending = null,cacheGeneration=0;
-const clearCache=()=>{cacheGeneration++;cache.clear();updating.clear();appsCache=appsPending=liveCache=livePending=null;};
+const clearCache=()=>{cacheGeneration++;cache.clear();backgroundRefreshes.cancelAll();appsCache=appsPending=liveCache=livePending=null;};
 const vault=new VaultService({dataRoot,cacheRoot:encryptedCacheRoot,ownerSid:settings.OwnerSid,guardFactory,onLock:clearCache,onKeys:entries=>{
   fullReader.close();quickReader.close();detailReader.close();clearCache();
   fullReader=makeReader('history',entries);quickReader=makeReader('quick',entries);detailReader=makeReader('detail',entries);
@@ -61,7 +63,8 @@ function storeCache(key, data) {
 async function query(payload, { signal, quick = false, fresh = false } = {}) {
   const key = JSON.stringify([payload, new Date(Date.now()+8*3600000).toISOString().slice(0,10)]);
   const entry = cache.get(key), ttl = quick ? 10000 : payload.type === 'detail' ? 30000 : 60000;
-  const reader = quick ? quickReader : payload.type==='detail'?detailReader:fullReader,currentGeneration=cacheGeneration;
+  const reader = quick ? quickReader : ['detail','harness','ladder','ladder-nodes'].includes(payload.type)?detailReader:fullReader,currentGeneration=cacheGeneration;
+  if(signal)backgroundRefreshes.cancel(reader,key);
   const load = async (signal) => {
     const result = await reader.query(payload, { signal });
     const data = { ...result, generatedAt: Date.now() };
@@ -69,10 +72,10 @@ async function query(payload, { signal, quick = false, fresh = false } = {}) {
     if (currentGeneration===cacheGeneration&&(!data.machine || data.machine.available || data.clash?.available)) storeCache(key,data);
     return data;
   };
-  if (entry && !(fresh && Date.now()-entry.at > 1000)) {
+  if (entry && !fresh) {
     cache.delete(key); cache.set(key,entry);
-    if (Date.now()-entry.at >= ttl && !updating.has(key)) {
-      updating.add(key); load().catch(()=>{}).finally(()=>{if(currentGeneration===cacheGeneration)updating.delete(key);});
+    if (Date.now()-entry.at >= ttl && !backgroundRefreshes.has(reader,key)) {
+      backgroundRefreshes.start(reader,key,signal=>load(signal));
     }
     return { ...entry.data, refreshing: Date.now()-entry.at >= ttl };
   }
@@ -188,6 +191,7 @@ const assets = new Map([
   ['/overview', ['overview.html', 'text/html; charset=utf-8']],
   ['/overview.css', ['overview.css', 'text/css; charset=utf-8']],
   ['/overview.js', ['overview.js', 'text/javascript; charset=utf-8']],
+  ['/history-progress.mjs', ['history-progress.mjs', 'text/javascript; charset=utf-8']],
   ['/security', ['vault.html','text/html; charset=utf-8']],
   ['/vault.js', ['vault.js','text/javascript; charset=utf-8']],
   ['/vault-browser.mjs', ['vault-browser.mjs','text/javascript; charset=utf-8']],
@@ -197,6 +201,7 @@ const assets = new Map([
   ['/storage.css', ['storage.css','text/css; charset=utf-8']],
   ['/diagnostics', ['diagnostics.html','text/html; charset=utf-8']],
   ['/diagnostics.js', ['diagnostics.js','text/javascript; charset=utf-8']],
+  ['/diagnostic-health.mjs', ['diagnostic-health.mjs','text/javascript; charset=utf-8']],
   ['/tcp-evidence.mjs', ['tcp-evidence.mjs','text/javascript; charset=utf-8']],
   ['/diagnostics.css', ['diagnostics.css','text/css; charset=utf-8']],
   ['/relays', ['relays.html','text/html; charset=utf-8']],
@@ -235,6 +240,12 @@ const server = http.createServer(async (req, res) => {
       if (req.headers['x-codex-flow'] !== '1') return json(403, { error: 'local_header_required' });
       if(await vaultRoute({req,url,json,vault,readJson,clearCache}))return;
       if(await diagnosticRoute({req,url,json,vault,readJson,dataRoot,token:bearer}))return;
+      if(req.method==='GET'&&url.pathname==='/api/overview-progress'){
+        if(vault.configured){vault.owner(bearer);securityContext={operation:'read'};}
+        const range=url.searchParams.get('range')||'today',date=url.searchParams.get('date')||undefined;
+        if(!['today','24h','7d','30d','all','day','month'].includes(range))return json(400,{error:'invalid_range'});
+        return json(200,{query:fullReader.progressFor({type:'overview',range,date}),initialization:vault.initialization||null,ready:!vault.configured||vault.ready});
+      }
       if(url.pathname==='/api/relay-targets'){
         vault.owner(bearer);
         if(req.method==='GET'){
@@ -264,12 +275,27 @@ const server = http.createServer(async (req, res) => {
         const at=queueRelayReconcile();vault.actor(bearer,{operation:'update'});vault.audit('owner','relay-targets-'+body.action,{count:result.targets.length,at});
         return json(200,{...result,at,queued:true});
       }
+      if(url.pathname==='/api/airport-groups'){
+        if(req.method==='GET'){
+          if(vault.configured){vault.owner(bearer);securityContext={operation:'read',lane:'clash'};}
+          return json(200,await quickReader.query({type:'airport-groups'},{signal:abort.signal}));
+        }
+        if(req.method!=='POST')return json(405,{error:'method_not_allowed'});
+        const body=await readJson(req,65536);if(vault.configured){vault.owner(bearer);securityContext={operation:'update'};}
+        const groups=normalizeAirportGroups(body.groups);
+        if(vault.configured){
+          const saved=await vault.callWriter({action:'airport-groups-set',lane:'clash',groups});vault.owner(bearer);clearCache();return json(200,saved);
+        }
+        const response=await fetch(`http://127.0.0.1:${collectorPorts[1]}/api/airport-groups`,{method:'POST',headers:{'x-codex-flow':'1','content-type':'application/json'},body:JSON.stringify({groups}),signal:AbortSignal.timeout(5000)});
+        if(!response.ok)throw new Error('airport_groups_save_failed');
+        const saved=await response.json();clearCache();return json(200,saved);
+      }
       if (req.method === 'POST' && url.pathname === '/api/stop') {
         json(200, { ok: true }); setTimeout(close, 100); return;
       }
       let actor;
       if(vault.configured){
-        securityContext={operation:url.pathname==='/api/harness-apps'&&req.method==='POST'?'rules':url.searchParams.get('export')==='1'?'export':'read',lane:url.pathname==='/api/detail'?(url.searchParams.get('lane')||'windows'):undefined};
+        securityContext={operation:url.pathname==='/api/harness-apps'&&req.method==='POST'?'rules':url.searchParams.get('export')==='1'?'export':'read',lane:['/api/detail','/api/harness'].includes(url.pathname)?(url.searchParams.get('lane')||'windows'):['/api/ladder','/api/ladder/nodes'].includes(url.pathname)?'clash':undefined};
         actor=vault.actor(bearer,securityContext);
         if(req.method==='GET'&&url.pathname==='/api/live'){
           if(!actor.owner)return json(403,{error:'grant_live_not_available'});
@@ -324,7 +350,23 @@ const server = http.createServer(async (req, res) => {
         if(actor&&!actor.owner)return json(403,{error:'grant_live_not_available'});
         return json(200, await livePacket());
       }
-      if (req.method === 'GET' && url.pathname === '/api/detail') {
+      if(url.pathname==='/api/ladder/nodes'){
+        if(req.method!=='GET')return json(405,{error:'method_not_allowed'});
+        if(vault.configured){vault.owner(bearer);securityContext={operation:'read',lane:'clash'};if(!vault.ready)return json(503,{error:'vault_migrating'});if(vault.storageBusy)return json(503,{error:'vault_storage_busy'});}
+        const range=url.searchParams.get('range')||'today',date=url.searchParams.get('date')||undefined;
+        if(!['today','24h','7d','30d','all','day'].includes(range))return json(400,{error:'invalid_range'});
+        const result=await query({type:'ladder-nodes',range,options:{lane:'clash',date}},{signal:abort.signal,fresh:true});
+        return json(200,result.detail);
+      }
+      if(req.method==='GET'&&url.pathname==='/api/ladder'){
+        const range=url.searchParams.get('range')||'today',client=url.searchParams.get('client')||'all',airport=(url.searchParams.get('airport')||'').slice(0,64),date=url.searchParams.get('date')||undefined;
+        if(!['today','24h','7d','30d','all','day'].includes(range))return json(400,{error:'invalid_range'});
+        if(!['all','verge','flclash','mihomo','legacy'].includes(client)||airport&&!/^__unassigned__$|^[a-zA-Z0-9_-]{1,64}$/.test(airport))return json(400,{error:'invalid_filter'});
+        const options={lane:'clash',client,airport,date,apps:await harnessApps(),...authorization};
+        const result=await query({type:'ladder',range,options},{signal:abort.signal,fresh:url.searchParams.get('fresh')==='1'});
+        return json(200,{...result.detail,...(actor&&!actor.owner?{authorization:{lanes:actor.lanes,windows:actor.windows,expiresAt:actor.expiresAt}}:{})});
+      }
+      if (req.method === 'GET' && ['/api/detail','/api/harness'].includes(url.pathname)) {
         const lane = url.searchParams.get('lane') || 'windows';
         if (!['windows', 'clash'].includes(lane)) return json(400, { error: 'invalid_lane' });
         const range = url.searchParams.get('range') || 'today';
@@ -341,6 +383,8 @@ const server = http.createServer(async (req, res) => {
           export: url.searchParams.get('export') === '1',
           family: url.searchParams.get('family') || '',
           route,
+          client:url.searchParams.get('client')||'',
+          airport:(url.searchParams.get('airport')||'').slice(0,64),
           date: url.searchParams.get('date') || undefined,
           from: url.searchParams.has('from') ? url.searchParams.get('from') : undefined,
           to: url.searchParams.has('to') ? url.searchParams.get('to') : undefined,
@@ -348,9 +392,12 @@ const server = http.createServer(async (req, res) => {
           ...authorization,
         };
         if (options.family && !['codex', 'claude', 'dsh'].includes(options.family)) return json(400, { error: 'invalid_family' });
+        if(options.client&&!['all','verge','flclash','mihomo','legacy'].includes(options.client))return json(400,{error:'invalid_client'});
+        if(options.airport&&!/^__unassigned__$|^[a-zA-Z0-9_-]{1,64}$/.test(options.airport))return json(400,{error:'invalid_airport'});
+        if(url.pathname==='/api/harness'&&!options.family)return json(400,{error:'invalid_family'});
         if (options.scope && !['codex','other','unknown'].includes(options.scope)) return json(400, { error: 'invalid_scope' });
         if (options.export) options.export = true;
-        const result = await query({ type: 'detail', range, options }, { signal: abort.signal });
+        const result = await query({ type: url.pathname==='/api/harness'?'harness':'detail', range, options }, { signal: abort.signal,fresh:url.searchParams.get('fresh')==='1' });
         return json(200, {...result.detail,...(actor&&!actor.owner?{authorization:{lanes:actor.lanes,windows:actor.windows,expiresAt:actor.expiresAt}}:{})});
       }
       return json(404, { error: 'not_found' });
@@ -361,7 +408,8 @@ const server = http.createServer(async (req, res) => {
     fs.createReadStream(path.join(root, 'public', asset[0])).on('error', () => res.destroy()).pipe(res);
   } catch (error) {
     if (res.destroyed || error.message === 'request_cancelled') return;
-    if (!res.headersSent) json(['vault_migrating','vault_busy','vault_storage_busy'].includes(error.message)?503:/^(vault_|grant_)/.test(error.message)?423:/^(relay_|invalid_relay|duplicate_relay)/.test(error.message)||['invalid_range','Invalid range','Invalid date'].includes(error.message)?400:503, { error: /^(vault_|grant_|relay_|invalid_relay|duplicate_relay)/.test(error.message)||['invalid_range','history_busy','history_timeout'].includes(error.message) ? error.message : 'history_unavailable' });
+    const publicError=/^(vault_|grant_|relay_|invalid_relay|duplicate_relay|invalid_airport_|airport_groups_)/.test(error.message)||['invalid_range','history_busy','history_timeout'].includes(error.message);
+    if (!res.headersSent) json(['vault_migrating','vault_busy','vault_storage_busy','airport_groups_save_failed'].includes(error.message)?503:/^(vault_|grant_)/.test(error.message)?423:/^(relay_|invalid_relay|duplicate_relay|invalid_airport_)/.test(error.message)||['invalid_range','Invalid range','Invalid date'].includes(error.message)?400:503, { error: publicError ? error.message : 'history_unavailable' });
     else res.end();
   }
 });

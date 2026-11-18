@@ -1,6 +1,28 @@
 # TrafficWatch validation
 
-The active test suite combines the upstream regression tests with synthetic history, process-family, encryption, storage, diagnosis and performance/recovery tests. The 0.10.10 checkout completed 241 cases: 239 passed, 2 administrator-only ETW integration tests skipped, no failures. JavaScript and PowerShell syntax checks passed. The native helper self-test and the Windows tray/controller package build also passed using hash-verified dependencies. Run `npm run check`, `npm test`, and `npm run audit:publication`. CI runs source tests on Windows and Linux; Linux validates query/accounting behavior and does not provide Windows native capture.
+The active test suite combines the upstream regression tests with synthetic history, process-family, encryption, storage, diagnosis and performance/recovery tests. Version 0.10.13 completed 260 cases: 258 passed, 2 administrator-only ETW integration tests skipped, no failures. JavaScript syntax checks and the publication audit passed. The 0.10.10 native helper self-test and Windows tray/controller package build passed using hash-verified dependencies; 0.10.11 through 0.10.13 change source behavior. Run `npm run check`, `npm test`, and `npm run audit:publication`. CI runs source tests on Windows and Linux; Linux validates query/accounting behavior and does not provide Windows native capture.
+
+## 0.10.13 ladder attribution and query scheduling
+
+Proxy totals and node membership use the exact client identity plus exact node name. Unmarked historical rows remain visibly separate as legacy data. Airport group labels are stored through the encrypted history writer; invalid group members return a clear validation code. The dashboard reads the bounded client/node inventory only when its manager opens, with an explicit retry and incremental display controls.
+
+Queue progress reports the selected query's actual position and the blocking reader stage. Foreground selections cancel unrelated stale cache refreshes, while an identical in-flight query remains shared. Regression coverage includes queue state, background cancellation, encrypted group save/read, client/airport filtering, and deferred inventory loading.
+
+An isolated WebView2 smoke test passed against synthetic histories: both overview totals rendered, the same node name remained scoped to its client, lazy inventory distinguished Clash Verge from FlClash, and client/TAG filters stayed local. This check caught and fixed a missing completion flag that previously kept filtered airport rows in a permanent loading state. The sandboxed WebView2 subprocesses crashed before page startup; the same smoke passed outside the sandbox with synthetic-only data.
+
+## 0.10.12 Harness queries and client switching
+
+A synthetic encrypted Windows history with 100,000 connections, 200,000 minute buckets and 5 KB rule payloads occupied 646 MB. For the same 10,000 matching Harness connections, the full detail request took 3,481 ms and returned 42,553 bytes; the lightweight Harness request took 1,485 ms and returned 1,048 bytes. Upload, download and distinct-connection totals matched. The lightweight path keeps Windows joins inside the encrypted covering index and counts identities in SQL, without retaining a JS Set for every historical connection. These measurements describe this fixture on this host.
+
+Regression checks compare lightweight queries with full details for aliases, legacy Codex scope, unknown scope, repeated connection identities, proxy-only routing, exact dates, compressed archives and nonconsecutive visitor grants. Controller checks cover idle `connections: null`, independent client secrets, live FlClash preference changes, TUN-based selection, rejection of multiple active TUNs, ignoring Verge validation sidecars, preserving the selected client's runtime, idempotence, and restoring owned additions from both installed clients. Client changes force fresh bound and ordinary-socket evidence.
+
+An isolated Edge session passed nine browser scenario groups: immediate overview totals and independent source completion; duplicate-click coalescing with no full detail request; rapid family switching; date-range changes; green capture and red failed validation with previous-success details; verified/stale colors; desktop and 390-pixel layout; clearing unauthorized live details; and lock clearing with no page errors. Failure summaries whitelist codes and never copy raw exceptions, controller credentials or configuration paths to status responses.
+
+## 0.10.11 statistics query progress
+
+A synthetic encrypted history containing 100,000 connection identities with 5 KB rule payloads occupied 615 MB after indexing. Exact streaming attribution took 2,404 ms without the compact lookup index and 935 ms with the index. Index construction took 739 ms and added 9.1 MB. Both queries returned the same upload/download and family totals. This fixture measures the metadata-lookup improvement; it does not measure the user's private history or promise a fixed query duration.
+
+Regression checks cover index creation and reuse without changing existing rows, encrypted index canaries, exact attribution counters, query progress isolation by selected range, and nonconsecutive visitor-date filters on the indexed path. An isolated Edge session passed eight browser scenario groups: quick totals during a delayed attribution; coalescing repeated refresh clicks; ignoring tiny idle-import cycles; desktop and 390-pixel layout; queuing one fresh query after a real backlog completes; timeout reporting while retaining totals; manual recovery; and lock clearing. Query progress uses real processed/total records when available and an indeterminate indicator for SQL phases without a measured denominator. Fresh overview requests bypass even recently completed cached results.
 
 ## 0.10.10 relay management checks
 

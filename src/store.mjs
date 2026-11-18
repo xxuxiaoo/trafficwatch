@@ -6,7 +6,7 @@ import { calendarSummary, reportSummary } from './reports.mjs';
 import { historyBounds } from './history-archive.mjs';
 
 export class Store {
-  constructor(dir, { filename = 'monitor.sqlite', encryptionKey } = {}) {
+  constructor(dir, { filename = 'monitor.sqlite', encryptionKey, onProgress = () => {} } = {}) {
     fs.mkdirSync(dir, { recursive: true });
     this.excludedSessions = new Set();
     this.db = new DatabaseSync(path.join(dir, filename), { encryptionKey });
@@ -61,6 +61,13 @@ export class Store {
       );
       CREATE INDEX IF NOT EXISTS anomalies_time ON anomalies(ended_at);
     `);
+    // Keep application attribution on a small covering index instead of
+    // decrypting the full domain/rule payload for every selected identity.
+    // The index lives inside the same (possibly encrypted) history database.
+    if(!this.db.prepare("SELECT 1 FROM sqlite_master WHERE type='index' AND name='connections_programs'").get()){
+      onProgress({stage:'program_index'});
+      this.db.exec('CREATE INDEX connections_programs ON connections(id,process,evidence)');
+    }
     const bucketColumns = this.db
       .prepare('PRAGMA table_info(buckets)')
       .all()

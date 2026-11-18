@@ -1,13 +1,19 @@
-param([string]$OutputFile,[string]$DependencyRoot)
+param([string]$OutputFile,[string]$DependencyRoot,[string]$StageRoot)
 $ErrorActionPreference='Stop'
 $projectRoot=[IO.Path]::GetFullPath((Split-Path -Parent $PSScriptRoot))
 $projectVersion=(Get-Content -LiteralPath (Join-Path $projectRoot 'package.json') -Raw|ConvertFrom-Json).version
 $buildRoot=Join-Path $projectRoot '.build'
-$stageRoot=[IO.Path]::GetFullPath((Join-Path $buildRoot 'windows'))
+$customStage=-not [string]::IsNullOrWhiteSpace($StageRoot)
+$buildRootFull=[IO.Path]::GetFullPath($buildRoot)
+if(-not $customStage){$stageRequest=Join-Path $buildRoot 'windows'}
+elseif([IO.Path]::IsPathRooted($StageRoot)){$stageRequest=$StageRoot}
+else{$stageRequest=Join-Path $projectRoot $StageRoot}
+$stageRoot=[IO.Path]::GetFullPath($stageRequest)
 $stage=Join-Path $stageRoot 'TrafficWatch'
 $cache=Join-Path $buildRoot 'dependencies'
 if(-not $OutputFile){$OutputFile=Join-Path $buildRoot 'trafficwatch-windows-x64.zip'}
 $OutputFile=[IO.Path]::GetFullPath($OutputFile)
+if(-not $stageRoot.StartsWith($buildRootFull+'\',[StringComparison]::OrdinalIgnoreCase)){throw 'Build staging must stay inside this checkout .build directory.'}
 if($OutputFile.StartsWith($stageRoot+'\',[StringComparison]::OrdinalIgnoreCase)){throw 'The output archive must be outside the staging directory.'}
 $nodeVersion='24.22.1'
 $nodeArchiveSha='d2046d28c2c3dcd211ac5145c0bf30e2047ef9dfb306693c8c6e2eccd8b95fa5'
@@ -40,8 +46,8 @@ function Expand-BuildEntries([string]$Archive,[hashtable]$Entries){
     }
   }finally{$zip.Dispose()}
 }
-if($stageRoot -ne [IO.Path]::GetFullPath((Join-Path $projectRoot '.build\windows'))){throw 'Unsafe build staging path.'}
-if(Test-Path -LiteralPath $stageRoot){Remove-Item -LiteralPath $stageRoot -Recurse -Force}
+if($customStage -and (Test-Path -LiteralPath $stageRoot)){throw 'Custom staging directory already exists; choose a new empty path.'}
+if(-not $customStage -and (Test-Path -LiteralPath $stageRoot)){Remove-Item -LiteralPath $stageRoot -Recurse -Force}
 [IO.Directory]::CreateDirectory($stage)|Out-Null
 [IO.Directory]::CreateDirectory($cache)|Out-Null
 [IO.Directory]::CreateDirectory((Join-Path $stage 'runtime'))|Out-Null

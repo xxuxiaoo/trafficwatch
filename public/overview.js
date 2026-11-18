@@ -1,9 +1,11 @@
 import {initializeVault,vaultHeaders,checkVaultResponse,importProgressText} from './vault-browser.mjs';
+import {queryProgressView,createImportRefreshTracker} from './history-progress.mjs';
 const $ = (id) => document.getElementById(id);
+const importRefreshTracker=createImportRefreshTracker();
 let vaultState;
 await initializeVault({overview:true,onStatus:value=>{
-  const previous=vaultState;vaultState=value;renderImportState();
-  if(previous&&(!previous.ready&&value.ready||previous.backgroundImport?.state==='running'&&value.backgroundImport?.state==='complete'))refresh(true);
+  vaultState=value;renderImportState();
+  if(importRefreshTracker(value)){if(refreshPromise)refreshAfterImport=true;else refresh(true);}
 }});
 function renderImportState(){
   const target=$('backgroundImportNotice');if(!target)return;
@@ -36,10 +38,13 @@ let refreshTimer = 0, refreshSequence = 0, detailSequence = 0, harnessSequence =
 let activeAppDetail = null, activeLadderDetail = null, activeFamily = 'codex', harnessLoadedKey = '';
 let appDetailData = null, ladderDetailData = null;
 let liveTimer = 0, livePacket = null, detailHistory = [], harnessResult = null;
-let harnessLoadedAt = 0;
+let ladderFilterAbort=null,ladderFilterData=null,ladderFilterDataKey='',ladderFilterPendingKey='',ladderFilterError='',ladderFilterSequence=0,airportNodeSelection=null;
+let airportInventory=null,airportInventoryKey='',airportInventoryPendingKey='',airportInventoryError='',airportInventoryAbort=null,airportNodeLimit=120;
+let harnessLoadedAt = 0,harnessResultKey='';
 let preferences = readPreferences();
 let historyAbort, detailAbort, harnessAbort, liveAbort, refreshPromise, refreshKey = '', dataKey = '';
 let historyState = 'loading', historyError = '', monthLoadedAt = 0, appPage = 0, settingsInitialized = false;
+let progressTimer=0,historyProgress=null,historyStartedAt=0,refreshAfterImport=false;
 const snapshotCache = new Map();
 const queryKey = () => `${range}|${range === 'day' ? selectedDate : calendarDate()}`;
 const isCancelled = (error) => error?.name === 'AbortError' || error?.message === 'request_cancelled';
@@ -210,7 +215,11 @@ function renderHeader() {
   renderLiveStatus();
   setText($('rangeSummary'), `${rangeLabel()} · ${historyState === 'loading' ? '正在更新' : historyState === 'error' ? '更新失败，保留上次记录' : '汇总刷新'} ${data?.generatedAt ? time(data.generatedAt, true) : '—'}`);
   setText($('updatedAt'), data?.generatedAt ? `最近更新 ${time(data.generatedAt, true)}` : '等待本机数据');
-  setText($('historyStatus'), historyState === 'loading' ? (dataKey === queryKey() ? '正在更新统计…' : '正在读取所选时间…') : historyState === 'error' ? `更新未完成：${historyError}` : `${rangeLabel()} · ${data?.generatedAt ? time(data.generatedAt) + ' 更新' : '等待记录'}`);
+  const progress=queryProgressView(historyProgress,historyStartedAt?Date.now()-historyStartedAt:0);
+  setText($('historyStatus'), historyState === 'loading' ? progress.text : historyState === 'error' ? `更新未完成：${historyError}` : `${rangeLabel()} · ${data?.generatedAt ? time(data.generatedAt) + ' 更新' : '等待记录'}`);
+  $('historyProgressPanel').hidden=historyState!=='loading'||!historyStartedAt;
+  if(progress.determinate){$('historyProgressBar').max=progress.total;$('historyProgressBar').value=progress.done;}
+  else $('historyProgressBar').removeAttribute('value');
   setAttribute($('refreshButton'), 'aria-busy', String(historyState === 'loading'));
   renderPendingAttribution();
 }
@@ -236,10 +245,12 @@ function renderTotals(target, row, onSelect) {
     item.addEventListener('click', () => onSelect?.(route));
     target.append(item);
   }
-  const unassigned = node('button', undefined, 'route-total unassigned-total'); unassigned.type = 'button';
-  unassigned.append(node('span', '未归因差额'), node('strong', bytes(total(row.unassigned))));
-  unassigned.addEventListener('click', () => showToast('这个差额没有对应连接证据，不能强行分配给应用或节点。'));
-  target.append(unassigned);
+  if(row.unassigned){
+    const unassigned = node('button', undefined, 'route-total unassigned-total'); unassigned.type = 'button';
+    unassigned.append(node('span', '未归因差额'), node('strong', bytes(total(row.unassigned))));
+    unassigned.addEventListener('click', () => showToast('这个差额没有对应连接证据，不能强行分配给应用或节点。'));
+    target.append(unassigned);
+  }
 }
 const clockFormat = new Intl.DateTimeFormat('zh-CN', { timeZone: 'Asia/Shanghai', hour: '2-digit', minute: '2-digit', hour12: false });
 const dayFormat = new Intl.DateTimeFormat('zh-CN', { timeZone: 'Asia/Shanghai', month: '2-digit', day: '2-digit' });
@@ -706,12 +717,109 @@ function showTimeDetail(from, to, title, filters = {}) {
   $('appSearch').value = '';
   openAppSelection({ ...filters, from, to, page: 0, title: `${title} · ${time(from, true)}` });
 }
+function proxyClientName(client){return ({verge:'Clash Verge',flclash:'FlClash',mihomo:'Mihomo / 其他',legacy:'旧记录（客户端未标记）'})[client]||'未知客户端';}
+function airportName(clash,id){return clash.airportGroups?.find(group=>group.id===id)?.name||'未归类机场';}
+function selectedLadderFilter(){return {client:$('proxyClientFilter').value||'all',airport:$('proxyAirportFilter').value||'all'};}
+function ladderFilterKey(){const filter=selectedLadderFilter();return `${queryKey()}|${filter.client}|${filter.airport}`;}
+function currentLadderData(){
+  const filter=selectedLadderFilter();if(filter.client==='all'&&filter.airport==='all')return data?.clash||null;
+  return ladderFilterDataKey===ladderFilterKey()?ladderFilterData:null;
+}
+function clearLadderDetail(){detailAbort?.abort();detailSequence++;activeLadderDetail=ladderDetailData=null;$('ladderDetail').hidden=true;}
+async function loadLadderFilter(force=false){
+  const {client,airport}=selectedLadderFilter(),key=ladderFilterKey();
+  if(client==='all'&&airport==='all'){ladderFilterAbort?.abort();ladderFilterSequence++;ladderFilterData=null;ladderFilterDataKey='';ladderFilterPendingKey='';ladderFilterError='';if(view==='ladder')renderLadder();return;}
+  if(!force&&ladderFilterDataKey===key&&ladderFilterData){if(view==='ladder')renderLadder();return;}
+  if(!force&&ladderFilterDataKey===key&&ladderFilterError){if(view==='ladder')renderLadder();return;}
+  if(!force&&ladderFilterPendingKey===key)return;
+  ladderFilterAbort?.abort();ladderFilterAbort=new AbortController();const signal=ladderFilterAbort.signal,sequence=++ladderFilterSequence;
+  ladderFilterPendingKey=key;ladderFilterError='';if(view==='ladder')renderLadder();
+  const params=rangeParams();params.set('client',client);if(airport!=='all')params.set('airport',airport);
+  try{
+    const result=await api('/api/ladder?'+params,{signal});if(signal.aborted||sequence!==ladderFilterSequence)return;
+    if(!result.available)throw new Error('Clash 历史暂不可读');ladderFilterData=result;ladderFilterDataKey=key;ladderFilterError='';
+  }catch(error){if(signal.aborted||sequence!==ladderFilterSequence||isCancelled(error))return;ladderFilterError=error.message;ladderFilterData=null;ladderFilterDataKey=key;}
+  finally{if(sequence===ladderFilterSequence){ladderFilterPendingKey='';if(view==='ladder')renderLadder();}}
+}
+async function loadAirportInventory(force=false){
+  const key=queryKey();if(airportInventoryKey&&airportInventoryKey!==key)airportNodeLimit=120;if(!force&&airportInventoryKey===key&&airportInventory)return;
+  if(airportInventoryPendingKey===key)return;
+  airportInventoryAbort?.abort();airportInventoryAbort=new AbortController();const signal=airportInventoryAbort.signal,sequence=(loadAirportInventory.sequence||0)+1;loadAirportInventory.sequence=sequence;
+  airportInventoryPendingKey=key;airportInventoryError='';setText($('airportNodeCount'),'正在读取此时间范围的代理节点…');
+  try{
+    const result=await api('/api/ladder/nodes?'+rangeParams(),{signal});if(signal.aborted||sequence!==loadAirportInventory.sequence)return;
+    if(!result.available)throw new Error('梯子历史暂不可读');airportInventory=result.clientNodes||[];airportInventoryKey=key;airportInventoryError='';
+  }catch(error){if(signal.aborted||sequence!==loadAirportInventory.sequence||isCancelled(error))return;airportInventory=null;airportInventoryKey=key;airportInventoryError=error.message;}
+  finally{if(sequence===loadAirportInventory.sequence){airportInventoryPendingKey='';if(view==='ladder'&&data?.clash)renderAirportManager(data.clash);}}
+}
+function renderAirportControls(clash){
+  const select=$('proxyAirportFilter'),current=select.value||'all',options=[['all','全部机场'],['__unassigned__','未归类机场'],...(clash.airportGroups||[]).map(group=>[group.id,group.name])];
+  select.replaceChildren(...options.map(([value,label])=>{const option=node('option',label);option.value=value;return option;}));
+  select.value=options.some(([value])=>value===current)?current:'all';
+}
+function renderAirportUsage(clash){
+  const target=$('airportUsageRows'),rows=clash?.airportUsage||[],proxyTotal=total(clash?.groups?.proxy);target.replaceChildren();
+  if(ladderFilterError){const retry=node('button',`机场统计未完成：${ladderFilterError}。点击重试`,'empty-state');retry.type='button';retry.addEventListener('click',()=>loadLadderFilter(true));target.append(retry);return;}
+  if(!clash){target.append(node('p',ladderFilterPendingKey?'正在按客户端与机场重新汇总…':'选择客户端或机场后显示用量。','empty-state'));return;}
+  if(clash.detailReady===false){target.append(node('p','正在汇总机场用量…','empty-state'));return;}
+  if(!rows.length){target.append(node('p','当前范围没有可归因到代理节点的流量。','empty-state'));return;}
+  for(const row of rows){
+    const button=node('button');button.type='button';button.className='airport-usage-row';
+    const identity=node('span',undefined,'airport-usage-identity'),title=node('strong',airportName(clash,row.airport)),client=node('small',proxyClientName(row.client));identity.append(title,client);
+    const directions=node('span',undefined,'airport-usage-directions');directions.append(node('small',`↑ ${bytes(row.up)}　↓ ${bytes(row.down)}`),node('small',`${row.connections.toLocaleString('zh-CN')} 条连接 · ${proxyTotal?percent(total(row)/proxyTotal*100):'—'}`));
+    const amount=node('strong',bytes(total(row)),'airport-usage-amount');button.append(identity,directions,amount);
+    button.addEventListener('click',()=>{
+      $('proxyClientFilter').value=row.client;$('proxyAirportFilter').value=row.airport||'__unassigned__';clearLadderDetail();loadLadderFilter();
+    });target.append(button);
+  }
+}
+function renderAirportManager(clash){
+  const groups=clash.airportGroups||[],inventoryReady=airportInventoryKey===queryKey()&&airportInventory!==null,nodes=inventoryReady?airportInventory:[],search=$('airportNodeSearch').value.trim().toLocaleLowerCase(),name=$('airportGroupName').value.trim();
+  if(document.querySelector('.airport-manager').open&&!inventoryReady&&!airportInventoryPendingKey&&!(airportInventoryKey===queryKey()&&airportInventoryError))loadAirportInventory();
+  const editing=groups.find(group=>group.name.toLocaleLowerCase()===name.toLocaleLowerCase());
+  if(airportNodeSelection===null)airportNodeSelection=new Set((editing?.members||[]).map(member=>`${member.client}\0${member.node}`));
+  const matching=nodes.filter(item=>!search||`${proxyClientName(item.client)} ${item.name}`.toLocaleLowerCase().includes(search));
+  const choices=$('airportNodeChoices');choices.replaceChildren();
+  for(const item of matching.slice(0,airportNodeLimit)){
+    const label=node('label',undefined,'airport-node-choice'),checkbox=node('input');checkbox.type='checkbox';checkbox.dataset.client=item.client;checkbox.dataset.node=item.name;checkbox.checked=airportNodeSelection.has(`${item.client}\0${item.name}`);
+    checkbox.addEventListener('change',()=>{const key=`${item.client}\0${item.name}`;if(checkbox.checked)airportNodeSelection.add(key);else airportNodeSelection.delete(key);});
+    label.append(checkbox,node('span',`${proxyClientName(item.client)} · ${item.name}`),node('small',bytes(Number(item.up||0)+Number(item.down||0))));choices.append(label);
+  }
+  const count=$('airportNodeCount'),countText=airportInventoryError?`节点列表读取失败：${airportInventoryError}`:!inventoryReady?`展开后读取当前时段已采集到的客户端与出口节点。`:nodes.length?`显示 ${Math.min(airportNodeLimit,matching.length)} / ${matching.length} 个匹配节点 · 历史中共 ${nodes.length} 个客户端节点；可输入关键词缩小范围。`:'这个时段没有新采集到可识别客户端的代理节点。';
+  count.replaceChildren(node('span',countText));
+  if(airportInventoryError){const retry=node('button','重试读取','quiet-button');retry.type='button';retry.addEventListener('click',()=>loadAirportInventory(true));count.append(' ',retry);}
+  else if(inventoryReady&&matching.length>airportNodeLimit){const more=node('button','显示更多节点','quiet-button');more.type='button';more.addEventListener('click',()=>{airportNodeLimit+=120;renderAirportManager(clash);});count.append(' ',more);}
+  const groupList=$('airportGroupRows');groupList.replaceChildren();
+  if(!groups.length)groupList.append(node('p','还没有机场归类。搜索节点，勾选同一机场的节点，再填写机场名称并保存。','empty-state'));
+  for(const group of groups){
+    const row=node('div',undefined,'airport-group-row'),edit=node('button',`${group.name} · ${group.members.length} 个节点`,'quiet-button');edit.type='button';edit.addEventListener('click',()=>{airportNodeSelection=new Set(group.members.map(member=>`${member.client}\0${member.node}`));$('airportGroupName').value=group.name;$('airportNodeSearch').value='';renderAirportManager(clash);});
+    const remove=node('button','删除归类','quiet-button');remove.type='button';remove.addEventListener('click',()=>{if($('airportGroupName').value===group.name){$('airportGroupName').value='';airportNodeSelection=new Set();}saveAirportGroups(groups.filter(item=>item.id!==group.id),'已删除机场归类；历史连接会回到未归类。');});
+    row.append(edit,remove);groupList.append(row);
+  }
+}
+async function saveAirportGroups(groups,successText){
+  const button=$('saveAirportGroup');button.disabled=true;$('airportGroupStatus').textContent='正在保存机场归类…';
+  try{
+    const saved=await api('/api/airport-groups',{method:'POST',body:JSON.stringify({groups})});
+    if(data?.clash)data.clash.airportGroups=saved.groups;
+    $('airportGroupStatus').textContent=successText||'机场归类已保存，所选历史时段正在重新汇总。';dataKey='';clearDetails();renderLadder();refresh(true);
+  }catch(error){$('airportGroupStatus').textContent=`保存失败：${error.message}`;}
+  finally{button.disabled=false;}
+}
 function renderLadder() {
-  if (!data?.clash?.available) {
+  const base=data?.clash;
+  if (!base?.available) {
     if(data) {$('routeSummary').replaceChildren(node('p','梯子历史暂不可读，点击刷新可重试。','empty-state'));for(const id of ['ladderProcessRows','ladderDomainRows','ladderNodeRows'])$(id).replaceChildren(node('p','等待历史记录…','empty-state'));$('ladderChart').width=1;$('ladderChart').height=1;}
     return;
   }
-  renderTotals($('routeSummary'), { ...data.clash.groups, unassigned: data.clash.unassigned }, (route) => {
+  renderAirportControls(base);renderAirportManager(base);
+  const ladder=currentLadderData();renderAirportUsage(ladder);
+  if(!ladder){
+    $('routeSummary').replaceChildren(node('p','正在按客户端与机场汇总所选时段…','empty-state'));
+    for(const id of ['ladderProcessRows','ladderDomainRows','ladderNodeRows'])$(id).replaceChildren(node('p','正在汇总筛选结果…','empty-state'));
+    releaseChart($('ladderChart'));if(!ladderFilterPendingKey&&!ladderFilterError)loadLadderFilter();return;
+  }
+  renderTotals($('routeSummary'), { ...ladder.groups,...(ladder.unassigned?{unassigned:ladder.unassigned}:{}) }, (route) => {
     $('routeFilter').value = route;
     detailAbort?.abort();detailSequence++;
     activeLadderDetail = null; ladderDetailData = null; $('ladderDetail').hidden = true;
@@ -720,19 +828,19 @@ function renderLadder() {
   const filtered = $('routeFilter').value;
   const routes = filtered === 'all' ? ['proxy', 'direct', 'unknown'] : [filtered];
   const routeNames = { proxy: '代理出口', direct: 'DIRECT 直连', unknown: '出口未知' };
-  drawChart($('ladderChart'), routes.map((key) => chartSeries(routeNames[key], data.clash.routeTimeline, data.clash, key)),
+  drawChart($('ladderChart'), routes.map((key) => chartSeries(routeNames[key], ladder.routeTimeline, ladder, key)),
     (point) => loadLadderDetail({ from: point.from, to: point.to, title: '梯子时段明细' }), { range: data.clash.range, ticks: 'ladderTicks' });
-  const routeRows = filtered === 'all' ? data.clash.allPrograms : data.clash.routePrograms?.[filtered] || [];
+  const routeRows = filtered === 'all' ? ladder.allPrograms : ladder.routePrograms?.[filtered] || [];
   renderCompactPrograms($('ladderProcessRows'), routeRows, 15,
     (row) => loadLadderDetail({ process: row.process || '__unknown__', title: row.name }));
-  renderCompactPrograms($('ladderDomainRows'), data.clash.routeDomains?.[filtered] || data.clash.domains, 15,
+  renderCompactPrograms($('ladderDomainRows'), ladder.routeDomains?.[filtered] || ladder.domains, 15,
     (row) => loadLadderDetail({ host: row.name, title: row.name }));
-  renderCompactPrograms($('ladderNodeRows'), data.clash.routeNodes?.[filtered] || data.clash.nodes, 8,
+  renderCompactPrograms($('ladderNodeRows'), ladder.routeNodes?.[filtered] || ladder.nodes, 8,
     (row) => loadLadderDetail({ node: row.name, title: `出口节点 · ${row.name}` }));
-  if(data.clash.detailReady === false) for (const id of ['ladderProcessRows','ladderDomainRows','ladderNodeRows']) $(id).replaceChildren(node('p','正在汇总连接归因…','empty-state'));
-  $('ladderAccountingNote').textContent = data.clash.connectionCountersExceedGlobal
+  if(ladder.detailReady === false) for (const id of ['ladderProcessRows','ladderDomainRows','ladderNodeRows']) $(id).replaceChildren(node('p','正在汇总连接归因…','empty-state'));
+  $('ladderAccountingNote').textContent = ladder.connectionCountersExceedGlobal
     ? '连接累计超过 Clash 全局计数。短连接、采样时点和计数重置都会造成差异；此处用于定位，不是精确账单。'
-    : 'Clash 总计包含代理、DIRECT 与未归因流量。这里只把明确走代理节点的连接计入“梯子代理出口”；短连接可能低估。';
+    : '按已采集的出口节点连接累计；旧记录会标为客户端未识别。短连接可能低估，此统计用于定位，不是机场账单。';
   if (activeLadderDetail && ladderDetailData) renderLadderDetail(activeLadderDetail, ladderDetailData);
 }
 async function loadLadderDetail(selection) {
@@ -755,6 +863,8 @@ async function loadLadderDetail(selection) {
       host: selection.host,
       node: selection.node,
       route: $('routeFilter').value,
+      client:selection.client??$('proxyClientFilter').value,
+      airport:(selection.airport??$('proxyAirportFilter').value)==='all'?'':selection.airport??$('proxyAirportFilter').value,
       from: selection.from,
       to: selection.to,
       page: selection.page || 0,
@@ -776,10 +886,10 @@ function renderLadderDetail(selection, result) {
   drawChart($('ladderDetailChart'), routes.map((key) => chartSeries(routeNames[key], result.series, result.observation || data?.clash, key)),
     (point) => loadLadderDetail({ ...selection, page: 0, from: point.from, to: point.to }), { range: result.range, fullRange: true });
   const body = $('ladderConnectionRows'); body.replaceChildren();
-  if (!result.connections.length) { const tr = node('tr'); const td = node('td', '这个时段没有匹配的代理连接。', 'empty-state'); td.colSpan = 7; tr.append(td); body.append(tr); }
+  if (!result.connections.length) { const tr = node('tr'); const td = node('td', '这个时段没有匹配的代理连接。', 'empty-state'); td.colSpan = 9; tr.append(td); body.append(tr); }
   for (const row of result.connections) {
     const tr = node('tr');
-    tr.append(node('td', time(row.lastAt, true)), node('td', row.process || '未识别'), node('td', row.host), node('td', row.node || '未知出口'), node('td', bytes(row.up)), node('td', bytes(row.down)), node('td', bytes(row.amount), 'numeric-strong'));
+    tr.append(node('td',proxyClientName(row.client)),node('td',airportName(data?.clash||{},row.airport)),node('td', time(row.lastAt, true)), node('td', row.process || '未识别'), node('td', row.host), node('td', row.node || '未知出口'), node('td', bytes(row.up)), node('td', bytes(row.down)), node('td', bytes(row.amount), 'numeric-strong'));
     body.append(tr);
   }
   renderPager('ladderPager', result.pagination, (page) => loadLadderDetail({ ...selection, page }));
@@ -789,57 +899,63 @@ function renderHarnessTabs() {
   for (const family of ['codex', 'claude', 'dsh']) {
     const button = node('button', familyNames[family]); button.type = 'button'; button.setAttribute('role', 'tab');
     button.setAttribute('aria-selected', String(activeFamily === family));
-    button.addEventListener('click', () => { activeFamily = family; renderHarnessTabs(); loadHarness(family, true); });
+    button.addEventListener('click', () => { activeFamily = family; renderHarnessTabs(); loadHarness(family); });
     target.append(button);
   }
 }
 async function loadHarness(family, force = false) {
   activeFamily = family;
   const key = `${family}|${queryKey()}|${JSON.stringify(apps)}`;
-  if (!force && key === harnessLoadedKey && Date.now() - harnessLoadedAt < 60000) return;
+  if (!force && key === harnessLoadedKey && !harnessAbort?.signal.aborted && Date.now() - harnessLoadedAt < 60000) return;
   harnessAbort?.abort(); harnessAbort = new AbortController(); const signal=harnessAbort.signal, rangeKey=queryKey();
   harnessLoadedKey = key;
   harnessLoadedAt = Date.now();
   const current = ++harnessSequence;
   $('harnessSelectedName').textContent = familyNames[family];
-  if (!harnessResult || harnessResult[0] !== family) {
-    $('harnessTotal').textContent = '读取中'; $('harnessProxyTotal').textContent = '读取中';
+  if (harnessResultKey!==key) {
+    harnessResult=null;
+    const preview=dataKey===rangeKey&&data?.machine?.detailReady!==false?data?.machine?.familyTotals?.[family]:null;
+    $('harnessTotal').textContent = preview?bytes(total(preview)):'读取中'; $('harnessProxyTotal').textContent = '读取中';
+    $('harnessShare').textContent=preview&&total(data?.machine?.totals)?percent(total(preview)/total(data.machine.totals)*100):'—';$('harnessPeak').textContent='正在读取时段分布…';
     $('harnessProcessRows').replaceChildren(node('p', '正在读取…', 'empty-state'));
-    $('harnessChart')._dispose?.();$('harnessChart').width=1;$('harnessChart').height=1;$('harnessDirections').textContent='正在读取所选分组…';$('harnessNotice').replaceChildren();
+    releaseChart($('harnessChart'));$('harnessDirections').textContent=preview?`↑ ${bytes(preview.up)}　↓ ${bytes(preview.down)} · 总览已统计`:'正在读取所选分组…';$('harnessNotice').replaceChildren();
   }
-  try {
-    const [machine, proxy] = await Promise.all([
-      requestDetail('windows', { family }, { signal }),
-      requestDetail('clash', { family, route: 'proxy' }, { signal }),
-    ]);
-    if (current !== harnessSequence || rangeKey !== queryKey() || signal.aborted) return;
-    if (!machine.available || !proxy.available) throw new Error('部分采集源尚未建立历史记录');
-    harnessResult = [family, machine, proxy];
-    if (view === 'harness') renderHarness(family, machine, proxy);
-  } catch (error) {
-    if (current === harnessSequence && !isCancelled(error)) { harnessLoadedKey='';$('harnessNotice').textContent = `Harness 明细暂不可用：${error.message}。再次点击分组可重试。`; }
-  }
+  const results=[null,null],errors=[];
+  const valid=()=>current===harnessSequence&&rangeKey===queryKey()&&!signal.aborted;
+  await Promise.all(['windows','clash'].map(async(lane,index)=>{
+    const params=rangeParams();params.set('lane',lane);params.set('family',family);if(force)params.set('fresh','1');
+    try{results[index]=await api('/api/harness?'+params,{signal});}
+    catch(error){if(isCancelled(error)||!valid())return;results[index]={available:false,error:error.message};errors.push(`${index?'梯子':'本机'}：${error.message}`);}
+    if(!valid())return;
+    harnessResult=[family,...results];harnessResultKey=key;
+    if(view==='harness')renderHarness(...harnessResult);
+  }));
+  if(!valid())return;
+  if(errors.length||results.some(value=>!value?.available))harnessLoadedKey='';
+  else harnessLoadedAt=Date.now();
 }
 function renderHarness(family, machine, proxy) {
-  const machineBytes = total(machine.summary);
-  const proxyBytes = total(proxy.routeTotals.proxy);
+  const machineReady=machine?.available===true,proxyReady=proxy?.available===true;
+  const preview=dataKey===queryKey()&&data?.machine?.detailReady!==false?data?.machine?.familyTotals?.[family]:null;
+  const machineSummary=machineReady?machine.summary:preview;
+  const machineBytes = total(machineSummary);
+  const proxyBytes = total(proxy?.routeTotals?.proxy);
   const systemBytes = total(data?.machine?.totals);
   $('harnessSelectedName').textContent = familyNames[family];
-  $('harnessTotal').textContent = bytes(machineBytes);
-  const { up, down } = machine.summary;
-  $('harnessDirections').textContent = `↑ ${bytes(up)}　↓ ${bytes(down)}`;
-  $('harnessProxyTotal').textContent = bytes(proxyBytes);
+  $('harnessTotal').textContent = machineSummary?bytes(machineBytes):machine?'暂不可用':'读取中';
+  $('harnessDirections').textContent = machineSummary?`↑ ${bytes(machineSummary.up)}　↓ ${bytes(machineSummary.down)}${machineReady?'':' · 总览已统计'}`:machine?'本机记录读取失败':'正在读取所选分组…';
+  $('harnessProxyTotal').textContent = proxyReady?bytes(proxyBytes):proxy?'暂不可用':'读取中';
   $('harnessProxyShare').textContent = 'Clash 代理连接独立计数，与左侧不相加';
-  $('harnessShare').textContent = systemBytes ? percent((machineBytes / systemBytes) * 100) : '—';
-  $('harnessPeak').textContent = `最高时段 ${peakFrom(machine.series)}`;
-  drawChart($('harnessChart'), [
-    chartSeries('本机进程记录', machine.series, machine.observation || data?.machine),
-    chartSeries('梯子代理出口', proxy.series, proxy.observation || data?.clash, 'proxy'),
-  ], (point) => showTimeDetail(point.from, point.to, familyNames[family], { family }), { range: machine.range });
-  renderCompactPrograms($('harnessProcessRows'), machine.processes, 15,
-    (row) => selectApp(row, { family }));
+  $('harnessShare').textContent = machineSummary&&systemBytes ? percent((machineBytes / systemBytes) * 100) : '—';
+  $('harnessPeak').textContent = machineReady?`最高时段 ${peakFrom(machine.series)}`:machine?'时段分布暂不可用':'正在读取时段分布…';
+  const series=[];if(machineReady)series.push(chartSeries('本机进程记录',machine.series,machine.observation));if(proxyReady)series.push(chartSeries('梯子代理出口',proxy.series,proxy.observation,'proxy'));
+  if(series.length)drawChart($('harnessChart'),series,(point)=>showTimeDetail(point.from,point.to,familyNames[family],{family}),{range:(machineReady?machine:proxy).range});
+  if(machineReady)renderCompactPrograms($('harnessProcessRows'),machine.processes,15,(row)=>selectApp(row,{family}));
+  else $('harnessProcessRows').replaceChildren(node('p',machine?'本机进程列表暂不可用；再次点击分组可重试。':'正在读取本机进程…','empty-state'));
   const notice = $('harnessNotice'); notice.replaceChildren();
-  if (!machineBytes) {
+  if(machine&&!machineReady||proxy&&!proxyReady){notice.className='warning-list has-warning';for(const [name,value]of [['本机',machine],['梯子',proxy]])if(value&&!value.available)notice.append(node('p',`${name}：${value.error==='missing_database'?'尚未建立记录':value.error||'暂不可读'}。再次点击分组可重试。`));}
+  else if(!machine||!proxy){notice.className='warning-list';notice.append(node('p',`${!machine?'本机':'梯子'}时段分布正在读取，已完成的来源先行显示。`));}
+  else if (!machineBytes) {
     notice.className = 'warning-list has-warning';
     notice.append(node('p', family === 'dsh'
       ? '所选时段没有可归入 dsh 的记录。已支持通过 dsh 的 Node 启动脚本识别及其子进程；旧记录缺少这项证据时保留为其他应用。'
@@ -957,6 +1073,7 @@ function exportAppsCsv(rows, name) {
 function exportConnectionsCsv(rows, filename) {
   exportCsv(filename, [
     { label: '进程名', value: 'process' }, { label: 'PID', value: 'pid' }, { label: '目标', value: 'host' },
+    { label: '客户端', value: (row) => proxyClientName(row.client) }, { label: '机场', value: (row) => airportName(data?.clash||{},row.airport) },
     { label: 'Harness', value: (row) => familyNames[row.family] || row.family }, { label: '出口', value: (row) => row.node || row.route || '' },
     { label: '证据', value: (row) => evidenceNames[row.evidence] || row.evidence }, { label: '上传字节', value: 'up' },
     { label: '下载字节', value: 'down' }, { label: '合计字节', value: total },
@@ -1005,10 +1122,13 @@ function acceptOverview(next, key, quick) {
 function refresh(force = false) {
   if (document.hidden) return Promise.resolve();
   const key = queryKey();
-  if (refreshPromise && refreshKey === key && !force) return refreshPromise;
+  // Repeated refreshes join the current query. Aborting it on every import
+  // completion or click can permanently starve a large first attribution.
+  if (refreshPromise && refreshKey === key) return refreshPromise;
   historyAbort?.abort(); historyAbort = new AbortController();
   const signal = historyAbort.signal, current = ++refreshSequence;let preparing=false;
-  clearTimeout(refreshTimer); refreshKey = key; historyState = 'loading'; historyError = '';
+  clearTimeout(refreshTimer);clearTimeout(progressTimer);historyProgress=null;historyStartedAt=Date.now();refreshAfterImport=false;
+  refreshKey = key; historyState = 'loading'; historyError = '';
   if (dataKey !== key) {
     const snapshot = snapshotCache.get(key);
     if (snapshot) { data = snapshot; dataKey = key; renderCurrentView(); }
@@ -1017,7 +1137,17 @@ function refresh(force = false) {
     if (dataKey !== key) $('globalNotice').textContent = '正在读取' + rangeLabel() + '，暂时保留先前画面；加载期间无法点击旧时段。';
   }
   renderHeader();
-  const params = rangeParams();
+  const params=rangeParams();
+  const pollProgress=async()=>{
+    if(current!==refreshSequence||signal.aborted||document.hidden)return;
+    try{
+      const progress=await api('/api/overview-progress?'+params,{signal,timeoutMs:3000});
+      if(current!==refreshSequence||signal.aborted)return;
+      historyProgress=progress;renderHeader();
+    }catch{/* A progress-poll failure must never interrupt the actual query. */}
+    if(current===refreshSequence&&!signal.aborted&&historyState==='loading')progressTimer=setTimeout(pollProgress,1000);
+  };
+  progressTimer=setTimeout(pollProgress,300);
   const run = async () => {
     let quickOk = false;
     try {
@@ -1047,8 +1177,10 @@ function refresh(force = false) {
       $('globalNotice').textContent = preparing?'正在打开加密历史，完成后自动显示；后台采集继续，不需要重复输入密码。':(quickOk ? '总量和趋势已加载，详细归因暂未完成。' : '历史更新暂未完成，已保留上次成功的记录。') + ' 点击右上角刷新可重试。';
     } finally {
       if (current === refreshSequence) {
+        clearTimeout(progressTimer);historyStartedAt=0;historyProgress=null;
         refreshPromise = null; renderHeader();
-        if (!document.hidden) refreshTimer = setTimeout(()=>refresh(),preparing?1500:data?.refreshing ? 5000 : ['running','paused'].includes(vaultState?.backgroundImport?.state)?10000:range === 'day' && selectedDate < calendarDate() ? 300000 : 60000);
+        const afterImport=refreshAfterImport;refreshAfterImport=false;
+        if (!document.hidden) refreshTimer = setTimeout(()=>refresh(afterImport),afterImport?0:preparing?1500:data?.refreshing ? 5000 : ['running','paused'].includes(vaultState?.backgroundImport?.state)?10000:range === 'day' && selectedDate < calendarDate() ? 300000 : 60000);
       }
     }
   };
@@ -1063,8 +1195,10 @@ async function refreshLive() {
   finally { if(liveAbort===controller)liveAbort=null;if(!document.hidden)liveTimer=setTimeout(refreshLive,5000); }
 }
 function clearDetails() {
-  detailAbort?.abort(); harnessAbort?.abort();
-  detailSequence++; harnessSequence++; activeAppDetail = activeLadderDetail = appDetailData = ladderDetailData = harnessResult = null;
+  detailAbort?.abort(); harnessAbort?.abort();ladderFilterAbort?.abort();airportInventoryAbort?.abort();
+  detailSequence++; harnessSequence++;ladderFilterSequence++;activeAppDetail = activeLadderDetail = appDetailData = ladderDetailData = harnessResult = null;
+  ladderFilterData=null;ladderFilterDataKey=ladderFilterPendingKey=ladderFilterError='';
+  airportInventory=null;airportInventoryKey=airportInventoryPendingKey=airportInventoryError='';
   detailHistory = []; harnessLoadedKey = ''; appPage = 0; $('appDetail').hidden = $('ladderDetail').hidden = true;
   for(const canvas of document.querySelectorAll('canvas')) releaseChart(canvas);
   hideChartTooltip();
@@ -1099,6 +1233,20 @@ $('selectedDate').value = selectedDate;
 $('selectedDate').max = selectedDate;
 $('selectedDate').addEventListener('change', () => { selectedDate = $('selectedDate').value || selectedDate; clearDetails(); refresh(true); });
 $('refreshButton').addEventListener('click', () => refresh(true));
+$('proxyClientFilter').addEventListener('change',()=>{clearLadderDetail();loadLadderFilter();});
+$('proxyAirportFilter').addEventListener('change',()=>{clearLadderDetail();loadLadderFilter();});
+$('airportNodeSearch').addEventListener('input',()=>{airportNodeLimit=120;if(view==='ladder'&&data?.clash)renderAirportManager(data.clash);});
+$('airportGroupName').addEventListener('input',()=>{if(view==='ladder'&&data?.clash)renderAirportManager(data.clash);});
+$('clearAirportGroup').addEventListener('click',()=>{airportNodeSelection=new Set();for(const checkbox of $('airportNodeChoices').querySelectorAll('input[type="checkbox"]'))checkbox.checked=false;});
+document.querySelector('.airport-manager').addEventListener('toggle',()=>{if(document.querySelector('.airport-manager').open&&data?.clash)loadAirportInventory();});
+$('saveAirportGroup').addEventListener('click',()=>{
+  const name=$('airportGroupName').value.trim(),selected=[...(airportNodeSelection||new Set())].map(key=>{const [client,nodeName]=key.split('\0');return {client,node:nodeName};});
+  if(!name||!selected.length){$('airportGroupStatus').textContent='请填写机场名称，并至少选择一个出口节点。';return;}
+  const groups=data?.clash?.airportGroups||[],existing=groups.find(group=>group.name.toLocaleLowerCase()===name.toLocaleLowerCase());
+  const id=existing?.id||crypto.randomUUID().replaceAll('-',''),selectedKeys=new Set(selected.map(member=>`${member.client}\0${member.node}`));
+  const next=groups.filter(group=>group.id!==id).map(group=>({...group,members:group.members.filter(member=>!selectedKeys.has(`${member.client}\0${member.node}`))}));
+  next.push({id,name,members:selected});saveAirportGroups(next);
+});
 let searchTimer;
 $('appSearch').addEventListener('input',()=>{clearTimeout(searchTimer);searchTimer=setTimeout(()=>{appPage=0;renderApps();},120);});
 $('appSort').addEventListener('change',()=>{appPage=0;renderApps();});
@@ -1159,13 +1307,13 @@ $('notificationsEnabled').addEventListener('change', async (event) => {
   renderBudgetSettingsStatus();
 });
 document.addEventListener('visibilitychange', () => {
-  clearTimeout(refreshTimer); clearTimeout(liveTimer); hideChartTooltip();
+  clearTimeout(refreshTimer); clearTimeout(liveTimer);clearTimeout(progressTimer); hideChartTooltip();
   if(document.hidden){historyAbort?.abort();liveAbort?.abort();detailAbort?.abort();harnessAbort?.abort();refreshSequence++;detailSequence++;harnessSequence++;harnessLoadedKey='';refreshPromise=null;for(const canvas of document.querySelectorAll('canvas'))releaseChart(canvas);}
   else{renderCurrentView();refreshLive();refresh();if(view==='apps'&&activeAppDetail&&!appDetailData)loadAppDetail(activeAppDetail);if(view==='ladder'&&activeLadderDetail&&!ladderDetailData)loadLadderDetail(activeLadderDetail);}
 });
 let resizeFrame;
 window.addEventListener('trafficwatch-vault-locked',()=>{
-  clearTimeout(refreshTimer);clearTimeout(liveTimer);clearTimeout(searchTimer);cancelAnimationFrame(resizeFrame);
+  clearTimeout(refreshTimer);clearTimeout(liveTimer);clearTimeout(progressTimer);clearTimeout(searchTimer);cancelAnimationFrame(resizeFrame);
   refreshSequence++;detailSequence++;harnessSequence++;refreshPromise=null;
   historyAbort?.abort();liveAbort?.abort();detailAbort?.abort();harnessAbort?.abort();
   for(const canvas of document.querySelectorAll('canvas'))releaseChart(canvas);

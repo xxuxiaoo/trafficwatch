@@ -8,7 +8,7 @@ import { spawnSync } from 'node:child_process';
 import { Store } from '../src/store.mjs';
 import { DatabaseSync,configureDatabaseKeys } from '../src/database.mjs';
 import { initializeArchives,archiveBatch,attachArchiveViews,deleteArchivedWindows,archiveSummary,historyBounds,setArchiveWindows } from '../src/history-archive.mjs';
-import { readLane,readDetail } from '../src/overview-data.mjs';
+import { readLane,readDetail,readHarness } from '../src/overview-data.mjs';
 import { restrictReadConnection } from '../src/vault-grants.mjs';
 import { readLegacy } from '../src/vault-legacy.mjs';
 import { compactHistory,recoverCompaction } from '../src/storage-compaction.mjs';
@@ -46,6 +46,7 @@ test('lossless monthly compression preserves complete overview, exact peaks, rou
     for(const options of [{},{family:'codex'},{scope:'unknown'},{process:'synthetic.exe'},{host:'archive-canary-1.example.test'},{route:'proxy'}])before.push(clean(readDetail(root,lane,'all',now,{...options,vault:true})));
     before.push(clean(readLane(root,lane,'all',now,{vault:true})));
     before.push(clean(readLane(root,lane,'day',now,{date:'2026-06-10',vault:true})));
+    before.push(clean(readHarness(root,lane,'all',now,{family:'codex',vault:true})));
   }
   for(const store of stores){let batch;do{batch=archiveBatch(store,at('2026-08-01'),{limit:7});}while(batch.moved);}
   let i=0;
@@ -53,6 +54,7 @@ test('lossless monthly compression preserves complete overview, exact peaks, rou
     for(const options of [{},{family:'codex'},{scope:'unknown'},{process:'synthetic.exe'},{host:'archive-canary-1.example.test'},{route:'proxy'}])assert.deepEqual(clean(readDetail(root,lane,'all',now,{...options,vault:true})),before[i++]);
     assert.deepEqual(clean(readLane(root,lane,'all',now,{vault:true})),before[i++]);
     assert.deepEqual(clean(readLane(root,lane,'day',now,{date:'2026-06-10',vault:true})),before[i++]);
+    assert.deepEqual(clean(readHarness(root,lane,'all',now,{family:'codex',vault:true})),before[i++]);
   }
   const summary=archiveSummary(stores[0].db);assert.equal(summary.months.length,2);assert.equal(summary.rows,120);assert.ok(summary.compressedBytes<summary.rawBytes);
   assert.deepEqual(legacyRoutes.map(([route,params])=>legacy(root,key,route,params)),legacyBefore);

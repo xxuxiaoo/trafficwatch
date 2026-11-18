@@ -159,7 +159,7 @@ export function createServer(config, store, monitor, shutdown) {
         if (req.headers['x-codex-flow'] !== '1')
           return json(403, { error: 'Missing local client header' });
         if (req.method === 'POST') {
-          const body = await readBody(req);
+          const body = await readBody(req,url.pathname==='/api/airport-groups'?65536:4096);
           if(store.sealed&&!['/api/stop','/api/capture'].includes(url.pathname)){
             verifyCommand??=commandVerifier(store.metadata.commandPublicKey);
             if(!verifyCommand(req.headers['x-trafficwatch-command'],url.pathname,JSON.parse(body||'{}')))return json(403,{error:'vault_command_required'});
@@ -189,6 +189,10 @@ export function createServer(config, store, monitor, shutdown) {
             } catch {
               return json(400, { error: 'Invalid Harness process names' });
             }
+          }
+          if (url.pathname === '/api/airport-groups') {
+            try { return json(200, { groups: monitor.setAirportGroups(JSON.parse(body || '{}').groups) }); }
+            catch { return json(400, { error: '机场分组或节点配置无效' }); }
           }
           if (url.pathname === '/api/settings') {
             const request = JSON.parse(body || '{}');

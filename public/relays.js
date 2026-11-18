@@ -1,4 +1,5 @@
 import {initializeVault,vaultHeaders,checkVaultResponse} from './vault-browser.mjs';
+import {diagnosticHealth} from './diagnostic-health.mjs';
 
 const $=id=>document.getElementById(id);
 const labels={verified:'IPv4 绕行已验证',checking:'正在解析与核验',route_checked:'路由已更新，等待核验',degraded:'部分目标未通过核验',stale:'状态过期，请重新校验',rolled_back:'已撤回受管绕行',stopped:'后台已停止'};
@@ -26,6 +27,8 @@ function targetHealth(target){
   if(!applied)return '等待解析与应用';
   if(state.status?.state==='stale')return '状态过期';
   if(state.pending)return '列表已变更，等待核验';
+  if(state.status?.state==='degraded'&&state.status.error)return '最近核验失败，详见上方原因';
+  if(state.status?.state==='checking'&&state.status.previousState!=='verified')return '正在重新核验';
   if(applied.stale)return 'DNS 结果过期';
   if(applied.ipv6Unmanaged&&applied.ipv6Available)return 'IPv6 路径未覆盖';
   if(check?.seenInClash)return '仍在 Clash 中';
@@ -62,7 +65,7 @@ function render(){
   const adapter=state.applied?.adapter,parts=[];
   if(adapter)parts.push('物理网卡 '+adapter.name+' · '+adapter.address);
   if(state.status?.at)parts.push('最后检查 '+clock.format(state.status.at));
-  if(state.status?.error)parts.push(errorText[state.status.error]||state.status.error);
+  if(state.status?.error||state.status?.client)parts.push(diagnosticHealth({bypass:state.status}).bypass.detail);
   if(state.disabled)parts.push('后台暂停中；恢复流量采集后会继续处理列表。');
   $('pathDetail').textContent=parts.join('　');
   setBusy(busy);

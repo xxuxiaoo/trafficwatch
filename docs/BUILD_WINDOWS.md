@@ -22,9 +22,11 @@ Outputs:
 - `.build/trafficwatch-windows-x64.zip`: package archive.
 - `.build/SHA256SUMS.txt`: archive SHA256.
 
+To keep an existing build available, pass a new staging path under `.build` and a separate archive name, for example `-StageRoot .build/windows-0.10.13 -OutputFile .build/release-0.10.13/trafficwatch-windows-x64.zip`. A custom staging path must not already exist; the default `.build/windows` path is refreshed in place.
+
 The Node.js, WebView2, encrypted SQLite, YAML and diagnostic dependency licenses/notices are copied into the package. Edge WebView2 Evergreen Runtime and .NET Framework 4.8 are installed system prerequisites. Generated EXEs are unsigned. Digest checks verify the pinned dependencies and archive contents, not Windows publisher identity.
 
-For an offline build, install the locked npm dependencies ahead of time, and pass `-DependencyRoot` pointing to an extracted, already available official-compatible package containing `runtime/node.exe`, the Node.js licenses/checksums, the three WebView2 DLLs and their license/notice files. The same executable/DLL hashes are checked. Also prepopulate this checkout's `.build/dependencies/traceevent-2.0.77.nupkg` and `.build/dependencies/unsafe-4.5.2.nupkg` using the official URLs and SHA256 pins in `scripts/build-diagnostics.ps1`; those packages are checked even when cached. Build staging is cleared only after its absolute path is checked to equal this checkout's `.build/windows`.
+For an offline build, install the locked npm dependencies ahead of time, and pass `-DependencyRoot` pointing to an extracted, already available official-compatible package containing `runtime/node.exe`, the Node.js licenses/checksums, the three WebView2 DLLs and their license/notice files. The same executable/DLL hashes are checked. Also prepopulate this checkout's `.build/dependencies/traceevent-2.0.77.nupkg` and `.build/dependencies/unsafe-4.5.2.nupkg` using the official URLs and SHA256 pins in `scripts/build-diagnostics.ps1`; those packages are checked even when cached. Staging must stay inside this checkout's `.build` directory; a supplied custom stage must not already exist.
 
 ## Fresh installation
 

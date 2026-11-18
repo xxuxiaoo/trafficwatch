@@ -33,5 +33,12 @@ test('scoped encrypted queries keep all totals, peaks, pagination and hosts insi
     assert.deepEqual(detail.destinations.map(row=>row.name).sort(),['day-10.example.test','day-12.example.test']);
     assert.equal(detail.pagination.total,2);assert.equal(JSON.stringify(detail).includes('day-11'),false);
     assert.equal(fs.existsSync(path.join(root,'forbidden-cache')),false);
+    const windowsGrant=normalizeGrant({lanes:['windows'],permissions:['read'],minutes:60,scope:{kind:'dates',dates:['2026-11-10','2026-11-12']}},Date.now());
+    const windowsOverview=await reader.query({type:'overview',range:'all',options:{vault:true,authorizedWindows:windowsGrant.windows,allowedLanes:windowsGrant.lanes}});
+    assert.equal(windowsOverview.machine.totals.up,22);assert.equal(windowsOverview.machine.allPrograms.reduce((sum,row)=>sum+row.up,0),22);
+    assert.equal(windowsOverview.clash.available,false);assert.equal(windowsOverview.machine.allPrograms[0].connections,2);
+    const scopedHarness=(await reader.query({type:'harness',range:'all',options:{vault:true,authorizedWindows:windowsGrant.windows,allowedLanes:windowsGrant.lanes,lane:'windows',family:'codex',apps:{codex:['synthetic.exe']}}})).detail;
+    assert.equal(scopedHarness.summary.up,22);assert.equal(scopedHarness.processes[0].connections,2);
+    assert.equal((await reader.query({type:'harness',range:'all',options:{...options,lane:'windows',family:'codex'}})).detail.available,false);
   }finally{reader?.close();configureDatabaseKeys([]);await new Promise(resolve=>setTimeout(resolve,100));fs.rmSync(root,{recursive:true,force:true,maxRetries:10,retryDelay:100});}
 });

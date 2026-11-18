@@ -1,6 +1,5 @@
-import fs from 'node:fs';
-import path from 'node:path';
 import {signCommand} from './vault-commands.mjs';
+import {readRelayHealth} from './relay-health.mjs';
 
 export async function diagnosticRoute({req,url,json,vault,readJson,dataRoot,token}){
   if(!url.pathname.startsWith('/api/diagnostics'))return false;
@@ -13,7 +12,7 @@ export async function diagnosticRoute({req,url,json,vault,readJson,dataRoot,toke
       if(!actor.owner){json(200,{liveAvailable:false,message:'访客卡只查询授权日期内的记录。'});return true;}
       let collector=null,bypass=null;
       try{const response=await fetch('http://127.0.0.1:43132/api/health',{signal:AbortSignal.timeout(1200)});collector=await response.json();}catch{}
-      try{const value=JSON.parse(fs.readFileSync(path.join(dataRoot,'relay-bypass','status.json'),'utf8'));bypass={state:Date.now()-value.at>150000?'stale':value.state,at:value.at};}catch{}
+      bypass=readRelayHealth(dataRoot);
       vault.actor(token,{lane:'diagnostics',operation});json(200,{collector,bypass,liveAvailable:true});return true;
     }
     if(!vault.ready)throw new Error('vault_migrating');

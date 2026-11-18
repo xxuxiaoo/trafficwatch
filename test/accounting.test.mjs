@@ -93,3 +93,12 @@ test('invalid counters do not replace a valid baseline and cause the next sample
   a.consume(invalid, 11000, classify);
   assert.equal(a.consume(snapshot(150, 220), 12000, classify).codexUp, 50);
 });
+
+test('proxy client identity is retained in route metadata and separates reused connection IDs',()=>{
+  const accounting=new Accounting({preserveRouteMetadata:true});
+  const first=snapshot(500,700,'same-id',new Date(9000).toISOString());first.proxyClient='verge';first.connections[0].chains=['TAG-HK-1'];
+  const second=snapshot(600,900,'same-id',new Date(10500).toISOString());second.proxyClient='flclash';second.connections[0].chains=['TAG-HK-1'];
+  const a=accounting.consume(first,10000,classify),b=accounting.consume(second,11000,classify);
+  assert.notEqual(a.rows[0].key,b.rows[0].key);
+  assert.equal(JSON.parse(a.rows[0].rule).client,'verge');assert.equal(JSON.parse(b.rows[0].rule).client,'flclash');
+});

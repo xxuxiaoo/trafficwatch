@@ -1,5 +1,27 @@
 # Changelog
 
+## 0.10.13 — 2026-11-17
+
+- Separate proxy usage by client and exact client/node membership, so identically named nodes in Clash Verge and FlClash can belong to different airport groups. Keep rows without recorded client identity explicitly under legacy / unrecognized history.
+- Store airport group labels in the encrypted history settings and add owner-only management for creating, editing and removing groups. Show client and airport upload/download totals together, with filters that stay local to the ladder view.
+- Load the client/node inventory only when airport management opens, separate it from normal ladder filtering, and provide retry and incremental node-list controls.
+- Report the true statistics queue position and the active blocker stage. Cancel obsolete background refreshes when a foreground query needs the reader, while coalescing same-query work.
+- Mark filtered airport summaries as complete so client and airport filters render their results instead of remaining in a loading state.
+
+## 0.10.12 — 2026-11-17
+
+- Add a lightweight Harness query for exact family totals, process attribution and time charts, without reading destinations, node lists or connection pages. Reuse the encrypted process index for Windows queries. Display existing overview totals immediately, render each source as it completes, coalesce repeated family clicks, and discard abandoned responses.
+- Treat Mihomo's idle `connections: null` as an empty connection list, preserving global counters. Discover FlClash controllers and live credential changes from its settings, prefer the active TUN over an idle installed client, and rediscover the traffic source every ten seconds. Detect an active FlClash with its control interface closed instead of silently collecting an idle Verge core.
+- Apply relay exclusions to the selected client's own runtime with independent ownership records; preserve live settings and never reload Verge YAML into FlClash. Revalidate after a client change, check every reachable discovered core for relay connections, and retain the existing Windows physical DNS and exact routes.
+- Show healthy diagnosis capture and verified paths in green, failed bypass validation in red, and incomplete or stale checks in amber. Report safe failure codes, affected checks, the failed stage and previous successful verification separately. Protect all live details with the existing owner-session policy and clear them from visitor views.
+
+## 0.10.11 — 2026-11-17
+
+- Add a compact, persistent application lookup index inside the history database. Exact range-first attribution avoids fetching full connection/rule payloads for each application identity; encrypted histories keep the index encrypted. Existing histories build it once during opening and reuse it on later unlocks.
+- Show the current statistics stage, elapsed time, and measured processed/total attribution records. Percentages explicitly refer to the current stage; SQL phases with no measured denominator use an indeterminate indicator. Query progress is restricted to the unlocked owner session.
+- Stream source attribution into application totals while preserving scope boundaries, aliases, family evidence and exact connection counts. Small idle capture imports and repeated refresh clicks no longer interrupt the current overview query; completing a real backlog queues one subsequent refresh.
+- Stop the progress display on failure or lock, retain previously loaded totals on query errors, and preserve quick totals while application attribution is running.
+
 ## 0.10.10 — 2026-11-17
 
 - Add a protected relay-management page inside the traffic center. Add, edit, enable, disable and remove relay hostnames; save a restore point before each list change; restore a selected prior list or disable all managed bypass entries.

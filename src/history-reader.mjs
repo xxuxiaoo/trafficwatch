@@ -33,9 +33,12 @@ export class HistoryReader {
     if (this.closed || this.active || this.restarting || !this.queue.length) return;
     if (!this.worker) {
       const worker = this.worker = this.createWorker();
-      worker.on('message', ({ id, data, error, event, stage, lane }) => {
+      worker.on('message', ({ id, data, error, event, stage, lane, done, total, unit }) => {
         if (this.worker !== worker || id !== this.active?.id) return;
-        if(event==='progress'){this.active.stage=stage;this.active.lane=lane;return;}
+        if(event==='progress'){
+          if(this.active.stage!==stage||this.active.lane!==lane)this.active.stageStartedAt=Date.now();
+          Object.assign(this.active,{stage,lane,done,total,unit});return;
+        }
         if(!error)this.completed++;
         this.finish(error ? new Error(error) : null, data);
       });
@@ -43,13 +46,14 @@ export class HistoryReader {
       worker.on('error', failed); worker.on('exit', failed);
     }
     this.active = this.queue.shift();
-    this.active.startedAt=Date.now();this.active.stage='opening';
+    this.active.startedAt=Date.now();this.active.stageStartedAt=this.active.startedAt;this.active.stage='opening';
     this.timer = setTimeout(() => this.finish(new Error('history_timeout'), undefined, true), this.timeoutMs);
     this.worker.postMessage({ ...this.active.payload, id: this.active.id, now: Date.now() });
   }
   finish(error, data, replace = false) {
     clearTimeout(this.timer);
     const active = this.active; this.active = null;
+    if(active)this.lastTask={payload:active.payload,state:error?'error':'complete',error:error?.message,elapsedMs:Date.now()-active.startedAt,finishedAt:Date.now()};
     if(active&&error&&error.message!=='request_cancelled'){this.failed++;this.lastError=error.message;}
     else if(active&&!error)this.lastError=null;
     if (active) for (const subscriber of active.subscribers) {
@@ -62,6 +66,20 @@ export class HistoryReader {
   }
   stats() { return { active: Boolean(this.active), queued: this.queue.length, restarts: this.restarts, completed: this.completed, failed:this.failed,lastError:this.lastError,
     ...(this.active?{stage:this.active.stage,lane:this.active.lane,elapsedMs:Date.now()-this.active.startedAt}:{}) }; }
+  progressFor(selector) {
+    const matches=task=>task&&Object.entries(selector).every(([key,value])=>task.payload[key]===value);
+    if(matches(this.active)){
+      const {stage,lane,done,total,unit,startedAt,stageStartedAt}=this.active;
+      return {state:'running',stage,lane,done,total,unit,startedAt,elapsedMs:Date.now()-startedAt,stageElapsedMs:Date.now()-stageStartedAt};
+    }
+    const position=this.queue.findIndex(matches);
+    if(position>=0){
+      const blocker=this.active?{stage:this.active.stage,lane:this.active.lane,elapsedMs:Date.now()-this.active.startedAt}:this.restarting?{stage:'reader_restart'}:null;
+      return {state:'queued',position:position+1,ahead:position,blocker};
+    }
+    if(matches(this.lastTask)&&Date.now()-this.lastTask.finishedAt<60000){const {state,error,elapsedMs}=this.lastTask;return {state,error,elapsedMs};}
+    return {state:'idle'};
+  }
   close() {
     this.closed = true;
     for (const task of this.queue.splice(0)) for (const subscriber of task.subscribers) { subscriber.cleanup(); subscriber.reject(new Error('request_cancelled')); }

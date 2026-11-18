@@ -24,10 +24,10 @@ function renderState(){
   $('password').minLength=status.configured?0:10;$('confirmPassword').required=!status.configured;
   $('unlockButton').disabled=!status.configured&&!setupNonce;
   $('migrationPanel').hidden=status.ready||locked;
-  $('migrationTitle').textContent=phase==='migration'?'首次加密原有历史':phase==='import'?'正在补齐锁定期间的记录':'正在打开加密记录';
+  $('migrationTitle').textContent=phase==='migration'?'首次加密原有历史':phase==='index'?'首次准备应用查询索引':phase==='import'?'正在补齐锁定期间的记录':'正在打开加密记录';
   const progress=status.initialization||status.migration;
   const progressLane=progress?.lane==='windows'?'本机应用':'Clash';
-  $('migrationText').textContent=progress?.error?'处理暂停：'+progress.error:phase==='migration'?'正在处理 '+progressLane+' 的 '+(progress?.table||'原有历史')+' 记录。':phase==='import'?'正在导入'+progressLane+'采集的加密记录，完成后即可查看。':'正在打开加密数据库，已有历史保持加密。';
+  $('migrationText').textContent=progress?.error?'处理暂停：'+progress.error:phase==='index'?'正在为'+progressLane+'建立精简应用索引，后续解锁直接复用；原记录保持加密。':phase==='migration'?'正在处理 '+progressLane+' 的 '+(progress?.table||'原有历史')+' 记录。':phase==='import'?'正在导入'+progressLane+'采集的加密记录，完成后即可查看。':'正在打开加密数据库，已有历史保持加密。';
   $('migrationHint').textContent=phase==='migration'?'首次迁移验证及明文清理完成前，旧文件仍可能包含未加密的历史。':'这是本次解锁的准备工作。'+(returnTarget?'完成后将自动返回原页面。':'请稍候。');
   $('cleanupPanel').hidden=!status.ready||!status.plaintextCleanupPending;
   const cleanup=status.cleanup,running=cleanup?.state==='running';

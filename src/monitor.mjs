@@ -6,6 +6,7 @@ import { DemoSource } from './demo.mjs';
 import { AnomalyDetector } from './anomalies.mjs';
 import { DEFAULT_BUDGET, validateBudget } from './budgets.mjs';
 import { normalizeHarnessApps } from './harness.mjs';
+import { normalizeAirportGroups } from './airport-groups.mjs';
 
 export class Monitor {
   constructor(config, store, { now = Date.now } = {}) {
@@ -43,6 +44,9 @@ export class Monitor {
     this.config.harnessApps = apps;
     this.observer.setHarnessApps(apps);
     return apps;
+  }
+  setAirportGroups(value) {
+    const groups=normalizeAirportGroups(value);this.store.set('airportGroups',groups);return groups;
   }
   openGap(reason, from) {
     if (!this.gaps.has(reason)) this.gaps.set(reason, this.store.openGap?.(reason, from));

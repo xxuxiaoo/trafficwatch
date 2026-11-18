@@ -52,23 +52,24 @@ test('removing an owned relay rule restores only its original rules and retains 
 
 test('changed relay lists force fresh physical checks and disabling the final target removes managed state',async()=>{
   const root=fs.mkdtempSync(path.join(os.tmpdir(),'tw-relay-cycle-')),adapter={index:10,address:'192.0.2.40',gateway:'192.0.2.1',name:'Synthetic Ethernet',ipv6:[]};
-  const calls=[],settings={DataRoot:root,RelayHosts:['old.example.test']};let probes=0,failResolve=false;
+  const calls=[],settings={DataRoot:root,RelayHosts:['old.example.test']};let probes=0,failResolve=false,client='verge';
   const services={
     discoverPhysical:async()=>adapter,
     physicalDns:async host=>{if(failResolve&&host==='new.example.test')throw new Error('dns_unavailable');return {at:Date.now(),records:[{type:'A',ip:host==='old.example.test'?'93.184.216.34':'93.184.216.35',ttl:600}],cnames:[],ipv6Records:[]};},
     runNetworkScript:async(_script,action,input)=>{calls.push(action);return [{ok:true,checks:input?JSON.parse(fs.readFileSync(input,'utf8')).targets.flatMap(target=>target.ips.map(ip=>({ip,physical:true}))):[]}];},
     applyClashOverlay:async(_settings,options)=>{calls.push(options.rollback?'overlay-rollback':'overlay-apply');return {state:'applied'};},
-    productionController:async()=>({candidate:{}}),controllerCall:async()=>({connections:[]}),
+    productionController:async()=>({candidate:{client}}),controllerCall:async()=>({connections:[]}),
     lookup:async host=>({address:host==='old.example.test'?'93.184.216.34':'93.184.216.35'}),
     probeRelay:async(host,ip,_adapter,{onConnected})=>{probes++;onConnected({host,ip,sourcePort:45000});return {source:adapter.address,phase:'complete',status:401};},
   };
   try{
-    const first=await bypassCycle(settings,{services});assert.equal(first.state,'verified');assert.equal(probes,1);
+    const first=await bypassCycle(settings,{services});assert.equal(first.state,'verified');assert.equal(probes,2);assert.equal(first.checks[0].ordinaryVerified,true);
+    client='flclash';const switched=await bypassCycle(settings,{services});assert.equal(switched.state,'verified');assert.equal(probes,4,'switching clients forces new bound and ordinary connection evidence');
     const initial=readRelayTargetConfig(root,settings.RelayHosts);
     saveRelayTargets(root,[...initial.targets,{name:'new',host:'new.example.test'}],{legacyHosts:settings.RelayHosts});
     failResolve=true;await assert.rejects(bypassCycle(settings,{services}),/relay_resolution_incomplete/);
     assert.deepEqual(JSON.parse(fs.readFileSync(path.join(root,'relay-bypass','targets.json'),'utf8')).targets.map(target=>target.host),['old.example.test']);
-    failResolve=false;const added=await bypassCycle(settings,{services});assert.equal(added.checks.length,2);assert.equal(added.state,'verified');assert.equal(probes,3);
+    failResolve=false;const added=await bypassCycle(settings,{services});assert.equal(added.checks.length,2);assert.equal(added.state,'verified');assert.equal(probes,8);
     saveRelayTargets(root,readRelayTargetConfig(root).targets.map(target=>({...target,enabled:false})));
     const disabled=await bypassCycle(settings,{services});assert.equal(disabled.state,'rolled_back');assert.deepEqual(disabled.targets,[]);assert.deepEqual(calls.slice(-2),['overlay-rollback','Rollback']);
     assert.deepEqual(JSON.parse(fs.readFileSync(path.join(root,'relay-bypass','targets.json'),'utf8')).targets,[]);

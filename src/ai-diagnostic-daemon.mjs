@@ -143,7 +143,7 @@ export async function startAiDiagnostics({settings=readSettings()}={}){
       }
     }
     updateTraceTargets();
-    if(!controller)try{controller=(await productionController(settings)).candidate;}catch{}
+    try{controller=(await productionController(settings)).candidate;}catch{controller=null;}
     if(controller)try{
       const [connections,config]=await Promise.all([controllerCall(controller,'/connections'),controllerCall(controller,'/configs')]);
       const rows=connections.connections.filter(connection=>settings.RelayHosts.includes(connection.metadata?.host)).map(connection=>({host:connection.metadata.host,source:connection.metadata.sourceIP,sourcePort:connection.metadata.sourcePort,destination:connection.metadata.destinationIP,chains:connection.chains,rule:connection.rule,upload:connection.upload,download:connection.download}));

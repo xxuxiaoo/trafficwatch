@@ -3,12 +3,34 @@ import assert from 'node:assert/strict';
 import { EventEmitter } from 'node:events';
 import path from 'node:path';
 import fs from 'node:fs';
-import { readLane, readDetail } from '../src/overview-data.mjs';
+import { readLane, readDetail,readHarness,readLadder,readLadderNodes } from '../src/overview-data.mjs';
 import { HistoryReader } from '../src/history-reader.mjs';
 import { initializeArchives,attachArchiveViews,setArchiveWindows } from '../src/history-archive.mjs';
-import { fixture, BASE, MINUTE, record, connection } from './history-synthetic-fixtures.mjs';
+import { fixture, BASE, MINUTE, record, connection,rule } from './history-synthetic-fixtures.mjs';
 const HOUR = 60 * MINUTE;
 function normalize(rows) {return [...rows].sort((a,b)=>JSON.stringify([a.process,a.scope,a.family]).localeCompare(JSON.stringify([b.process,b.scope,b.family])));}
+
+test('lightweight harness queries exactly match full details for aliases, scoped unknown history, repeated identities and proxy routes',t=>{
+  const f=fixture(t);
+  for(const lane of ['windows','clash']){
+    const store=f.open(lane);initializeArchives(store);
+    for(const offset of [MINUTE,HOUR+MINUTE,2*HOUR+MINUTE])record(store,BASE+offset,[
+      connection('legacy',1,2,{process:'renamed.exe',scope:'codex',rule:rule()}),
+      connection('script',3,4,{process:'node.exe',family:'dsh',familyRoot:'script:dsh',rule:rule()}),
+      connection('alias',5,6,{process:'my-claude.exe',rule:rule(['DIRECT'])}),
+      connection('unknown',7,8,{process:'codex.exe',scope:'unknown',rule:rule()}),
+    ]);
+    const now=BASE+3*HOUR,options={from:BASE+2*MINUTE,to:now,apps:{codex:['codex.exe'],claude:['my-claude.exe'],dsh:['dsh.exe']}};
+    for(const family of ['codex','claude','dsh']){
+      const request={...options,family,...(lane==='clash'?{route:'proxy'}:{})};
+      const full=readDetail(f.root,lane,'all',now,request),light=readHarness(f.root,lane,'all',now,request);
+      assert.deepEqual({...light.summary},{...full.summary});assert.deepEqual(light.series.map(({at,up,down})=>({at,up,down})),full.series.map(({at,up,down})=>({at,up,down})));
+      assert.deepEqual(normalize(light.processes),normalize(full.processes));assert.deepEqual(light.observation,full.observation);
+      if(lane==='clash')assert.deepEqual(light.routeTotals,full.routeTotals);
+      assert.equal(Object.hasOwn(light,'connections'),false);assert.equal(Object.hasOwn(light,'destinations'),false);
+    }
+  }
+});
 
 test('durable rollups exactly preserve interval edges, distinct connections, scopes, aliases and new traffic', t=>{
   const f = fixture(t), store=f.open('windows'),cacheRoot=path.join(f.root,'viewer-cache');
@@ -46,6 +68,33 @@ test('quick overview includes real totals and marks pending attribution instead 
   const quick=readLane(f.root,'windows','all',BASE+MINUTE,{quick:true});
   assert.equal(quick.detailReady,false);assert.equal(quick.totals.up,12);assert.equal(quick.totals.down,34);assert.equal(quick.timeline.length,1);
 });
+
+test('proxy history separates clients and explicitly grouped airports without reclassifying legacy rows',t=>{
+  const f=fixture(t),store=f.open('clash');initializeArchives(store);
+  store.set('airportGroups',[{id:'tag',name:'TAG机场',members:[{client:'verge',node:'TAG-HK-1'},{client:'flclash',node:'TAG-HK-1'}]}]);
+  record(store,BASE+MINUTE,[
+    connection('verge-tag',10,20,{rule:rule(['TAG-HK-1'],{client:'verge'})}),
+    connection('fl-tag',30,40,{rule:rule(['TAG-HK-1'],{client:'flclash'})}),
+    connection('verge-other',50,60,{rule:rule(['Other-HK'],{client:'verge'})}),
+    connection('legacy-node',70,80,{rule:rule(['Old-HK'])}),
+  ]);
+  const now=BASE+3*HOUR,all=readLane(f.root,'clash','all',now);
+  assert.deepEqual(all.airportUsage.map(row=>JSON.stringify([row.client,row.airport,row.up,row.down])).sort(),[
+    ['legacy','',70,80],['flclash','tag',30,40],['verge','',50,60],['verge','tag',10,20],
+  ].map(row=>JSON.stringify(row)).sort());
+  const inventory=readLadderNodes(f.root,'all',now);
+  assert.equal(Object.hasOwn(readLadder(f.root,'all',now),'clientNodes'),false,'normal ladder queries leave the node inventory scan for the manager');
+  assert.deepEqual(inventory.clientNodes.map(row=>[row.client,row.name]).sort((a,b)=>a[0].localeCompare(b[0])||a[1].localeCompare(b[1])),[
+    ['flclash','TAG-HK-1'],['verge','Other-HK'],['verge','TAG-HK-1'],
+  ].sort((a,b)=>a[0].localeCompare(b[0])||a[1].localeCompare(b[1])));
+  const tagged=readLane(f.root,'clash','all',now,{client:'verge',airport:'tag'});
+  assert.deepEqual({up:tagged.groups.proxy.up,down:tagged.groups.proxy.down},{up:10,down:20});
+  const ladder=readLadder(f.root,'all',now,{client:'flclash',airport:'tag'});
+  assert.equal(ladder.detailReady,true,'a completed filtered ladder query must not leave the airport list in its loading state');
+  assert.equal(ladder.groups.proxy.up,30);assert.equal(ladder.airportUsage[0].client,'flclash');assert.equal(ladder.airportUsage[0].airport,'tag');
+  const detail=readDetail(f.root,'clash','all',now,{client:'flclash',airport:'tag',route:'proxy'});
+  assert.equal(detail.summary.up,30);assert.equal(detail.connections[0].client,'flclash');assert.equal(detail.connections[0].airport,'tag');
+});
 test('a broken disposable cache falls back to source records without hiding history',t=>{
   const f=fixture(t),store=f.open('windows');
   record(store,BASE+MINUTE,[connection('retained',11,22)]);
@@ -60,10 +109,27 @@ test('large connection dictionaries return exact attribution without building an
   store.db.exec('BEGIN');
   for(let i=0;i<count;i++){const id='large-synthetic-'+i;insert.run(id,'synthetic.example.test','tcp',i%2?'codex.exe':'browser.exe',1,'other','etw',at,at,'{}');bucket.run(at,id,'other',2,3,at);}
   store.db.prepare('INSERT INTO samples VALUES(?,?,?,?,?,?,?,?,?)').run(at,1000,0,0,count*2,count*3,0,0,'[]');store.db.exec('COMMIT');
-  const result=readLane(f.root,'windows','all',BASE+3*HOUR,{cacheRoot});
+  const progress=[],result=readLane(f.root,'windows','all',BASE+3*HOUR,{cacheRoot,report:value=>progress.push(value)});
   assert.equal(result.available,true);assert.equal(result.detailReady,true);assert.equal(result.allPrograms.reduce((n,r)=>n+r.up,0),count*2);
   assert.equal(result.allPrograms.reduce((n,r)=>n+r.down,0),count*3);assert.equal(result.allPrograms.reduce((n,r)=>n+r.connections,0),count);
   assert.equal(result.familyTotals.codex.up,Math.floor(count/2)*2);assert.equal(fs.existsSync(cacheRoot),false);
+  const attribution=progress.filter(value=>value.unit==='identities');
+  assert.equal(attribution[0].done,0);assert.equal(attribution[0].total,count);assert.equal(attribution.at(-1).done,count);
+  assert(attribution.every((value,index)=>value.total===count&&(!index||value.done>=attribution[index-1].done)));
+});
+
+test('an existing encrypted history gains and reuses the compact program index without changing records',async t=>{
+  const {randomBytes}=await import('node:crypto'),{Store}=await import('../src/store.mjs');
+  const f=fixture(t),dir=path.join(f.root,'windows'),key=randomBytes(32);let store=new Store(dir,{encryptionKey:key});
+  t.after(()=>{try{store.close();}catch{}key.fill(0);});
+  record(store,BASE+MINUTE,[connection('encrypted-identity',12,34,{process:'private-program-canary.exe'})]);
+  const before=store.db.prepare('SELECT * FROM connections').all();store.db.exec('DROP INDEX connections_programs');store.close();
+  const progress=[];store=new Store(dir,{encryptionKey:key,onProgress:value=>progress.push(value)});
+  assert.deepEqual(store.db.prepare('SELECT * FROM connections').all(),before);assert.equal(progress[0].stage,'program_index');
+  const plan=store.db.prepare('EXPLAIN QUERY PLAN SELECT id,process,evidence FROM connections INDEXED BY connections_programs WHERE id=?').all('encrypted-identity').map(row=>row.detail).join('\n');
+  assert.match(plan,/COVERING INDEX connections_programs/);store.close();
+  store=new Store(dir,{encryptionKey:key,onProgress:()=>assert.fail('a later opening must reuse the existing index')});store.close();
+  for(const name of fs.readdirSync(dir))assert.equal(fs.readFileSync(path.join(dir,name)).includes(Buffer.from('private-program-canary.exe')),false,'index contents stay encrypted');
 });
 
 test('an empty archive uses the real bucket index for detail lookups',t=>{
@@ -87,6 +153,21 @@ test('reader deduplicates equal queries and removes abandoned queued work', asyn
     const rejected=assert.rejects(abandoned,/request_cancelled/);cancel.abort();await rejected;
     assert.equal(reader.stats().queued,0);assert.equal(workers[0].sent.length,1);
     workers[0].complete({amount:100});assert.deepEqual(await first,{amount:100});assert.deepEqual(await shared,{amount:100});
+  }finally{reader.close();}
+});
+test('query progress tracks the selected range, real counters, queues and completion without exposing query payloads',async()=>{
+  const worker=new FakeWorker(),reader=new HistoryReader({}, {createWorker:()=>worker});
+  try{
+    const first=reader.query({type:'overview',range:'today',options:{privateValue:'synthetic-canary'}});
+    const queued=reader.query({type:'overview',range:'7d'});
+    const waiting=reader.progressFor({type:'overview',range:'7d'});assert.equal(waiting.state,'queued');assert.equal(waiting.position,1);assert.equal(waiting.ahead,0);assert.equal(waiting.blocker.stage,'opening');
+    worker.emit('message',{id:worker.sent.at(-1).id,event:'progress',stage:'programs',lane:'windows',done:2048,total:4096,unit:'identities'});
+    const progress=reader.progressFor({type:'overview',range:'today'});
+    assert.equal(progress.done,2048);assert.equal(progress.total,4096);assert.equal(progress.stage,'programs');assert.equal(progress.state,'running');
+    assert.equal(JSON.stringify(progress).includes('synthetic-canary'),false);
+    assert.equal(reader.progressFor({type:'overview',range:'day',date:'2026-11-10'}).state,'idle');
+    worker.complete();await first;assert.equal(reader.progressFor({type:'overview',range:'today'}).state,'complete');
+    worker.complete();await queued;
   }finally{reader.close();}
 });
 test('a query timeout terminates its worker and the next request recovers without a service restart', async()=>{

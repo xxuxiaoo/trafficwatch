@@ -12,6 +12,7 @@ import { storageSnapshot,saveStoragePolicy,storagePolicy,archiveOldHistory,tidyB
 import { compactHistory } from './storage-compaction.mjs';
 import { DiagnosticHistory } from './ai-diagnostic-store.mjs';
 import {importBudgetMs,measureImportProgress} from './import-progress.mjs';
+import {normalizeAirportGroups} from './airport-groups.mjs';
 
 const {dataRoot,metadata,secrets}=workerData,stores=new Map();
 const entries=vaultKeyEntries(dataRoot,secrets);
@@ -120,7 +121,10 @@ try {
       if(compacting&&action!=='storage-status')throw new Error('vault_storage_busy');
       const store=stores.get(lane||'windows');if(!store)throw new Error('invalid_lane');
       let result;
-      if(action==='storage-status'){
+      if(action==='airport-groups-set'){
+        if((lane||'windows')!=='clash')throw new Error('invalid_lane');
+        const groups=normalizeAirportGroups(request.groups);store.set('airportGroups',groups);result={groups};
+      }else if(action==='storage-status'){
         if(!compacting&&(!lastSnapshot||Date.now()-lastSnapshot.generatedAt>=60000||request.fresh))lastSnapshot=storageSnapshot(dataRoot,stores,storageJob);
         result={...lastSnapshot,job:storageJob};
       }else if(action==='storage-policy'){

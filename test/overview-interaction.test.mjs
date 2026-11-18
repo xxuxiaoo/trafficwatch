@@ -55,3 +55,27 @@ test('an interactive detail finishes while a whole-range overview is still runni
   assert.equal(readers.get('detail').stats().completed,1);
   releaseOverview();await overview;
 });
+
+test('airport and client selection uses a separate bounded ladder query and loads node inventory only on demand',async t=>{
+  const f=fixture(t);let ladderRequest,ladderNodesRequest;const readers=new Map();
+  class ReaderWorker extends EventEmitter{
+    constructor(role){super();this.role=role;}
+    postMessage(message){
+      const data=message.type==='apps'?{apps:{codex:['codex.exe'],claude:[],dsh:[]}}:{detail:{available:true,lane:'clash',groups:{proxy:{up:12,down:34},direct:{up:0,down:0},unknown:{up:0,down:0}},airportUsage:[{client:'flclash',airport:'tag',up:12,down:34,connections:1}],clientNodes:[{client:'flclash',name:'TAG-HK-1'}],routeTimeline:[],routePrograms:{proxy:[]},routeDomains:{proxy:[]},routeNodes:{proxy:[]},range:{from:1000,to:2000,intervalMs:60000}}};
+      if(message.type==='ladder')ladderRequest=message;
+      if(message.type==='ladder-nodes')ladderNodesRequest=message;
+      queueMicrotask(()=>this.emit('message',{id:message.id,data}));
+    }
+    terminate(){return Promise.resolve(0);}
+  }
+  const port=await freePort(),app=startOverviewServer({historyRoot:f.root,listenPort:port,sourcePorts:[await freePort(),await freePort()],guardFactory:callback=>({start(){callback({state:'unlocked'});},close(){}}),readerFactory:(data,options,role)=>{
+    const reader=new HistoryReader(data,{...options,createWorker:()=>new ReaderWorker(role)});readers.set(role,reader);return reader;
+  }});
+  t.after(()=>app.close());await new Promise(resolve=>app.server.listening?resolve():app.server.once('listening',resolve));
+  const base='http://127.0.0.1:'+port,headers={'x-codex-flow':'1'},response=await fetch(base+'/api/ladder?range=7d&client=flclash&airport=tag',{headers});
+  assert.equal(response.status,200);assert.equal((await response.json()).airportUsage[0].client,'flclash');
+  assert.equal(ladderRequest.type,'ladder');assert.equal(ladderRequest.options.client,'flclash');assert.equal(ladderRequest.options.airport,'tag');assert.equal(ladderRequest.options.lane,'clash');
+  const inventory=await fetch(base+'/api/ladder/nodes?range=7d',{headers});assert.equal(inventory.status,200);assert.equal((await inventory.json()).clientNodes[0].name,'TAG-HK-1');
+  assert.equal(ladderNodesRequest.type,'ladder-nodes');assert.equal(ladderNodesRequest.options.lane,'clash');
+  assert.equal((await fetch(base+'/api/ladder?client=verge&airport=bad%20value',{headers})).status,400);
+});

@@ -23,9 +23,15 @@ test('HTTP routes enforce password, source scope, exact dates, notes privileges,
     const call=async(route,{body,token}={})=>{const response=await fetch(`http://127.0.0.1:${port}${route}`,{method:body===undefined?'GET':'POST',headers:{'x-codex-flow':'1',...(token?{Authorization:'Bearer '+token}:{}),...(body===undefined?{}:{'content-type':'application/json'})},...(body===undefined?{}:{body:JSON.stringify(body)})});return {status:response.status,data:await response.json()};};
     const relayPage=await fetch(`http://127.0.0.1:${port}/relays`);assert.equal(relayPage.status,200);assert.match(await relayPage.text(),/中转直连/);
     assert.equal((await call('/api/overview?range=all')).status,423);
+    assert.equal((await call('/api/overview-progress?range=all')).status,423);
     const unlocked=await call('/api/vault/unlock',{body:{password:'synthetic-only-password'}});assert.equal(unlocked.status,200);const owner=unlocked.data.token;
     assert(unlocked.data.sessionExpiresAt>Date.now());assert.equal((await call('/api/vault/session',{token:owner})).data.owner,true);
     for(let attempt=0;attempt<80&&!app.vault.ready;attempt++)await new Promise(resolve=>setTimeout(resolve,50));assert.equal(app.vault.ready,true,JSON.stringify(app.vault.status()));
+    const airportGroups=[{id:'tag-group',name:'TAG机场',members:[{client:'verge',node:'TAG-HK-1'},{client:'flclash',node:'TAG-HK-1'}]}];
+    const savedAirports=await call('/api/airport-groups',{token:owner,body:{groups:airportGroups}});assert.equal(savedAirports.status,200,JSON.stringify(savedAirports.data));assert.deepEqual(savedAirports.data.groups,airportGroups);
+    assert.deepEqual((await call('/api/airport-groups',{token:owner})).data.groups,airportGroups);
+    assert.equal((await call('/api/airport-groups')).status,423,'airport/node labels are private encrypted settings');
+    const invalidAirports=await call('/api/airport-groups',{token:owner,body:{groups:[{id:'unsafe',name:'invalid',members:[{client:'unknown',node:'proxy-node'}]}]}});assert.equal(invalidAirports.status,400);assert.equal(invalidAirports.data.error,'invalid_airport_member');
     app.vault.ready=false;
     try{
       assert.equal((await call('/api/overview?range=all',{token:owner})).status,503);
@@ -33,6 +39,7 @@ test('HTTP routes enforce password, source scope, exact dates, notes privileges,
       assert.equal((await call('/api/live',{token:owner})).status,200);
       assert.equal((await call('/api/diagnostics/status',{token:owner})).status,200);
       assert.equal((await call('/api/ai/session',{token:owner})).data.owner,true);
+      const queryProgress=await call('/api/overview-progress?range=all',{token:owner});assert.equal(queryProgress.status,200);assert.equal(queryProgress.data.ready,false);
     }finally{app.vault.ready=true;}
     const relayList=await call('/api/relay-targets',{token:owner});assert.equal(relayList.status,200);assert.deepEqual(relayList.data.targets.map(target=>target.host),['relay.example.test']);
     assert.equal((await call('/api/relay-targets',{body:{action:'save',targets:[]}})).status,423,'relay configuration requires the unlocked owner');
@@ -49,8 +56,11 @@ test('HTTP routes enforce password, source scope, exact dates, notes privileges,
     const claimed=(await call('/api/ai/claim',{body:request})).data;const token=claimed.token;
     assert.equal((await call('/api/relay-targets',{token})).status,423,'AI visitor cards cannot change network routing');
     assert.equal((await call('/api/vault/session',{token})).status,423,'AI credentials never restore the owner UI');
+    assert.equal((await call('/api/overview-progress?range=all',{token})).status,423,'owner-query telemetry is not exposed through visitor cards');
     const overview=await call('/api/overview?range=all',{token});assert.equal(overview.status,200);assert.equal(overview.data.clash.totals.up,22);assert.equal(overview.data.machine.available,false);
     assert.equal((await call('/api/detail?lane=windows&range=all',{token})).status,423);
+    assert.equal((await call('/api/harness?lane=windows&range=all&family=codex',{token})).status,423);
+    assert.equal((await call('/api/harness?lane=clash&range=all&family=codex',{token})).status,200);
     assert.equal((await call('/api/detail?lane=clash&range=all&export=1',{token})).status,423);
     const note={at:Date.parse('2026-11-10T12:00:00+08:00'),title:'test note',body:'synthetic'};
     assert.equal((await call('/api/ai/notes',{token,body:{action:'create',lane:'clash',note}})).status,200);

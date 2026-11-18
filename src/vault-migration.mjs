@@ -21,7 +21,7 @@ export function vaultKeyEntries(dataRoot, secrets, cacheRoot) {
 export async function migrateLane(dataRoot, lane, key, { signal, progress = () => {} } = {}) {
   const dir = path.join(dataRoot,lane), sourceFile = path.join(dir,'monitor.sqlite');
   recoverCompaction(path.join(dir,'history.vault.sqlite'));
-  const target = new Store(dir, { filename: 'history.vault.sqlite', encryptionKey: key });
+  const target = new Store(dir, { filename: 'history.vault.sqlite', encryptionKey: key,onProgress:()=>progress({lane,phase:'index',table:'应用查询索引'}) });
   finishRecoveredCompaction(path.join(dir,'history.vault.sqlite'),target.db);
   target.db.exec('CREATE TABLE IF NOT EXISTS vault_migration(name TEXT PRIMARY KEY,cursor INTEGER NOT NULL,done INTEGER NOT NULL DEFAULT 0)');
   if(target.db.prepare("SELECT done FROM vault_migration WHERE name='complete'").get()?.done) return target;

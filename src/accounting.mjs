@@ -37,7 +37,8 @@ export class Accounting {
         continue;
       // Native IDs already contain helper generation, process birth and endpoints.
       // Its start timestamp belongs to each drained ETW window, not the connection.
-      const key = snapshot.incremental && c.metadata?.native ? c.id : `${c.id}:${c.start || ''}`;
+      const proxyClient=this.preserveRouteMetadata&&!c.metadata?.native&&['verge','flclash','mihomo'].includes(snapshot.proxyClient)?snapshot.proxyClient:'';
+      const key = snapshot.incremental && c.metadata?.native ? c.id : `${c.id}:${c.start || ''}${proxyClient?`:client:${proxyClient}`:''}`;
       const old = this.previous.get(key);
       const rawUp = finiteBytes(c.upload),
         rawDown = finiteBytes(c.download);
@@ -86,6 +87,7 @@ export class Accounting {
         rawDown,
         rule: this.preserveRouteMetadata
           ? JSON.stringify({ source: c.metadata?.native ? 'windows' : 'mihomo',
+              client: proxyClient,
               type: String(c.rule || ''), payload: c.rulePayload || '', chains: c.chains || [],
               localIP: c.metadata?.sourceIP || '', localPort: c.metadata?.sourcePort || 0,
               destinationIP: c.metadata?.destinationIP || '', destinationPort: c.metadata?.destinationPort || 0,

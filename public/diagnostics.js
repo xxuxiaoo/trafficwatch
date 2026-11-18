@@ -1,5 +1,6 @@
 import {initializeVault,vaultHeaders,checkVaultResponse,importProgressText} from './vault-browser.mjs';
 import {tcpOperationCategory,summarizeTcpRetries} from './tcp-evidence.mjs';
+import {diagnosticHealth} from './diagnostic-health.mjs';
 const $=id=>document.getElementById(id),node=(tag,text='',className='')=>{const element=document.createElement(tag);element.textContent=text;if(className)element.className=className;return element;};
 const date=new Intl.DateTimeFormat('zh-CN',{timeZone:'Asia/Shanghai',month:'2-digit',day:'2-digit',hour:'2-digit',minute:'2-digit',second:'2-digit',hour12:false});
 const labels={incident:'故障现场',request:'真实请求',probe:'独立探测',route:'物理路径',gap:'采集缺口',resource:'采集器负载',status:'状态',log:'Magpie 日志',mark:'手动标记',tcp:'TCP 事件',success:'成功',reachable:'可连通',eof:'EOF / 断流',gateway_error:'502 / 504',reset:'连接重置',tls_error:'TLS 错误',dns_error:'DNS 错误',timeout:'超时',upstream_busy:'503 繁忙',rate_limit:'429 限流',cancelled:'取消',pending:'尚未结束',server_error:'服务端错误',http_rejected:'HTTP 拒绝',recording:'仍在取证',complete:'现场完整保存',interrupted:'记录中断',verified:'物理绕行已验证',degraded:'部分验证未通过',route_checked:'路由已检查，等待连接验证',stale:'需重新验证',rolled_back:'已恢复原 DIRECT 路径',stopped:'已停止',unavailable:'不可用',waiting_for_targets:'等待目标地址',in_use_by_other:'其他程序正在使用',foreign_filters_present:'已有其他筛选器',manual:'手动标记',diagnostics_started:'诊断启动 / 前段未记录',trace_dropped_events:'ETW 有丢失事件',trace_stopped:'ETW 助手停止',socket:'连接进度',retransmit:'TCP 重传'};
@@ -69,10 +70,16 @@ function clearDetail(){
   const empty=node('div','','detail-empty');empty.append(node('span','⌁'),node('strong','选择一条记录查看详情'),node('p','左侧列出匹配记录，这里显示请求阶段和现场时间线。'));$('detail').replaceChildren(empty);
 }
 function renderStatus(value){
-  if(value.liveAvailable===false){$('collector').textContent='按授权查看历史';$('bypass').textContent='实时信息未授权';return;}
-  const state=value.collector;$('collector').textContent=state?.state==='recording'?'正在持续取证':'诊断后台未运行';
-  $('capture').textContent=state?'TCP：'+label(state.trace)+' · PktMon：'+label(state.pktmon)+' · '+Math.round(state.resources.rssBytes/1048576)+' MiB':'历史仍可查询；可从桌面控制台启动诊断';
-  $('bypass').textContent=value.bypass?label(value.bypass.state):'尚未启用 / 无状态';$('bypassTime').textContent=value.bypass?'最后检查 '+date.format(value.bypass.at):'不会自动改走付费节点';
+  const health=diagnosticHealth(value);
+  for(const id of ['collector','bypass']){const target=$(id),item=health[id];target.textContent=item.title;target.dataset.tone=item.tone;target.closest('.diagnostic-health>div').dataset.tone=item.tone;}
+  const state=value.collector;
+  $('capture').textContent=value.liveAvailable!==false&&state?health.collector.detail+' · TCP：'+label(state.trace)+' · PktMon：'+label(state.pktmon)+(Number.isFinite(state.resources?.rssBytes)?' · '+Math.round(state.resources.rssBytes/1048576)+' MiB':''):health.collector.detail;
+  $('bypassTime').textContent=health.bypass.detail;
+  const facts=$('bypassFacts');facts.replaceChildren();
+  for(const reason of health.bypass.reasons.slice(1))facts.append(node('li',reason));
+  if(health.bypass.at)facts.append(node('li','最近检查 '+date.format(health.bypass.at)+(health.bypass.stage?' · '+health.bypass.stage:'')));
+  if(health.bypass.lastVerifiedAt&&health.bypass.tone!=='good')facts.append(node('li','上次完整通过 '+date.format(health.bypass.lastVerifiedAt)+'；不代表本次通过'));
+  $('bypassDetails').hidden=!facts.children.length;
 }
 function renderCollection(value){
   const check=value.rows?.[0];
