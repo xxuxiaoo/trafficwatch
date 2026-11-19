@@ -3,7 +3,18 @@ const roundRate=value=>round(Math.max(0,value));
 
 export function importBudgetMs(remaining){
   if(!Number.isSafeInteger(remaining)||remaining<200)return 25;
-  return remaining>=2000?75:50;
+  // Large backlogs spend most wall time committing encrypted transactions;
+  // larger slices amortize those commits. Near the end, yield more often.
+  return remaining>=2000?300:120;
+}
+
+export function importBatchLimit(remaining){
+  if(!Number.isSafeInteger(remaining)||remaining<200)return 32;
+  return remaining>=2000?512:192;
+}
+
+export function shouldCheckImportBudget({now,lastChecked=0,wasPending,pending,intervalMs=60000}={}){
+  return now-lastChecked>=intervalMs||wasPending&&!pending;
 }
 
 export function measureImportProgress(points,now,remaining,{windowMs=30000,minWindowMs=5000}={}){

@@ -185,29 +185,60 @@ function setView(next,{resumeDetails=true}={}) {
 }
 for (const button of document.querySelectorAll('[data-view-button]')) button.addEventListener('click', () => setView(button.dataset.viewButton));
 
+function proxyStatusLabel(proxy) {
+  if (proxy.state === 'partial') return proxy.routeClient ? `${proxyClientName(proxy.routeClient)} 接管 · 控制器不可读` : '部分控制器不可读';
+  if (proxy.routing === 'multiple') return '多张 TUN 网卡接管';
+  if (proxy.routeClient) {
+    const name = proxyClientName(proxy.routeClient);
+    if (proxy.state === 'multiple') return `${name} 接管 · 两边均有记录`;
+    return proxy.clients?.some(item => item.client === proxy.routeClient && item.deltaBytes > 0)
+      ? `${name} 接管 · 有流量` : `${name} 接管 · 当前空闲`;
+  }
+  if (proxy.state === 'multiple') return '多个客户端同时有流量';
+  if (proxy.client && proxy.state === 'active') return `${proxyClientName(proxy.client)} 有流量`;
+  if (proxy.routing === 'none') return '未发现 TUN 接管';
+  if (proxy.state === 'unavailable') return '控制器未连接';
+  if (proxy.clients?.some(item => item.reachable)) return '控制器在线 · 接管待确认';
+  return '';
+}
 function setSourceStatus(id, live, expected) {
   const target = $(id);
   const fresh = live?.state === 'connected' && live.capture?.active === expected &&
     Number.isFinite(live.lastAt) && Date.now() >= live.lastAt && Date.now() - live.lastAt < (live.intervalMs || 1000) + 6000;
   const mismatch = live && live.capture?.active && live.capture.active !== expected;
+  const proxy=live?.capture?.proxy;
+  const proxyFresh=expected==='mihomo'&&Number.isFinite(proxy?.observedAt)&&Date.now()>=proxy.observedAt&&Date.now()-proxy.observedAt<(live?.intervalMs||1000)+6000;
+  const uncertain=proxyFresh&&(proxy.state==='partial'||proxy.routing==='multiple');
   const label = fresh ? '正在采集' : mismatch ? '采集来源不符' : live ? '采集已断开' : '采集未连接';
-  const className = `status-chip ${expected === 'mihomo' ? 'proxy-chip' : ''} ${fresh ? 'is-live' : 'is-offline'}`;
+  const className = `status-chip ${expected === 'mihomo' ? 'proxy-chip' : ''} ${uncertain?'is-warning':fresh?'is-live':'is-offline'}`;
   if (target.className !== className) target.className = className;
   const speed = expected === 'native' ? Number(live?.allUpRate || 0) + Number(live?.allDownRate || 0) : total(live?.routeRates?.proxy);
+  let text=`${expected === 'native' ? '本机' : '梯子'} · ${fresh ? bytes(speed, '/s') : label}`;
+  const proxyLabel=proxyFresh?proxyStatusLabel(proxy):'';
+  if(proxyLabel)text=`梯子 · ${proxyLabel}`;
   if (target.lastElementChild?.tagName !== 'SPAN') {
     const indicator = node('i'); indicator.setAttribute('aria-hidden', 'true');
     target.replaceChildren(indicator, node('span'));
   }
-  setText(target.lastElementChild, `${expected === 'native' ? '本机' : '梯子'} · ${fresh ? bytes(speed, '/s') : label}`);
-  setAttribute(target, 'title', fresh ? `最近采样 ${time(live.lastAt, true)}` : (live?.error || '当前显示历史记录'));
+  setText(target.lastElementChild,text);
+  const clientStates=Array.isArray(proxy?.clients)?proxy.clients.map(item=>{
+    const tun=item.tunEnabled===true?'TUN 配置开启':item.tunEnabled===false?'TUN 配置关闭':'TUN 配置未知';
+    const adapter=item.route===true?'Windows 路由指向此网卡':item.interfaceStatus==='up'?`${item.interfaceName||'TUN'} 网卡在线`:item.interfaceStatus==='down'?'TUN 网卡断开':item.interfaceStatus==='missing'?'未匹配到 TUN 网卡':'TUN 网卡状态未知';
+    return `${proxyClientName(item.client)}：${item.reachable?'控制器在线':'控制器未连接'}，${tun}，${adapter}${item.deltaBytes>0?'，本次增加 '+bytes(item.deltaBytes):''}`;
+  }).join('；'):'';
+  setAttribute(target, 'title', proxyFresh?`${proxyLabel||'状态未知'}${clientStates?'；'+clientStates:''}${fresh?'；代理出口合计 '+bytes(speed,'/s'):''}；最近检查 ${time(proxy.observedAt,true)}`:fresh?`最近采样 ${time(live.lastAt, true)}`:(live?.error || '当前显示历史记录'));
   return fresh;
 }
 function renderLiveStatus() {
   const machineLive = setSourceStatus('machineStatus', livePacket ? livePacket.machine : data?.live?.machine, 'native');
   const clashLive = setSourceStatus('clashStatus', livePacket ? livePacket.clash : data?.live?.clash, 'mihomo');
-  const status = machineLive && clashLive ? 'is-live' : 'is-offline';
+  const selection=livePacket?.clash?.capture?.proxy||data?.live?.clash?.capture?.proxy;
+  const selectionFresh=Number.isFinite(selection?.observedAt)&&Date.now()>=selection.observedAt&&Date.now()-selection.observedAt<(livePacket?.clash?.intervalMs||data?.live?.clash?.intervalMs||1000)+6000;
+  const uncertain=selectionFresh&&(selection.state==='partial'||selection.routing==='multiple');
+  const status = uncertain?'is-warning':machineLive&&clashLive?'is-live':'is-offline';
   if ($('sidebarCollectorDot').className !== status) $('sidebarCollectorDot').className = status;
-  setText($('sidebarCollectorText'), machineLive && clashLive ? '两路采集均在运行' : '历史可看 · 部分采集未运行');
+  const collectorText=selectionFresh&&proxyStatusLabel(selection)||(!machineLive||!clashLive?'历史可看 · 部分采集未运行':'两路采集均在运行');
+  setText($('sidebarCollectorText'),collectorText);
   setAttribute($('selectedDate'), 'max', calendarDate());
 }
 function renderHeader() {
@@ -254,7 +285,7 @@ function renderTotals(target, row, onSelect) {
 }
 const clockFormat = new Intl.DateTimeFormat('zh-CN', { timeZone: 'Asia/Shanghai', hour: '2-digit', minute: '2-digit', hour12: false });
 const dayFormat = new Intl.DateTimeFormat('zh-CN', { timeZone: 'Asia/Shanghai', month: '2-digit', day: '2-digit' });
-const gapReasons = { collector_restart: '采集程序重启', initial_baseline: '首次采集基线', source_unavailable: '采集源未连接', collector_error: '采集异常', source_changed: '切换采集来源', observer_unavailable: '进程信息暂不可用', sampling_delay: '采样延迟', native_events_lost: '系统事件丢失', clock_changed: '系统时间调整' };
+const gapReasons = { collector_restart: '采集程序重启', initial_baseline: '首次采集基线', source_unavailable: '采集源未连接', proxy_controller_unavailable: '接管中的 Clash 控制器暂不可读', collector_error: '采集异常', source_changed: '切换采集来源', observer_unavailable: '进程信息暂不可用', sampling_delay: '采样延迟', native_events_lost: '系统事件丢失', clock_changed: '系统时间调整' };
 const directionColors = { up: '#d58526', down: '#287ca5' };
 let chartTooltip;
 function chartSeries(name, rows, source, route = '') {
@@ -718,7 +749,7 @@ function showTimeDetail(from, to, title, filters = {}) {
   openAppSelection({ ...filters, from, to, page: 0, title: `${title} · ${time(from, true)}` });
 }
 function proxyClientName(client){return ({verge:'Clash Verge',flclash:'FlClash',mihomo:'Mihomo / 其他',legacy:'旧记录（客户端未标记）'})[client]||'未知客户端';}
-function airportName(clash,id){return clash.airportGroups?.find(group=>group.id===id)?.name||'未归类机场';}
+function airportName(clash,id){return clash.airportGroups?.find(group=>group.id===id)?.name||clash.airportUsage?.find(row=>row.airport===id&&row.airportName)?.airportName||'未归类机场';}
 function selectedLadderFilter(){return {client:$('proxyClientFilter').value||'all',airport:$('proxyAirportFilter').value||'all'};}
 function ladderFilterKey(){const filter=selectedLadderFilter();return `${queryKey()}|${filter.client}|${filter.airport}`;}
 function currentLadderData(){
@@ -754,6 +785,10 @@ async function loadAirportInventory(force=false){
 }
 function renderAirportControls(clash){
   const select=$('proxyAirportFilter'),current=select.value||'all',options=[['all','全部机场'],['__unassigned__','未归类机场'],...(clash.airportGroups||[]).map(group=>[group.id,group.name])];
+  const known=new Set(options.map(([id])=>id));
+  for(const row of clash.airportUsage||[])if(row.airport&&row.airportName&&!known.has(row.airport)){
+    options.push([row.airport,row.airportName]);known.add(row.airport);
+  }
   select.replaceChildren(...options.map(([value,label])=>{const option=node('option',label);option.value=value;return option;}));
   select.value=options.some(([value])=>value===current)?current:'all';
 }
@@ -765,7 +800,7 @@ function renderAirportUsage(clash){
   if(!rows.length){target.append(node('p','当前范围没有可归因到代理节点的流量。','empty-state'));return;}
   for(const row of rows){
     const button=node('button');button.type='button';button.className='airport-usage-row';
-    const identity=node('span',undefined,'airport-usage-identity'),title=node('strong',airportName(clash,row.airport)),client=node('small',proxyClientName(row.client));identity.append(title,client);
+    const identity=node('span',undefined,'airport-usage-identity'),title=node('strong',row.airportName||airportName(clash,row.airport)),client=node('small',proxyClientName(row.client)+(row.airportName?' · 自动识别':''));identity.append(title,client);
     const directions=node('span',undefined,'airport-usage-directions');directions.append(node('small',`↑ ${bytes(row.up)}　↓ ${bytes(row.down)}`),node('small',`${row.connections.toLocaleString('zh-CN')} 条连接 · ${proxyTotal?percent(total(row)/proxyTotal*100):'—'}`));
     const amount=node('strong',bytes(total(row)),'airport-usage-amount');button.append(identity,directions,amount);
     button.addEventListener('click',()=>{
@@ -790,7 +825,7 @@ function renderAirportManager(clash){
   if(airportInventoryError){const retry=node('button','重试读取','quiet-button');retry.type='button';retry.addEventListener('click',()=>loadAirportInventory(true));count.append(' ',retry);}
   else if(inventoryReady&&matching.length>airportNodeLimit){const more=node('button','显示更多节点','quiet-button');more.type='button';more.addEventListener('click',()=>{airportNodeLimit+=120;renderAirportManager(clash);});count.append(' ',more);}
   const groupList=$('airportGroupRows');groupList.replaceChildren();
-  if(!groups.length)groupList.append(node('p','还没有机场归类。搜索节点，勾选同一机场的节点，再填写机场名称并保存。','empty-state'));
+  if(!groups.length)groupList.append(node('p','可手动归类旧记录或未识别的节点。','empty-state'));
   for(const group of groups){
     const row=node('div',undefined,'airport-group-row'),edit=node('button',`${group.name} · ${group.members.length} 个节点`,'quiet-button');edit.type='button';edit.addEventListener('click',()=>{airportNodeSelection=new Set(group.members.map(member=>`${member.client}\0${member.node}`));$('airportGroupName').value=group.name;$('airportNodeSearch').value='';renderAirportManager(clash);});
     const remove=node('button','删除归类','quiet-button');remove.type='button';remove.addEventListener('click',()=>{if($('airportGroupName').value===group.name){$('airportGroupName').value='';airportNodeSelection=new Set();}saveAirportGroups(groups.filter(item=>item.id!==group.id),'已删除机场归类；历史连接会回到未归类。');});
@@ -889,7 +924,7 @@ function renderLadderDetail(selection, result) {
   if (!result.connections.length) { const tr = node('tr'); const td = node('td', '这个时段没有匹配的代理连接。', 'empty-state'); td.colSpan = 9; tr.append(td); body.append(tr); }
   for (const row of result.connections) {
     const tr = node('tr');
-    tr.append(node('td',proxyClientName(row.client)),node('td',airportName(data?.clash||{},row.airport)),node('td', time(row.lastAt, true)), node('td', row.process || '未识别'), node('td', row.host), node('td', row.node || '未知出口'), node('td', bytes(row.up)), node('td', bytes(row.down)), node('td', bytes(row.amount), 'numeric-strong'));
+    tr.append(node('td',proxyClientName(row.client)),node('td',row.airportName||airportName(data?.clash||{},row.airport)),node('td', time(row.lastAt, true)), node('td', row.process || '未识别'), node('td', row.host), node('td', row.node || '未知出口'), node('td', bytes(row.up)), node('td', bytes(row.down)), node('td', bytes(row.amount), 'numeric-strong'));
     body.append(tr);
   }
   renderPager('ladderPager', result.pagination, (page) => loadLadderDetail({ ...selection, page }));
@@ -987,7 +1022,7 @@ function renderInvestigation() {
   const target = $('gapRows'); target.replaceChildren();
   if (!gaps.length) target.append(node('p', '所选时段没有记录到采集缺口。', 'empty-state'));
   for (const gap of gaps) {
-    const reasons = { collector_restart:'采集程序重启',initial_baseline:'首次采集基线',source_unavailable:'采集源未连接',collector_error:'采集异常',source_changed:'切换采集来源',observer_unavailable:'进程信息暂不可用',sampling_delay:'采样延迟',native_events_lost:'系统事件丢失',clock_changed:'系统时间调整' };
+    const reasons = gapReasons;
     const row = node('div', undefined, 'gap-row');
     row.append(node('span', gap.source, 'gap-source'), node('strong', time(gap.gapFrom, true)), node('span', gap.ongoing ? '仍在持续' : time(gap.gapTo, true)), node('span', duration(gap.durationMs)), node('span', reasons[gap.reason] || gap.reason));
     target.append(row);
@@ -1073,7 +1108,7 @@ function exportAppsCsv(rows, name) {
 function exportConnectionsCsv(rows, filename) {
   exportCsv(filename, [
     { label: '进程名', value: 'process' }, { label: 'PID', value: 'pid' }, { label: '目标', value: 'host' },
-    { label: '客户端', value: (row) => proxyClientName(row.client) }, { label: '机场', value: (row) => airportName(data?.clash||{},row.airport) },
+    { label: '客户端', value: (row) => proxyClientName(row.client) }, { label: '机场', value: (row) => row.airportName||airportName(data?.clash||{},row.airport) },
     { label: 'Harness', value: (row) => familyNames[row.family] || row.family }, { label: '出口', value: (row) => row.node || row.route || '' },
     { label: '证据', value: (row) => evidenceNames[row.evidence] || row.evidence }, { label: '上传字节', value: 'up' },
     { label: '下载字节', value: 'down' }, { label: '合计字节', value: total },
@@ -1180,7 +1215,7 @@ function refresh(force = false) {
         clearTimeout(progressTimer);historyStartedAt=0;historyProgress=null;
         refreshPromise = null; renderHeader();
         const afterImport=refreshAfterImport;refreshAfterImport=false;
-        if (!document.hidden) refreshTimer = setTimeout(()=>refresh(afterImport),afterImport?0:preparing?1500:data?.refreshing ? 5000 : ['running','paused'].includes(vaultState?.backgroundImport?.state)?10000:range === 'day' && selectedDate < calendarDate() ? 300000 : 60000);
+        if (!document.hidden) refreshTimer = setTimeout(()=>refresh(afterImport),afterImport?0:preparing?1500:data?.refreshing?5000:range==='day'&&selectedDate<calendarDate()?300000:60000);
       }
     }
   };

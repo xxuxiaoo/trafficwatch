@@ -305,7 +305,8 @@ const server = http.createServer(async (req, res) => {
         if(vault.storageBusy)return json(503,{error:'vault_storage_busy'});
       }
       const authorization=actor&&!actor.owner?{authorizedWindows:actor.windows,allowedLanes:actor.lanes}:{};
-      if(actor?.owner&&['running','paused'].includes(vault.backgroundImport?.state))authorization.skipRollup=true;
+      const importStatus=vault.backgroundImport;
+      if(actor?.owner&&importStatus?.state==='running'&&(importStatus.remaining==null||importStatus.remaining>=16))authorization.skipRollup=true;
       if(url.pathname.startsWith('/api/legacy/')){
         if(vault.configured)vault.owner(bearer);
         const match=/^\/api\/legacy\/(windows|clash)\/(dashboard|calendar|report|correlation|export|settings|capture|stop|update|diagnostics)$/.exec(url.pathname);

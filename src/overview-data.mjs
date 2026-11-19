@@ -83,15 +83,17 @@ function definitions(db, apps, airportGroups = []) {
   const family = `CASE ${familyCases.join(' ')} ELSE 'other' END`;
   const leaf = "CASE WHEN json_valid(c.rule) THEN COALESCE(json_extract(c.rule,'$.chains[0]'),'') ELSE '' END";
   const client = "CASE WHEN json_valid(c.rule) THEN CASE lower(COALESCE(json_extract(c.rule,'$.client'),'')) WHEN 'verge' THEN 'verge' WHEN 'flclash' THEN 'flclash' WHEN 'mihomo' THEN 'mihomo' ELSE 'legacy' END ELSE 'legacy' END";
+  const autoAirport = "CASE WHEN json_valid(c.rule) THEN json_extract(c.rule,'$.airport.id') END";
+  const autoAirportName = "CASE WHEN json_valid(c.rule) THEN json_extract(c.rule,'$.airport.name') END";
   const airportCases=airportGroups.flatMap(group=>group.members.map(member=>`WHEN ${client}=${literal(member.client)} AND ${leaf}=${literal(member.node)} THEN ${literal(group.id)}`));
-  const airport=airportCases.length?`CASE ${airportCases.join(' ')} ELSE '' END`:"''";
+  const airport=`COALESCE(${autoAirport},${airportCases.length?`CASE ${airportCases.join(' ')} ELSE '' END`:"''"})`;
   const route = `CASE WHEN NOT json_valid(c.rule) THEN 'unknown'
     WHEN COALESCE(json_extract(c.rule,'$.source'),'')<>'mihomo' THEN 'unknown'
     WHEN upper(trim(${leaf}))='DIRECT' THEN 'direct'
     WHEN upper(trim(${leaf})) IN ('','REJECT','REJECT-DROP','PASS','COMPATIBLE') THEN 'unknown'
     ELSE 'proxy' END`;
   return {
-    name, family, route, leaf, client, airport, apps, hasFamily,
+    name, family, route, leaf, client, airport, autoAirportName, apps, hasFamily,
     evidence: "CASE WHEN b.scope='unknown' THEN 'none' ELSE c.evidence END",
     pid: "CASE WHEN b.scope='unknown' THEN NULL ELSE c.pid END",
     join: `FROM buckets b JOIN connections c ON c.id=b.connection_id ${hasFamily ? 'LEFT JOIN connection_families f ON f.connection_id=c.id' : ''}`,
@@ -165,8 +167,9 @@ function selectUsage(db,defs,range,options={},detail=false,compact=false){
   const covering=compact&&options.lane==='windows'&&!options.authorizedWindows&&db.prepare("SELECT 1 FROM main.sqlite_master WHERE type='index' AND name='connections_programs'").get();
   let source=filter.sql.replace('FROM buckets b','FROM range_usage b');
   if(compact)source=source.replace('JOIN connections c ON',`CROSS JOIN connections c ${covering?'INDEXED BY connections_programs ':''}ON`);
+  const airportColumns=options.lane==='windows'?"'' airport,NULL airport_name":`${defs.airport} airport,${defs.autoAirportName} airport_name`;
   db.prepare(`CREATE TEMP TABLE selected_usage AS SELECT c.id,${defs.name} process,${compact?'':`${defs.pid} pid,c.host,c.network,`}b.scope,${defs.evidence} evidence,${defs.family} family,
-    ${compact&&options.lane==='windows'?"'unknown'":defs.route} route,${defs.client} client,${defs.airport} airport,${compact?'':`${defs.leaf} node,`}b.up,b.down,b.up+b.down amount,b.minute firstAt,b.last_at lastAt,b.minutes,
+    ${compact&&options.lane==='windows'?"'unknown'":defs.route} route,${defs.client} client,${airportColumns},${compact?'':`${defs.leaf} node,`}b.up,b.down,b.up+b.down amount,b.minute firstAt,b.last_at lastAt,b.minutes,
     ${detail?`(c.first_seen>=${range.from} AND c.last_seen<${range.to})`:'0'} _lifetime_inside
     ${source}`).run(...filter.params);
   const selected=detail?db.prepare('SELECT COUNT(*) count,COALESCE(SUM(minutes),0) minutes,MIN(_lifetime_inside) inside FROM selected_usage').get():{},all=detail?db.prepare('SELECT COALESCE(SUM(minutes),0) minutes FROM range_usage').get():{};
@@ -177,7 +180,7 @@ function selectedGroups(db,expression,route='',limit=100){
   return db.prepare(`SELECT ${expression} name,SUM(up) up,SUM(down) down,COUNT(DISTINCT id) connections FROM selected_usage${route?' WHERE route=?':''} GROUP BY 1 ORDER BY SUM(up+down) DESC LIMIT ?`).all(...(route?[route]:[]),limit);
 }
 function airportRows(db){
-  return db.prepare(`SELECT client,airport,SUM(up) up,SUM(down) down,COUNT(DISTINCT id) connections,MIN(firstAt) firstAt,MAX(lastAt) lastAt
+  return db.prepare(`SELECT client,airport,MAX(airport_name) airportName,SUM(up) up,SUM(down) down,COUNT(DISTINCT id) connections,MIN(firstAt) firstAt,MAX(lastAt) lastAt
     FROM selected_usage WHERE route='proxy' GROUP BY client,airport ORDER BY SUM(up+down) DESC,client,airport`).all();
 }
 function clientNodes(db,range,defs){
@@ -330,7 +333,7 @@ export function readDetail(dataRoot, lane, rangeName, now = Date.now(), options 
     const apps = harnessApps(db, options),airportGroups=lane==='clash'?savedAirportGroups(db):[];
     const { range } = resolveRange(db, rangeName, now, options);
     setArchiveWindows(db,[{from:range.from,to:range.to}]);
-    report('selection');const defs = definitions(db, apps,airportGroups),width=widthFor(range),plan=selectUsage(db,defs,range,options,true);
+    report('selection');const defs = definitions(db, apps,airportGroups),width=widthFor(range),plan=selectUsage(db,defs,range,{...options,lane},true);
     report('summary');
     const summary = db.prepare('SELECT COALESCE(SUM(up),0) up,COALESCE(SUM(down),0) down,COUNT(DISTINCT id) connections,MIN(firstAt) firstAt,MAX(lastAt) lastAt FROM selected_usage').get();
     const processes=selectedPrograms(db),destinations=selectedGroups(db,'host'),nodes=lane==='clash'?selectedGroups(db,'node','',50):[];
@@ -344,8 +347,8 @@ export function readDetail(dataRoot, lane, rangeName, now = Date.now(), options 
     report('connections');const connections = db.prepare(`WITH page AS MATERIALIZED (SELECT * FROM selected_usage ORDER BY amount DESC,id LIMIT ? OFFSET ?)
       SELECT page.*,c.rule FROM page CROSS JOIN connections c ON c.id=page.id ORDER BY page.amount DESC,page.id`).all(pageSize,page*pageSize).map(row=>{
       let metadata = {};try {metadata=JSON.parse(row.rule);} catch {}
-      const {rule,_lifetime_inside,...connection} = row;
-      return {...connection,destinationIP:metadata.destinationIP || '',destinationPort:metadata.destinationPort || 0,localIP:metadata.localIP || '',localPort:metadata.localPort || 0,observedPID:metadata.observedPID || null,client:metadata.client||'legacy',chain:metadata.chains || []};
+      const {rule,_lifetime_inside,airport_name:airportName,...connection} = row;
+      return {...connection,...(airportName?{airportName}:{}),destinationIP:metadata.destinationIP || '',destinationPort:metadata.destinationPort || 0,localIP:metadata.localIP || '',localPort:metadata.localPort || 0,observedPID:metadata.observedPID || null,client:metadata.client||'legacy',chain:metadata.chains || []};
     });
     const timeline = db.prepare('SELECT CAST(at / ? AS INTEGER)*? at,COUNT(*) samples FROM samples WHERE at>=? AND at<? GROUP BY 1 ORDER BY 1').all(width,width,range.from,range.to);
     const gapDetails = db.prepare('SELECT reason,MAX(started_at,?) gapFrom,MIN(COALESCE(ended_at,?),?) gapTo,ended_at IS NULL ongoing FROM collection_gaps WHERE started_at<? AND COALESCE(ended_at,?)>? ORDER BY started_at DESC LIMIT 100').all(range.from,range.to,range.to,range.to,range.to,range.from);

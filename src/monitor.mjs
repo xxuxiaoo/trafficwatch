@@ -130,6 +130,8 @@ export class Monitor {
         'collector_error',
       ])
         this.closeGap(reason, now);
+      if (snapshot.proxyPartial) this.openGap('proxy_controller_unavailable', this.lastAt || began);
+      else this.closeGap('proxy_controller_unavailable', now);
       if (!this.config.demo) {
         const observerAge = now - this.observer.at;
         const observerReady =

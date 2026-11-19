@@ -33,7 +33,7 @@ export class TrafficSource {
   }
   get endpoint() { return this.active?.endpoint || this.proxy.endpoint; }
   status() { return { mode: this.preference, active: this.active === this.native ? 'native' : this.active ? 'mihomo' : null,
-    nativeState: this.native.state, nativeIssue: this.native.issue, eventsLost: this.eventsLost || 0 }; }
+    nativeState: this.native.state, nativeIssue: this.native.issue, eventsLost: this.eventsLost || 0,proxy:this.proxy.status() }; }
   async setMode(mode, authorize = false) {
     if (!['auto', 'native', 'mihomo'].includes(mode)) throw new Error('Invalid capture mode');
     if (authorize) { this.attempted = true; await this.native.start(true); }

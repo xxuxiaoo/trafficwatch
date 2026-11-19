@@ -117,7 +117,7 @@ export class Store {
       } catch (error) { this.db.exec('ROLLBACK'); this.db.close(); throw error; }
     } else this.db.exec('PRAGMA user_version=4');
   }
-  record(sample, { transaction = true } = {}) {
+  record(sample, { transaction = true, dailyAccumulator } = {}) {
     if (this.archivedSampleExists?.(sample.at)) return false;
     if (transaction) this.db.exec('BEGIN');
     try {
@@ -136,7 +136,12 @@ export class Store {
         if (transaction) this.db.exec('COMMIT');
         return false;
       }
-      this.insertDaily.run(this.calendar.day(sample.at), sample.codexUp, sample.codexDown, sample.allUp, sample.allDown, sample.at, sample.at);
+      const day=this.calendar.day(sample.at);
+      if(dailyAccumulator){
+        const total=dailyAccumulator.get(day)||{day,codex_up:0,codex_down:0,all_up:0,all_down:0,first_at:sample.at,last_at:sample.at};
+        total.codex_up+=sample.codexUp;total.codex_down+=sample.codexDown;total.all_up+=sample.allUp;total.all_down+=sample.allDown;
+        total.first_at=Math.min(total.first_at,sample.at);total.last_at=Math.max(total.last_at,sample.at);dailyAccumulator.set(day,total);
+      }else this.insertDaily.run(day, sample.codexUp, sample.codexDown, sample.allUp, sample.allDown, sample.at, sample.at);
       for (const row of sample.rows) {
         this.insertConnection.run(
           row.key,

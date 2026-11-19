@@ -8,7 +8,7 @@ import {spawnSync} from 'node:child_process';
 import {DatabaseSync} from 'node:sqlite';
 import {Store} from '../src/store.mjs';
 import {SEALED_FLUSH_INTERVAL_MS,SEALED_MAX_PENDING_OPERATIONS,SealedStore,initializeImport,drainIngestBatch} from '../src/sealed-store.mjs';
-import {importBudgetMs,measureImportProgress} from '../src/import-progress.mjs';
+import {importBudgetMs,measureImportProgress,shouldCheckImportBudget} from '../src/import-progress.mjs';
 import {DiagnosticHistory,DiagnosticSpool} from '../src/ai-diagnostic-store.mjs';
 import {createVaultKeys,sealPacket,packetFormat} from '../src/vault-crypto.mjs';
 import {vaultKeyEntries} from '../src/vault-migration.mjs';
@@ -72,12 +72,40 @@ test('import notices distinguish queued history, actual import failures and norm
 });
 
 test('import rates separate completed packets from new arrivals and give an honest net ETA',()=>{
-  assert.equal(importBudgetMs(null),25);assert.equal(importBudgetMs(199),25);assert.equal(importBudgetMs(200),50);assert.equal(importBudgetMs(1999),50);assert.equal(importBudgetMs(2000),75);
+  assert.equal(importBudgetMs(null),25);assert.equal(importBudgetMs(199),25);assert.equal(importBudgetMs(200),120);assert.equal(importBudgetMs(1999),120);assert.equal(importBudgetMs(2000),300);
   const rate=measureImportProgress([{at:0,remaining:1000,processed:0},{at:10000,remaining:650,processed:400}],10000,650);
   assert.deepEqual(rate,{measurementSeconds:10,importedPerSecond:40,arrivingPerSecond:5,netPerSecond:35,etaSeconds:19,stalled:false});
   const stalled=measureImportProgress([{at:0,remaining:1000,processed:0},{at:10000,remaining:1010,processed:10}],10000,1010);
   assert.equal(stalled.importedPerSecond,1);assert.equal(stalled.arrivingPerSecond,2);assert.equal(stalled.netPerSecond,-1);assert.equal(stalled.etaSeconds,null);assert.equal(stalled.stalled,true);
   assert.equal(measureImportProgress([{at:0,remaining:100,processed:0},{at:1000,remaining:100,processed:20}],1000,100).importedPerSecond,null,'do not present a noisy ETA before five seconds of measurements');
+  assert.equal(shouldCheckImportBudget({now:5000,lastChecked:1000,wasPending:true,pending:true}),false);
+  assert.equal(shouldCheckImportBudget({now:5000,lastChecked:1000,wasPending:true,pending:false}),true);
+  assert.equal(shouldCheckImportBudget({now:61000,lastChecked:1000,wasPending:false,pending:false}),true);
+});
+
+test('encrypted batch import coalesces daily rollups and replay does not add them twice',async t=>{
+  const f=await fixture(t),times=[base,base+1000,base+86400000,base+86401000];
+  for(let index=0;index<times.length;index++){f.captured.record({...sample(index),at:times[index]});f.captured.flush();}
+  const replay=f.spool.prepare('SELECT id,payload FROM envelopes ORDER BY sequence LIMIT 1').get();
+  assert.deepEqual(drainIngestBatch(f.store,f.metadata,f.secrets,{includeRemaining:true}),{count:4,pending:false,remaining:0});
+  const before=f.store.db.prepare('SELECT * FROM daily_usage ORDER BY day').all();assert.equal(before.length,2);
+  assert.deepEqual(before.map(row=>[row.codex_up,row.codex_down,row.all_up,row.all_down]),[[0,0,34,58],[0,0,34,58]]);
+  f.spool.prepare('INSERT INTO envelopes(id,payload) VALUES (?,?)').run(replay.id,replay.payload);
+  assert.deepEqual(drainIngestBatch(f.store,f.metadata,f.secrets,{includeRemaining:true}),{count:1,pending:false,remaining:0});
+  assert.deepEqual(f.store.db.prepare('SELECT * FROM daily_usage ORDER BY day').all(),before);
+});
+
+test('a deletion between slices prevents old queued records from reappearing, with exact end boundaries',async t=>{
+  const f=await fixture(t);
+  for(let i=0;i<5;i++){f.captured.record(sample(i));f.captured.flush();}
+  assert.equal(drainIngestBatch(f.store,f.metadata,f.secrets,{limit:1}).count,1);
+  const tombstone=f.store.db.prepare('INSERT INTO vault_deletions VALUES (?,?)');
+  tombstone.run(base+1000,base+3000);
+  tombstone.run(base+2000,base+4000);
+  assert.deepEqual(drainIngestBatch(f.store,f.metadata,f.secrets,{includeRemaining:true}),{count:4,pending:false,remaining:0});
+  assert.deepEqual(f.store.db.prepare('SELECT at FROM samples ORDER BY at').all().map(row=>row.at),[base,base+4000]);
+  assert.equal(f.store.db.prepare('SELECT SUM(all_up) total FROM daily_usage').get().total,34);
+  assert.equal(f.store.db.prepare('SELECT COUNT(*) total FROM vault_imports').get().total,5);
 });
 
 test('collector packs adjacent samples into one encrypted envelope and flushes it within the bounded interval',async t=>{

@@ -7,7 +7,7 @@ import { randomBytes } from 'node:crypto';
 import { spawnSync } from 'node:child_process';
 import { Store } from '../src/store.mjs';
 import { DatabaseSync,configureDatabaseKeys } from '../src/database.mjs';
-import { initializeArchives,archiveBatch,attachArchiveViews,deleteArchivedWindows,archiveSummary,historyBounds,setArchiveWindows } from '../src/history-archive.mjs';
+import { initializeArchives,archiveBatch,attachArchiveViews,deleteArchivedWindows,archivedSampleExists,archiveSummary,historyBounds,setArchiveWindows } from '../src/history-archive.mjs';
 import { readLane,readDetail,readHarness } from '../src/overview-data.mjs';
 import { restrictReadConnection } from '../src/vault-grants.mjs';
 import { readLegacy } from '../src/vault-legacy.mjs';
@@ -110,6 +110,15 @@ test('partial archived deletion leaves other minutes exactly intact and can be r
   assert.equal(db.prepare('SELECT COUNT(*) count FROM samples').get().count,72);
   assert.equal(db.prepare('SELECT COUNT(*) count FROM buckets WHERE minute>=? AND minute<?').get(windows[0].from,windows[0].to).count,0);
   assert.equal(db.prepare('SELECT COUNT(*) count FROM buckets WHERE minute=?').get(at('2026-06-10')+4*minute).count,1);
+});
+
+test('archived duplicate timestamps are cached, and archive edits invalidate the replay cache',t=>{
+  const {stores}=fixture(t),store=stores[0],timestamp=at('2026-06-10')+minute;
+  while(archiveBatch(store,at('2026-08-01')).moved){}
+  assert.equal(archivedSampleExists(store.db,timestamp),true);
+  assert.equal(archivedSampleExists(store.db,timestamp),true);
+  store.db.exec('BEGIN');deleteArchivedWindows(store.db,[{from:timestamp,to:timestamp+1}]);store.db.exec('COMMIT');
+  assert.equal(archivedSampleExists(store.db,timestamp),false);
 });
 
 test('archive reads prune unrelated blocks before decoding and never emit decrypted canaries to files',t=>{

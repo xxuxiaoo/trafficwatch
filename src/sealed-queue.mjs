@@ -4,7 +4,7 @@ import {DatabaseSync} from 'node:sqlite';
 // Keep the encrypted history commit durable before acknowledging any source
 // packet. A crash in between replays the committed import ids without adding
 // bytes again. Grouping commits avoids two filesystem flushes for every packet.
-export function drainSealedQueue(file,history,importRow,{limit=120,maxMs=Infinity,includeRemaining=false,connection}={}){
+export function drainSealedQueue(file,history,importRow,{limit=120,maxMs=Infinity,includeRemaining=false,connection,beforeCommit}={}){
   if(!fs.existsSync(file))return {count:0,pending:false,...(includeRemaining?{remaining:0}:{})};
   const spool=connection||new DatabaseSync(file),accepted=[];const started=performance.now();let failure;
   try{
@@ -16,6 +16,7 @@ export function drainSealedQueue(file,history,importRow,{limit=120,maxMs=Infinit
           if(accepted.length&&performance.now()-started>=maxMs)break;
           try{importRow(row);accepted.push(row.id);}catch(error){failure=error;break;}
         }
+        beforeCommit?.();
         history.exec('COMMIT');
       }catch(error){try{history.exec('ROLLBACK');}catch{}throw error;}
       if(accepted.length){

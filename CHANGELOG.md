@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.10.14 — 2026-11-19
+
+- Show which Clash client owns the Windows TUN route, including while it is idle. Record each reachable controller's byte deltas independently during switches and mark gaps when an active controller cannot be read.
+- Automatically label known nodes from the current Clash Verge or FlClash subscription and live provider membership. Keep manual groups for unclassified nodes and earlier records.
+- Speed up encrypted history catch-up with larger batches for large queues, fewer repeated database operations and shorter retries for transient database locks. Keep the encrypted queue and its replay protection.
+
 ## 0.10.13 — 2026-11-17
 
 - Separate proxy usage by client and exact client/node membership, so identically named nodes in Clash Verge and FlClash can belong to different airport groups. Keep rows without recorded client identity explicitly under legacy / unrecognized history.

@@ -11,7 +11,7 @@ import { initializeArchives,attachArchiveViews,detachArchiveViews,deleteArchived
 import { storageSnapshot,saveStoragePolicy,storagePolicy,archiveOldHistory,tidyBackupStaging } from './storage-manager.mjs';
 import { compactHistory } from './storage-compaction.mjs';
 import { DiagnosticHistory } from './ai-diagnostic-store.mjs';
-import {importBudgetMs,measureImportProgress} from './import-progress.mjs';
+import {importBatchLimit,importBudgetMs,measureImportProgress,shouldCheckImportBudget} from './import-progress.mjs';
 import {normalizeAirportGroups} from './airport-groups.mjs';
 
 const {dataRoot,metadata,secrets}=workerData,stores=new Map();
@@ -20,6 +20,7 @@ let compacting=false,storageTask=null,stopArchive=false,storageJob=null,lastSnap
 let diagnostics;
 function diagnosticStore(){return diagnostics??=new DiagnosticHistory(dataRoot,metadata,secrets);}
 const importLanes=['windows','clash','diagnostics'],importStates=new Map(importLanes.map(lane=>[lane,{pending:true,retryAt:0,remaining:null,processed:0,error:null,samples:[]}]));
+const budgetChecks=new Map(['windows','clash'].map(lane=>[lane,0]));
 // At most three source handles per unlocked writer. Reopening and closing on
 // every slice can repeatedly checkpoint an otherwise idle source queue.
 const importConnections=new Map();
@@ -31,7 +32,11 @@ function importConnection(lane){
   return importConnections.get(lane);
 }
 let importTimer,importIndex=0,lastImportStatus='',lastImportReport=0,initialArchivePending=true,importStarted=performance.now();
-const importError=error=>['SQLITE_BUSY','SQLITE_LOCKED'].includes(error.code)?'database_busy':/^(ingest_|invalid_(?:encrypted_packet|packet_signature|ingest_|diagnostic_))/.test(error.message)?'packet_validation_failed':'import_failed';
+function importError(error) {
+  const sqliteCode = error.errcode & 255;
+  if (sqliteCode === 5 || sqliteCode === 6 || /^SQLITE_(BUSY|LOCKED)/.test(error.code || '')) return 'database_busy';
+  return /^(ingest_|invalid_(?:encrypted_packet|packet_signature|ingest_|diagnostic_))/.test(error.message) ? 'packet_validation_failed' : 'import_failed';
+}
 function recordImportSample(state,now){
   if(state.remaining===null)return;
   const previous=state.samples.at(-1);if(previous&&now-previous.at<500)return;
@@ -42,13 +47,20 @@ function importTick(){
   if(compacting||storageTask){importTimer=setTimeout(importTick,500);return;}
   const lane=importLanes[importIndex++%importLanes.length],state=importStates.get(lane);
   if(Date.now()>=state.retryAt){
+    const wasPending=state.pending;
     try{
-      const options={limit:128,maxMs:importBudgetMs(state.remaining),includeRemaining:true,connection:importConnection(lane)};
+      const options={limit:importBatchLimit(state.remaining),maxMs:importBudgetMs(state.remaining),includeRemaining:true,connection:importConnection(lane)};
       const batch=lane==='diagnostics'?diagnosticStore().drainBatch(options):drainIngestBatch(stores.get(lane),metadata,secrets,options);
       state.pending=batch.pending;state.remaining=batch.remaining;state.processed+=batch.count;state.retryAt=0;state.error=null;
-      if(batch.count&&lane!=='diagnostics')stores.get(lane).checkBudgets();
+      if(batch.count&&lane!=='diagnostics'&&shouldCheckImportBudget({now:Date.now(),lastChecked:budgetChecks.get(lane),wasPending,pending:batch.pending})){
+        stores.get(lane).checkBudgets();budgetChecks.set(lane,Date.now());
+      }
     }catch(error){
-      state.pending=true;state.retryAt=Date.now()+60000;state.error=importError(error);state.processed+=error.importedCount||0;if(Number.isSafeInteger(error.remaining))state.remaining=error.remaining;
+      state.pending=true;
+      state.error=importError(error);
+      state.retryAt=Date.now()+(state.error==='database_busy'?1500:60000);
+      state.processed+=error.importedCount||0;
+      if(Number.isSafeInteger(error.remaining))state.remaining=error.remaining;
     }
     recordImportSample(state,performance.now());
   }

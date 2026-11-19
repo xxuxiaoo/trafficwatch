@@ -5,6 +5,8 @@ import http from 'node:http';
 import net from 'node:net';
 import {createRequire} from 'node:module';
 import { yamlScalar } from './config.mjs';
+import { inspectTunnelInterfaces } from './ai-windows.mjs';
+import { airportIndex, airportProfileStamp, subscriptionFor } from './proxy-airports.mjs';
 
 export function validateEndpoint(endpoint) {
   if (endpoint.startsWith('\\\\.\\pipe\\')) return { socketPath: endpoint };
@@ -78,6 +80,38 @@ export function normalizeSnapshot(data){
   return {...data,connections:data.connections||[]};
 }
 
+const adapterName = value => String(value || '').trim().toLowerCase();
+const knownDevices = { verge: ['clash verge', 'clashverge', 'verge-mihomo', 'mihomo'], flclash: ['flclash'] };
+
+export function tunnelStatus(client, device, network) {
+  const { adapters, routes } = network || {};
+  const names = device ? [adapterName(device)] : knownDevices[client] || [];
+  const matched = adapters?.filter(adapter => names.includes(adapterName(adapter.name))) || [];
+  if (matched.length !== 1) return { interfaceStatus: adapters && !matched.length ? 'missing' : 'unknown', route: null };
+  const adapter = matched[0];
+  const up = adapter.status === 'Up';
+  const routed = up && routes?.some(({ family, index }) => index === (family === 4 ? adapter.ipv4 : adapter.ipv6));
+  return { interfaceStatus: up ? 'up' : 'down', interfaceName: adapter.name, route: routes?.length ? Boolean(routed) : null };
+}
+
+const isSidecar=item=>/[\\/]verge-mihomo-sidecar(?:-|$)/i.test(item.candidate.endpoint||'');
+const controllerKey=item=>[item.candidate.client||'mihomo',item.config['mixed-port']||'',item.config.tun?.device||''].join('\u0000');
+const captureKey = item => `${item.candidate.client || 'mihomo'}\0${item.candidate.endpoint}`;
+function uniqueControllers(controllers){
+  const running=controllers.filter(item=>!isSidecar(item));
+  running.sort((a,b)=>Number(!/verge-mihomo-production-/i.test(a.candidate.endpoint||''))-Number(!/verge-mihomo-production-/i.test(b.candidate.endpoint||'')));
+  return running.filter((item,index,all)=>all.findIndex(other=>controllerKey(other)===controllerKey(item))===index);
+}
+function summarizeClientEndpoints(outcomes){
+  const clients=new Map();
+  for(const result of outcomes){
+    const client=result.candidate?.client||'mihomo',reachable=result.status==='fulfilled',previous=clients.get(client);
+    if(!previous||reachable&&!previous.reachable)clients.set(client,{client,reachable,tunEnabled:reachable?result.value?.config?.tun?.enable===true:null});
+    else if(reachable&&previous.reachable)previous.tunEnabled||=result.value?.config?.tun?.enable===true;
+  }
+  return [...clients.values()];
+}
+
 export function requestController(candidate,route,method='GET',body,{timeoutMs=1800}={}){
   return new Promise((resolve,reject)=>{
     let timer,finished=false;
@@ -91,11 +125,9 @@ export function requestController(candidate,route,method='GET',body,{timeoutMs=1
 }
 
 export function chooseController(controllers){
-  // Multiple installed clients are common. A live TUN wins over an idle core;
-  // never use its port number as a client identity or load another client's YAML.
-  const running=controllers.filter(item=>!/[\\/]verge-mihomo-sidecar-/i.test(item.candidate.endpoint||''));
-  running.sort((a,b)=>Number(!/verge-mihomo-production-/i.test(a.candidate.endpoint||''))-Number(!/verge-mihomo-production-/i.test(b.candidate.endpoint||'')));
-  const unique=running.filter((item,index,all)=>all.findIndex(other=>other.candidate.client===item.candidate.client&&other.config['mixed-port']===item.config['mixed-port']&&other.config.tun?.device===item.config.tun?.device)===index);
+  // This controller-only selector is for configuration operations; capture uses
+  // live traffic deltas. Never guess when more than one client has TUN enabled.
+  const unique=uniqueControllers(controllers);
   const tun=unique.filter(item=>item.config.tun?.enable);
   if(tun.length>1)throw new Error('clash_multiple_active_tun');
   return tun[0]||unique[0]||null;
@@ -183,57 +215,152 @@ export function requestSnapshot(candidate, timeoutMs = 1800) {
   });
 }
 
+const counterValue=value=>Number.isFinite(value)&&value>=0?Math.floor(value):0;
+
 export class MihomoSource {
-  constructor(config) {
-    this.config = config;
-    this.current = null;
-    this.endpoint = '';
-    this.generation = 0;
-    this.issue = null;
-    this.nextDiscovery=0;
+  constructor(config,{discover=discoverEndpoints,controllerRequest=requestController,snapshotRequest=requestSnapshot,assertObservable=assertObservableClient,interfaceReader=inspectTunnelInterfaces,now=Date.now}={}) {
+    this.config=config;this.current=null;this.endpoint='';this.generation=0;this.issue=null;
+    this.counters=new Map();this.devices=new Map();this.interfaceReader=interfaceReader;this.now=now;
+    this.airports=new Map();
+    this.network=null;this.nextInterfaceCheck=0;this.selectedIdentity='';this.selection={state:'starting',client:null,clients:[]};
+    this.discover=discover;this.controllerRequest=controllerRequest;this.snapshotRequest=snapshotRequest;this.assertObservable=assertObservable;
+  }
+  refreshInterfaces() {
+    const now=this.now();
+    if (this.interfaceCheck || now<this.nextInterfaceCheck) return;
+    this.nextInterfaceCheck=now+4000;
+    this.interfaceCheck=Promise.resolve().then(()=>this.interfaceReader()).then(result=>{
+      this.network=result;
+      this.networkAt=this.now();
+    }).catch(()=>{this.network=null;}).finally(()=>{this.interfaceCheck=null;});
+  }
+  observe(item, now, nextCounters) {
+    const key=captureKey(item),old=this.counters.get(key);
+    const upload=counterValue(item.data.uploadTotal),download=counterValue(item.data.downloadTotal);
+    const reset=!old||upload<old.upload||download<old.download;
+    const delta=reset?0:upload-old.upload+download-old.download;
+    const lastTrafficAt=delta?now:reset?null:old.lastTrafficAt;
+    nextCounters.set(key,{upload,download,lastTrafficAt});
+    return { key, reset, deltaBytes:delta, lastTrafficAt };
+  }
+  labelAirports({candidate, data}, key, now) {
+    const stamp=airportProfileStamp(candidate);
+    let entry=this.airports.get(key);
+    if(!entry||entry.stamp!==stamp){
+      entry={stamp,nextCheck:0};
+      this.airports.set(key,entry);
+    }
+    if(!entry.pending&&now>=entry.nextCheck){
+      entry.nextCheck=now+30000;
+      entry.pending=Promise.resolve().then(()=>this.controllerRequest(candidate,'/providers/proxies'))
+        .then(response=>{entry.lookup=airportIndex(candidate.client||'mihomo',response,subscriptionFor(candidate));})
+        .catch(()=>{entry.lookup=null;}).finally(()=>{entry.pending=null;});
+    }
+    if(!entry.lookup)return data;
+    const connections=data.connections.map(connection=>{
+      const label=entry.lookup(connection);
+      return label?{...connection,airport:label}:connection;
+    });
+    return {...data,connections};
+  }
+  activate(item,state,clients){
+    const identity=controllerKey(item),endpoint=item.candidate.endpoint;
+    if(this.selectedIdentity!==identity||this.current?.endpoint!==endpoint){this.generation++;this.selectedIdentity=identity;}
+    this.current=item.candidate;this.endpoint=endpoint.startsWith('\\\\')?'Windows 命名管道':endpoint;
+    this.selection={state,client:item.candidate.client||'mihomo',observedAt:this.now(),clients};this.issue=null;
+    return {...item.data,proxyClient:item.candidate.client||'mihomo'};
+  }
+  async autoSnapshot(){
+    this.refreshInterfaces();
+    if(!this.candidates||this.now()>=this.rediscoverAt){
+      this.candidates=this.discover(this.config);
+      this.rediscoverAt=this.now()+4000;
+    }
+    const candidates=this.candidates;
+    const settled=await Promise.allSettled(candidates.map(async candidate=>{
+      const [config,data]=await Promise.all([this.controllerRequest(candidate,'/configs'),this.snapshotRequest(candidate)]);
+      // A TCP fallback may use the same port as a stale configuration for another client.
+      if(!candidate.endpoint.startsWith('\\\\')&&adapterName(config.tun?.device)==='flclash')candidate={...candidate,client:'flclash'};
+      return {candidate,config,data};
+    }));
+    const outcomes=settled.map((result,index)=>({...result,candidate:result.value?.candidate||candidates[index]}));
+    const controllers=outcomes.filter(result=>result.status==='fulfilled').map(result=>result.value);
+    const unique=uniqueControllers(controllers);
+    let controllerIssue=null;
+    if(!unique.some(item=>item.candidate.client==='flclash')){
+      try{await this.assertObservable(controllers,this.config);}catch(error){controllerIssue=error.message;}
+    }
+    const now=this.now(),network=now-this.networkAt<=7000?this.network:null;
+    const clients=new Map(summarizeClientEndpoints(outcomes.filter(item=>!isSidecar(item))).map(item=>[item.client,item]));
+    const nextCounters=new Map();
+    const proxySnapshots=unique.map(item=>{
+      const client=item.candidate.client||'mihomo',device=item.config.tun?.device;
+      if(device)this.devices.set(client,device);
+      const data=this.observe(item,now,nextCounters);
+      const summary=clients.get(client);
+      summary.deltaBytes=(summary.deltaBytes||0)+data.deltaBytes;
+      summary.lastTrafficAt=Math.max(summary.lastTrafficAt||0,data.lastTrafficAt||0)||null;
+      const snapshot=this.labelAirports(item,data.key,now);
+      return {...snapshot,proxyClient:client,sourceKey:data.key,reset:data.reset};
+    });
+    this.counters=nextCounters;
+    for (const key of this.airports.keys()) if (!nextCounters.has(key)) this.airports.delete(key);
+    // Device matches and route checks diagnose TUN ownership, independently of
+    // any clients using explicit proxy ports or closing connections at cutover.
+    for(const client of ['verge','flclash']){
+      if(!clients.has(client)&&(this.devices.has(client)||tunnelStatus(client,null,network).interfaceStatus==='up'))
+        clients.set(client,{client,reachable:false,tunEnabled:null});
+    }
+    for(const item of clients.values()){
+      Object.assign(item,tunnelStatus(item.client,this.devices.get(item.client),network));
+      if(item.tunEnabled===false)item.route=false;
+    }
+    const routed=[...clients.values()].filter(item=>item.route===true);
+    const active=[...clients.values()].filter(item=>item.deltaBytes>0);
+    const routeClient=routed.length===1?routed[0].client:null;
+    const routing=routed.length>1?'multiple':routeClient?'routed':!network?.routes?.length||[...clients.values()].some(item=>item.tunEnabled===true&&item.route===null)?'unknown':'none';
+    const incomplete=routed.some(item=>!item.reachable)||Boolean(controllerIssue&&routing==='unknown');
+    const client=active.length===1?active[0].client:null;
+    const state=incomplete?'partial':active.length>1?'multiple':client?'active':unique.length?'idle':routing==='none'?'idle':'unavailable';
+    this.selection={state,client,routeClient,routing,observedAt:now,clients:[...clients.values()]};
+    this.issue=incomplete?'active_controller_unavailable':null;
+    const current=unique.find(item=>item.candidate.client===(routeClient||client))||unique[0];
+    this.current=current?.candidate||null;
+    this.endpoint=this.current?.endpoint?.startsWith('\\\\')?'Windows 命名管道':this.current?.endpoint||'';
+    if(!unique.length&&(routing!=='none'||incomplete)){
+      const unauthorized=outcomes.some(result=>/HTTP (401|403)|controller_http_(401|403)/i.test(result.reason?.message||''));
+      const incompatible=outcomes.some(result=>/HTTP |controller_http_|Unexpected Mihomo|JSON|Response too large/i.test(result.reason?.message||'')||result.reason instanceof SyntaxError);
+      this.issue||=unauthorized?'authorization':incompatible?'incompatible':'unreachable';
+      throw new Error(unauthorized?'接口需要授权：设置 MIHOMO_SECRET 后重启。':incompatible?'Mihomo 控制器响应格式不兼容。':'未连接 Mihomo：请启动代理，或在 config.local.json 配置本地 controller。');
+    }
+    if(!this.generation)this.generation=1;
+    return {proxySnapshots,proxyClient:routeClient||client,proxyPartial:incomplete};
+  }
+  manualSelection(data){
+    const client=this.current?.client||'mihomo',key=`manual\u0000${this.current?.endpoint||''}`,upload=counterValue(data.uploadTotal),download=counterValue(data.downloadTotal),old=this.counters.get(key);
+    const delta=old&&upload>=old.upload&&download>=old.download?(upload-old.upload)+(download-old.download):0;
+    this.counters.set(key,{upload,download});
+    const state=delta?'active':old?'idle':'ready';
+    const clients=[{client,reachable:true,tunEnabled:null,deltaBytes:delta,...(delta?{lastTrafficAt:Date.now()}:{})}];
+    this.selection={state,client,observedAt:Date.now(),clients};
+    return {...data,proxyClient:client};
   }
   async snapshot() {
-    if (this.current && (this.config.controller!=='auto'||Date.now()<this.nextDiscovery)) {
-      try {
-        const data = await requestSnapshot(this.current);
-        this.issue = null;
-        return {...data,proxyClient:this.current.client||'mihomo'};
-      } catch {
-        this.current = null;
-      }
+    if(this.config.controller==='auto')return this.autoSnapshot();
+    if(this.current){
+      try{const data=await this.snapshotRequest(this.current);this.issue=null;return this.manualSelection(data);}
+      catch{this.current=null;}
     }
-    const candidates = discoverEndpoints(this.config);
-    const outcomes = await Promise.allSettled(
-      candidates.map(async (c) => ({ candidate: c, data: await requestSnapshot(c),config:this.config.controller==='auto'?await requestController(c,'/configs'):{} })),
-    );
-    const controllers=outcomes.filter(result=>result.status==='fulfilled').map(result=>result.value);
-    try{await assertObservableClient(controllers,this.config);}catch(error){this.current=null;this.issue='unreachable';throw error;}
-    const selected=this.config.controller==='auto'?chooseController(controllers):controllers[0];
-    const found=selected?{value:selected}:null;
-    if (!found) {
-      const unauthorized = outcomes.some((x) => /HTTP (401|403)/.test(x.reason?.message || ''));
-      this.issue = unauthorized
-        ? 'authorization'
-        : outcomes.some(
-              (x) =>
-                /HTTP |Unexpected Mihomo|JSON|Response too large/i.test(x.reason?.message || '') ||
-                x.reason instanceof SyntaxError,
-            )
-          ? 'incompatible'
-          : 'unreachable';
-      throw new Error(
-        unauthorized
-          ? '接口需要授权：设置 MIHOMO_SECRET 后重启。'
-          : '未连接 Mihomo：请启动代理，或在 config.local.json 配置本地 controller。',
-      );
+    const candidates=this.discover(this.config),outcomes=await Promise.allSettled(candidates.map(async candidate=>({candidate,data:await this.snapshotRequest(candidate),config:{}})));
+    const controllers=outcomes.filter(result=>result.status==='fulfilled').map(result=>result.value),found=controllers[0];
+    if(!found){
+      const unauthorized=outcomes.some(result=>/HTTP (401|403)/.test(result.reason?.message||''));
+      this.issue=unauthorized?'authorization':outcomes.some(result=>/HTTP |Unexpected Mihomo|JSON|Response too large/i.test(result.reason?.message||'')||result.reason instanceof SyntaxError)?'incompatible':'unreachable';
+      this.selection={state:'unavailable',client:null,observedAt:Date.now(),clients:[]};
+      throw new Error(unauthorized?'接口需要授权：设置 MIHOMO_SECRET 后重启。':'未连接 Mihomo：请启动代理，或在 config.local.json 配置本地 controller。');
     }
-    this.issue = null;
-    if(this.current?.endpoint!==found.value.candidate.endpoint||this.current?.client!==found.value.candidate.client)this.generation++;
-    this.current = found.value.candidate;
-    this.nextDiscovery=Date.now()+10000;
-    this.endpoint = this.current.endpoint.startsWith('\\\\')
-      ? 'Windows 命名管道'
-      : this.current.endpoint;
-    return {...found.value.data,proxyClient:this.current.client||'mihomo'};
+    this.current=found.candidate;
+    return this.activate(found,'ready',[{client:found.candidate.client||'mihomo',reachable:true,tunEnabled:null,deltaBytes:0}]);
   }
+  status(){return {...this.selection,issue:this.issue};}
 }

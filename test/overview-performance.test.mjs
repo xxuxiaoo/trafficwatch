@@ -95,6 +95,20 @@ test('proxy history separates clients and explicitly grouped airports without re
   const detail=readDetail(f.root,'clash','all',now,{client:'flclash',airport:'tag',route:'proxy'});
   assert.equal(detail.summary.up,30);assert.equal(detail.connections[0].client,'flclash');assert.equal(detail.connections[0].airport,'tag');
 });
+test('a recorded automatic airport label stays distinct from legacy manual grouping of the same node',t=>{
+  const f=fixture(t),store=f.open('clash');
+  const airport={id:'auto-1234567890abcdef12345678',name:'Synthetic subscription'};
+  store.set('airportGroups',[{id:'manual',name:'Manual fallback',members:[{client:'verge',node:'Shared node'}]}]);
+  record(store,BASE+MINUTE,[
+    connection('automatic',10,20,{rule:rule(['Shared node'],{client:'verge',airport})}),
+    connection('older',30,40,{rule:rule(['Shared node'],{client:'verge'})}),
+  ]);
+  const now=BASE+3*HOUR,summary=readLadder(f.root,'all',now);
+  assert.deepEqual(summary.airportUsage.map(row=>[row.airport,row.airportName,row.up]),[['manual',null,30],[airport.id,airport.name,10]]);
+  const detail=readDetail(f.root,'clash','all',now,{client:'verge',airport:airport.id,route:'proxy'});
+  assert.equal(detail.summary.up,10);
+  assert.equal(detail.connections[0].airportName,airport.name);
+});
 test('a broken disposable cache falls back to source records without hiding history',t=>{
   const f=fixture(t),store=f.open('windows');
   record(store,BASE+MINUTE,[connection('retained',11,22)]);

@@ -7,6 +7,7 @@ using System.Net;
 using System.Net.NetworkInformation;
 using System.Net.Security;
 using System.Net.Sockets;
+using System.Runtime.InteropServices;
 using System.Security.Authentication;
 using System.Text;
 using System.Threading;
@@ -14,6 +15,8 @@ using System.Web.Script.Serialization;
 
 internal static class RelayProbe {
     static readonly JavaScriptSerializer Json=new JavaScriptSerializer();
+    [DllImport("iphlpapi.dll")]
+    static extern uint GetBestInterfaceEx(byte[] destination,out uint interfaceIndex);
     static long Now() { return DateTimeOffset.UtcNow.ToUnixTimeMilliseconds(); }
     static void Emit(object value) { Console.WriteLine(Json.Serialize(value)); Console.Out.Flush(); }
     static Socket Bound(string local,int index,SocketType type,ProtocolType protocol) {
@@ -33,6 +36,26 @@ internal static class RelayProbe {
             adapters.Add(new { index=props.GetIPv4Properties().Index,address=v4.Address.ToString(),gateway=gw.Address.ToString(),name=nic.Name,description=nic.Description,ipv6=props.UnicastAddresses.Where(a=>a.Address.AddressFamily==AddressFamily.InterNetworkV6&&!a.Address.IsIPv6LinkLocal).Select(a=>a.Address.ToString()).ToArray() });
         }
         return new {kind="network",at=Now(),adapters=adapters};
+    }
+    static object Interfaces() {
+        var adapters=new List<object>();
+        foreach(var nic in NetworkInterface.GetAllNetworkInterfaces()) {
+            try {
+                var props=nic.GetIPProperties();int ipv4=0,ipv6=0;
+                if(nic.Supports(NetworkInterfaceComponent.IPv4))ipv4=props.GetIPv4Properties().Index;
+                if(nic.Supports(NetworkInterfaceComponent.IPv6))ipv6=props.GetIPv6Properties().Index;
+                adapters.Add(new {name=nic.Name,status=nic.OperationalStatus.ToString(),ipv4=ipv4,ipv6=ipv6});
+            }catch{}
+        }
+        // Ask Windows which interface it would use. This never sends a packet.
+        var routes=new List<object>();
+        foreach(string address in new[]{"1.1.1.1","8.8.8.8","208.67.222.222","2606:4700:4700::1111","2001:4860:4860::8888"}) {
+            var ip=IPAddress.Parse(address);var endpoint=new IPEndPoint(ip,0).Serialize();
+            var buffer=new byte[endpoint.Size];for(int i=0;i<buffer.Length;i++)buffer[i]=endpoint[i];
+            uint index;
+            if(GetBestInterfaceEx(buffer,out index)==0&&index>0)routes.Add(new {family=ip.AddressFamily==AddressFamily.InterNetwork?4:6,index=index});
+        }
+        return new {kind="interfaces",at=Now(),adapters=adapters,routes=routes};
     }
     static int U16(byte[] b,int p) { return (b[p]<<8)|b[p+1]; }
     static string DnsName(byte[] b,ref int p) {
@@ -85,6 +108,7 @@ internal static class RelayProbe {
         Console.OutputEncoding=new UTF8Encoding(false);
         try {
             if(args.Length==1&&args[0]=="discover"){Emit(Discover());return 0;}
+            if(args.Length==1&&args[0]=="interfaces"){Emit(Interfaces());return 0;}
             var input=Json.Deserialize<Dictionary<string,object>>(Console.ReadLine());string mode=Convert.ToString(input["mode"]),host=Convert.ToString(input["host"]),local=Convert.ToString(input["localAddress"]);int index=Convert.ToInt32(input["interfaceIndex"]);
             if(mode=="dns")Emit(Dns(host,local,index,Convert.ToString(input["resolver"])));
             else if(mode=="probe")Emit(Probe(host,Convert.ToString(input["ip"]),local,index,input.ContainsKey("hold")&&Convert.ToBoolean(input["hold"])));

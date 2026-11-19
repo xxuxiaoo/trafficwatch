@@ -4,6 +4,8 @@ import { createHash } from 'node:crypto';
 const DAY = 86400000, MAX_RAW = 1024 * 1024, READ_CACHE = 8 * 1024 * 1024;
 const states = new WeakMap();
 const replayStatements = new WeakMap();
+const replaySampleCaches = new WeakMap();
+const REPLAY_CACHE = 4 * 1024 * 1024;
 const sampleColumns = ['at','duration','codex_up','codex_down','all_up','all_down','unknown_up','unknown_down','candidates'];
 const bucketColumns = ['minute','scope','up','down','last_at'];
 const monthAt = at => new Date(at + 8 * 3600000).toISOString().slice(0,7);
@@ -106,18 +108,48 @@ export function archiveBatch(store, cutoff, { limit = 512, beforeCommit } = {}) 
     for (const row of bounded) remove.run(...(kind==='samples'?[row.at]:[row.minute,row.connection_id,row.scope]));
     beforeCommit?.();
     db.exec('COMMIT');
+    invalidateReplaySampleCache(db);
     return { moved: bounded.length, kind, month, rawBytes: chunk.raw_bytes, compressedBytes: chunk.payload.length };
   } catch (error) { db.exec('ROLLBACK'); throw error; }
 }
 
 export function archivedSampleExists(db, at) {
-  let query=replayStatements.get(db);
-  if(!query){query=db.prepare("SELECT * FROM vault_archive_chunks INDEXED BY archive_end WHERE kind='samples' AND start_at<=? AND end_at>?");replayStatements.set(db,query);}
-  for (const chunk of query.iterate(at,at)) {
-    if (unpack(chunk).rows.some(row=>row[0]===at)) return true;
+  let cache = replaySampleCaches.get(db);
+  if (!cache) {
+    const upper = db.prepare("SELECT end_at FROM vault_archive_chunks WHERE kind='samples' ORDER BY end_at DESC LIMIT 1").get();
+    cache = { end: upper?.end_at ?? -Infinity, blocks: new Map(), bytes: 0 };
+    replaySampleCaches.set(db, cache);
+  }
+  if (at >= cache.end) return false;
+  // Recent capture is usually newer than the archive. For older packets, use
+  // the manifest to find overlapping compressed blocks before decoding them.
+  let statements = replayStatements.get(db);
+  if (!statements) {
+    statements = {
+      ids: db.prepare("SELECT id FROM vault_archive_chunks INDEXED BY archive_end WHERE kind='samples' AND start_at<=? AND end_at>?"),
+      block: db.prepare('SELECT * FROM vault_archive_chunks WHERE id=?'),
+    };
+    replayStatements.set(db, statements);
+  }
+  for (const { id } of statements.ids.iterate(at, at)) {
+    let block = cache.blocks.get(id);
+    if (block) cache.blocks.delete(id);
+    else {
+      const times = new Set(unpack(statements.block.get(id)).rows.map(row => row[0]));
+      block = { times, bytes: Math.max(64, times.size * 48) };
+      if (block.bytes <= REPLAY_CACHE) cache.bytes += block.bytes;
+    }
+    if (block.bytes <= REPLAY_CACHE) cache.blocks.set(id, block);
+    while (cache.bytes > REPLAY_CACHE) {
+      const oldest = cache.blocks.keys().next().value;
+      cache.bytes -= cache.blocks.get(oldest).bytes;
+      cache.blocks.delete(oldest);
+    }
+    if (block.times.has(at)) return true;
   }
   return false;
 }
+function invalidateReplaySampleCache(db){replaySampleCaches.delete(db);}
 
 // A time predicate on the manifest prunes compressed blocks before decoding.
 // group_key stays a real indexed SQL column, so detail joins by connection id
@@ -214,6 +246,7 @@ export function deleteArchivedWindows(db, windows) {
     }
     cursor=affected.at(-1).id;
   }
+  invalidateReplaySampleCache(db);
 }
 export function archiveSummary(db) {
   if (!hasArchives(db)) return { months:[],rows:0,rawBytes:0,compressedBytes:0,firstAt:null,lastAt:null };

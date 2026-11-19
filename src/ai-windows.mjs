@@ -16,6 +16,11 @@ export function runJson(file,args=[],input,{timeout=20000,onRow}={}) {
   });
 }
 export const networkHelper=()=>path.join(appRoot,'native','TrafficWatch-RelayProbe.exe');
+export async function inspectTunnelInterfaces(){
+  if(process.platform!=='win32')return null;
+  const rows=await runJson(networkHelper(),['interfaces'],undefined,{timeout:3000});
+  return rows.find(row=>row.kind==='interfaces')??null;
+}
 export async function discoverPhysical(){const [value]=await runJson(networkHelper(),['discover']);if(!value?.adapters?.length)throw new Error('physical_adapter_unavailable');return value.adapters[0];}
 export const physicalDns=async(host,adapter)=>{
   for(const resolver of ['223.5.5.5','1.1.1.1'])try{
