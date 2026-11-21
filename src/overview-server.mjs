@@ -1,60 +1,76 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import http from 'node:http';
+import { spawn } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 import { HistoryReader } from './history-reader.mjs';
-import { DEFAULT_CODEX_PROCESS_NAMES, normalizeHarnessApps } from './harness.mjs';
-import { VaultService } from './vault-service.mjs';
-import { vaultRoute } from './vault-router.mjs';
-import { signCommand } from './vault-commands.mjs';
-import { csvCell } from './server.mjs';
+import { normalizeHarnessApps } from './harness.mjs';
 import { VERSION } from './version.mjs';
 import { diagnosticRoute } from './ai-diagnostic-router.mjs';
 import {readRelayTargetConfig,listRelayTargetBackups,saveRelayTargets,restoreRelayTargets,requestRelayReconcile,relayHostRevision} from './relay-targets.mjs';
 import {BackgroundHistoryRefreshes} from './history-background-refresh.mjs';
-import {normalizeAirportGroups} from './airport-groups.mjs';
+import {loadConfig} from './config.mjs';
+import { historyDirectory } from './history-paths.mjs';
+import { HistoryMaintenance } from './history-maintenance.mjs';
 
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
-export function startOverviewServer({guardFactory,listenPort,suiteSettings,historyRoot,sourcePorts,readerFactory=(data,options)=>new HistoryReader(data,options)}={}){
+const CONTROL_ACTIONS = new Set(['Start','PauseCapture','Stop','EnableStartup','DisableStartup','StartDiagnostics','StopDiagnostics','EnableBypass','RollbackBypass','ReopenTray']);
+const controlErrors = new Set(['control_helper_missing','control_action_timeout','control_action_interrupted','control_action_failed','control_action_cancelled','control_action_busy','control_status_invalid','control_session_required']);
+const validAirport = value => value === '' || value === '__unassigned__' || /^airport-[a-f0-9]{24}$/.test(value);
+
+function runInstalledControl(action, directory=root){
+  const executable=path.join(directory,'TrafficWatch-Control.exe');
+  if(!fs.existsSync(executable)||!fs.existsSync(path.join(directory,'suite-settings.json')))return Promise.reject(new Error('control_helper_missing'));
+  const status=action==='Status';
+  return new Promise((resolve,reject)=>{
+    const child=spawn(executable,status?['--status']:['--action',action==='Stop'?'StopFromOverview':action],{cwd:directory,windowsHide:true,stdio:['ignore','pipe','ignore']});
+    let output='';child.stdout.setEncoding('utf8');
+    child.stdout.on('data',text=>{if(output.length<=8192)output+=text;});
+    const timer=setTimeout(()=>{child.kill();reject(new Error('control_action_timeout'));},status?6500:78000);
+    child.once('error',error=>{clearTimeout(timer);reject(new Error(error.code==='ENOENT'?'control_helper_missing':'control_action_failed'));});
+    child.once('close',(code,signal)=>{
+      clearTimeout(timer);
+      if(code!==0)return reject(new Error(signal?'control_action_interrupted':code===3?'control_action_cancelled':code===4?'control_session_required':'control_action_failed'));
+      if(!status)return resolve({ok:true,action});
+      try{
+        const value=JSON.parse(output),fields=['Startup','Diagnostics','Bypass','Tray','Supervisor'];
+        if(output.length>8192||!fields.every(key=>typeof value?.[key]==='string'&&value[key].length<=180))throw new Error('control_status_invalid');
+        if(typeof value.CapturePaused!=='boolean')throw new Error('control_status_invalid');
+        resolve({...Object.fromEntries(fields.map(key=>[key,value[key]])),CapturePaused:value.CapturePaused});
+      }catch(error){reject(new Error('control_status_invalid',{cause:error}));}
+    });
+  });
+}
+
+export function startOverviewServer({listenPort,suiteSettings,historyRoot,sourcePorts,readerFactory=(data,options)=>new HistoryReader(data,options),controlRunner=runInstalledControl}={}){
 const settingsPath = path.join(root, 'suite-settings.json');
 const settings = suiteSettings||(fs.existsSync(settingsPath)
   ? JSON.parse(fs.readFileSync(settingsPath, 'utf8').replace(/^\uFEFF/, ''))
   : {});
 const dataRoot = path.resolve(historyRoot||process.env.TRAFFICWATCH_DATA_ROOT || settings.DataRoot || path.join(root, 'data'));
+const singleCollector = !settings.DataRoot && process.env.TRAFFICWATCH_SINGLE_COLLECTOR === '1'
+  ? (process.env.TRAFFICWATCH_DEMO === '1'?'demo':loadConfig(root).captureMode) : null;
 const port = Number(listenPort||process.env.TRAFFICWATCH_OVERVIEW_PORT || 43131);
 if (!Number.isInteger(port) || port < 1024 || port > 65535) throw new Error('Invalid overview port');
 const host = `127.0.0.1:${port}`;
 const collectorPorts=sourcePorts||[Number(process.env.TRAFFICWATCH_MACHINE_PORT||43128),Number(process.env.TRAFFICWATCH_CLASH_PORT||43130)];
 if(collectorPorts.some(value=>!Number.isInteger(value)||value<1024||value>65535))throw new Error('Invalid collector port');
 const cacheRoot = process.env.TRAFFICWATCH_CACHE_ROOT || path.join(dataRoot, 'viewer-cache');
-const encryptedCacheRoot=path.join(cacheRoot,'encrypted-v1');
 function queueRelayReconcile(){
   const config=readRelayTargetConfig(dataRoot,settings.RelayHosts);
   if(config.targets.some(target=>target.enabled))try{fs.unlinkSync(path.join(dataRoot,'relay-bypass','disabled'));}catch(error){if(error.code!=='ENOENT')throw error;}
   return requestRelayReconcile(dataRoot);
 }
-const makeReader=(role,keyEntries)=>readerFactory({dataRoot,...(role==='history'?{cacheRoot:keyEntries?encryptedCacheRoot:cacheRoot}:{}),...(keyEntries?{keyEntries}:{})},{timeoutMs:role==='quick'?12000:role==='detail'?20000:45000},role);
-let fullReader=makeReader('history'),quickReader=makeReader('quick'),detailReader=makeReader('detail');
+const makeReader = role => readerFactory({ dataRoot, singleCollector, ...(role === 'history' ? { cacheRoot } : {}) },
+  { timeoutMs: role === 'quick' ? 12000 : role === 'detail' ? 20000 : 45000 }, role);
+let fullReader = makeReader('history');
+const quickReader = makeReader('quick'), detailReader = makeReader('detail');
+const maintenance = new HistoryMaintenance({ dataRoot, cacheRoot, singleCollector });
 const cache = new Map(), backgroundRefreshes = new BackgroundHistoryRefreshes();
 let appsCache = null, appsPending = null, liveCache = null, livePending = null,cacheGeneration=0;
+let controlPending, controlStatusPending, controlStatusCache;
+let stoppingFromOverview = false;
 const clearCache=()=>{cacheGeneration++;cache.clear();backgroundRefreshes.cancelAll();appsCache=appsPending=liveCache=livePending=null;};
-const vault=new VaultService({dataRoot,cacheRoot:encryptedCacheRoot,ownerSid:settings.OwnerSid,guardFactory,onLock:clearCache,onKeys:entries=>{
-  fullReader.close();quickReader.close();detailReader.close();clearCache();
-  fullReader=makeReader('history',entries);quickReader=makeReader('quick',entries);detailReader=makeReader('detail',entries);
-},onMaintenance:async active=>{
-  if(active){await Promise.all([fullReader.close(),quickReader.close(),detailReader.close()]);clearCache();}
-  else{
-    fullReader=makeReader('history',vault.keyEntries);quickReader=makeReader('quick',vault.keyEntries);detailReader=makeReader('detail',vault.keyEntries);clearCache();
-  }
-},waitForCollectors:async()=>{
-  for(let attempt=0;attempt<20;attempt++){
-    const states=await Promise.all(collectorPorts.map(async collectorPort=>{
-      try{const response=await fetch(`http://127.0.0.1:${collectorPort}/api/health`,{signal:AbortSignal.timeout(700)});const state=await response.json();return state.app==='codex-flow'?state.sealedStorage===true:false;}catch{return true;}
-    }));
-    if(states.every(Boolean))return;await new Promise(resolve=>setTimeout(resolve,500));
-  }
-  throw new Error('vault_collectors_need_update');
-}});
 function storeCache(key, data) {
   cache.delete(key); cache.set(key, { at: Date.now(), data, size: JSON.stringify(data).length });
   let size = [...cache.values()].reduce((n,item) => n+item.size,0);
@@ -63,7 +79,7 @@ function storeCache(key, data) {
 async function query(payload, { signal, quick = false, fresh = false } = {}) {
   const key = JSON.stringify([payload, new Date(Date.now()+8*3600000).toISOString().slice(0,10)]);
   const entry = cache.get(key), ttl = quick ? 10000 : payload.type === 'detail' ? 30000 : 60000;
-  const reader = quick ? quickReader : ['detail','harness','ladder','ladder-nodes'].includes(payload.type)?detailReader:fullReader,currentGeneration=cacheGeneration;
+  const reader = quick ? quickReader : ['detail','harness','ladder'].includes(payload.type)?detailReader:fullReader,currentGeneration=cacheGeneration;
   if(signal)backgroundRefreshes.cancel(reader,key);
   const load = async (signal) => {
     const result = await reader.query(payload, { signal });
@@ -88,7 +104,7 @@ async function live(collectorPort) {
       headers: { 'x-codex-flow': '1' }, signal: AbortSignal.timeout(900),
     });
     if (!response.ok) return null;
-    const data = vault.decryptLive(await response.json());
+    const data = await response.json();
     return data.app === 'trafficwatch-live' ? data : null;
   } catch { return null; }
 }
@@ -99,30 +115,16 @@ async function harnessApps() {
   appsPending = loadHarnessApps().finally(()=>{appsPending=null;}); return appsPending;
 }
 async function loadHarnessApps() {
-  if(vault.configured){
-    const saved=await quickReader.query({type:'apps'});appsCache={at:Date.now(),apps:saved.apps};return saved.apps;
-  }
-  try {
-    const response = await fetch(`http://127.0.0.1:${collectorPorts[0]}/api/harness-apps`, {
-      headers: { 'x-codex-flow': '1' }, signal: AbortSignal.timeout(1200),
-    });
-    if (response.ok) {
-      const data = await response.json();
-      const apps = normalizeHarnessApps(data.apps, data.apps?.codex || DEFAULT_CODEX_PROCESS_NAMES);
-      appsCache = { at: Date.now(), apps };
-      return apps;
-    }
-  } catch { /* Use the built-in exact process names while collectors are offline. */ }
-  try {
-    const saved = await quickReader.query({ type: 'apps' });
-    appsCache = { at: Date.now(), apps: saved.apps };
-    return saved.apps;
-  } catch { return normalizeHarnessApps(null, DEFAULT_CODEX_PROCESS_NAMES); }
+  const saved = await quickReader.query({ type: 'apps' });
+  appsCache = { at: Date.now(), apps: saved.apps };
+  return saved.apps;
 }
+
 async function livePacket() {
   if (liveCache && Date.now()-liveCache.at < 1500) return liveCache.value;
-  if (!livePending) livePending = Promise.all(collectorPorts.map(live)).then(([machine,clash])=>{
-    const value = { live: { machine,clash },generatedAt:Date.now() }; liveCache = { at:Date.now(),value }; return value;
+  if (!livePending) livePending = (singleCollector ? live(collectorPorts[0]).then(packet=>singleCollector==='mihomo'?[null,packet]:[packet,null]) : Promise.all(collectorPorts.map(live))).then(([machine,clash])=>{
+    const installedControls=Boolean(settings.DataRoot),capturePaused=installedControls&&fs.existsSync(path.join(dataRoot,'capture-paused'));
+    const value = { live: { machine,clash,installedControls,capturePaused,...(singleCollector?{singleCollector}:{}) },generatedAt:Date.now() }; liveCache = { at:Date.now(),value }; return value;
   }).finally(()=>{livePending=null;});
   return livePending;
 }
@@ -149,7 +151,8 @@ function readJson(req, limit = 4096) {
 async function updateHarnessApps(apps) {
   const current = await harnessApps();
   const normalized = normalizeHarnessApps(apps, current.codex);
-  const previous = vault.configured?[current,current]:await Promise.all(collectorPorts.map(async (collectorPort) => {
+  const targets = singleCollector ? collectorPorts.slice(0,1) : collectorPorts;
+  const previous = await Promise.all(targets.map(async (collectorPort) => {
     const response = await fetch(`http://127.0.0.1:${collectorPort}/api/harness-apps`, {
       headers: { 'x-codex-flow': '1' }, signal: AbortSignal.timeout(2000),
     });
@@ -158,10 +161,10 @@ async function updateHarnessApps(apps) {
   }));
   const changed = [];
   try {
-    for (const [index, collectorPort] of collectorPorts.entries()) {
+    for (const [index, collectorPort] of targets.entries()) {
       const response = await fetch(`http://127.0.0.1:${collectorPort}/api/harness-apps`, {
         method: 'POST',
-        headers: { 'x-codex-flow': '1', 'content-type': 'application/json',...(vault.configured?{'x-trafficwatch-command':signCommand('/api/harness-apps',{apps:normalized},vault.secrets)}:{}) },
+        headers: { 'x-codex-flow': '1', 'content-type': 'application/json' },
         body: JSON.stringify({ apps: normalized }),
         signal: AbortSignal.timeout(2500),
       });
@@ -172,8 +175,8 @@ async function updateHarnessApps(apps) {
     let recovered = true;
     for (const index of changed) {
       try {
-        const response = await fetch(`http://127.0.0.1:${collectorPorts[index]}/api/harness-apps`, {
-          method: 'POST', headers: { 'x-codex-flow': '1', 'content-type': 'application/json',...(vault.configured?{'x-trafficwatch-command':signCommand('/api/harness-apps',{apps:previous[index]},vault.secrets)}:{}) },
+        const response = await fetch(`http://127.0.0.1:${targets[index]}/api/harness-apps`, {
+          method: 'POST', headers: { 'x-codex-flow': '1', 'content-type': 'application/json' },
           body: JSON.stringify({ apps: previous[index] }), signal: AbortSignal.timeout(2500),
         });
         recovered &&= response.ok;
@@ -192,10 +195,6 @@ const assets = new Map([
   ['/overview.css', ['overview.css', 'text/css; charset=utf-8']],
   ['/overview.js', ['overview.js', 'text/javascript; charset=utf-8']],
   ['/history-progress.mjs', ['history-progress.mjs', 'text/javascript; charset=utf-8']],
-  ['/security', ['vault.html','text/html; charset=utf-8']],
-  ['/vault.js', ['vault.js','text/javascript; charset=utf-8']],
-  ['/vault-browser.mjs', ['vault-browser.mjs','text/javascript; charset=utf-8']],
-  ['/vault.css', ['vault.css','text/css; charset=utf-8']],
   ['/storage', ['storage.html','text/html; charset=utf-8']],
   ['/storage.js', ['storage.js','text/javascript; charset=utf-8']],
   ['/storage.css', ['storage.css','text/css; charset=utf-8']],
@@ -208,14 +207,9 @@ const assets = new Map([
   ['/relays.js', ['relays.js','text/javascript; charset=utf-8']],
   ['/relays.css', ['relays.css','text/css; charset=utf-8']],
   ['/icon.svg', ['icon.svg', 'image/svg+xml']],
-  ['/legacy',['index.html','text/html; charset=utf-8']],
-  ...['app.js','i18n.js','desktop.js','history.js','setup.js'].map(file=>['/'+file,[file,'text/javascript; charset=utf-8']]),
-  ['/style.css',['style.css','text/css; charset=utf-8']],
 ]);
 
 const server = http.createServer(async (req, res) => {
-  let securityContext;
-  const bearer=String(req.headers.authorization||'').replace(/^Bearer /,'');
   const abort = new AbortController();
   res.once('close', () => { if (!res.writableEnded) abort.abort(); });
   res.setHeader('Cache-Control', 'no-store');
@@ -224,9 +218,6 @@ const server = http.createServer(async (req, res) => {
   res.setHeader('X-Frame-Options', 'DENY');
   res.setHeader('Content-Security-Policy', "default-src 'self'; script-src 'self'; style-src 'self'; img-src 'self'; connect-src 'self'; object-src 'none'; frame-ancestors 'none'; base-uri 'none'; form-action 'self'");
   const json = (code, data) => {
-    if(code===200&&securityContext&&vault.configured){
-      try{vault.actor(bearer,securityContext);}catch{code=423;data={error:'vault_locked'};}
-    }
     res.writeHead(code, { 'Content-Type': 'application/json; charset=utf-8' }); res.end(JSON.stringify(data));
   };
   if (req.headers.host !== host || (req.headers.origin && req.headers.origin !== `http://${host}`))
@@ -234,31 +225,49 @@ const server = http.createServer(async (req, res) => {
   try {
     const url = new URL(req.url, `http://${host}`);
     if (req.method === 'GET' && url.pathname === '/api/health')
-      return json(200, { app: 'trafficwatch-overview', version: VERSION, collectorPid: process.pid, readOnly: true,
+      return json(200, { app: 'trafficwatch-overview', version: VERSION, collectorPid: process.pid, storage: 'sqlite-wal', singleCollector,
         performance: { quick: quickReader.stats(), history: fullReader.stats(), detail:detailReader.stats(),cachedQueries: cache.size } });
     if (url.pathname.startsWith('/api/')) {
       if (req.headers['x-codex-flow'] !== '1') return json(403, { error: 'local_header_required' });
-      if(await vaultRoute({req,url,json,vault,readJson,clearCache}))return;
-      if(await diagnosticRoute({req,url,json,vault,readJson,dataRoot,token:bearer}))return;
+      if (req.method === 'POST' && url.pathname !== '/api/stop' && req.headers['content-type']?.split(';', 1)[0] !== 'application/json')
+        return json(415, { error: 'json_content_type_required' });
+      // Refuse an incomplete data conversion instead of creating a second history.
+      historyDirectory(dataRoot, 'windows', { singleCollector });
+      if(await diagnosticRoute({req,url,json,maintenance,readJson,dataRoot}))return;
+      if (url.pathname === '/api/storage' && req.method === 'GET')
+        return json(200, await maintenance.request('storage-status', { fresh: url.searchParams.get('fresh') === '1' }));
+      if (req.method === 'POST' && /^\/api\/storage\/(run|compact|cache|policy)$/.test(url.pathname)) {
+        const operation = url.pathname.split('/').at(-1), body = await readJson(req);
+        if (operation === 'cache') {
+          const previous = fullReader;
+          await previous.close(); clearCache();
+          try { return json(200, await maintenance.request('storage-cache')); }
+          finally { fullReader = makeReader('history'); }
+        }
+        return json(operation === 'policy' ? 200 : 202, await maintenance.request('storage-' + operation, { policy: body }));
+      }
       if(req.method==='GET'&&url.pathname==='/api/overview-progress'){
-        if(vault.configured){vault.owner(bearer);securityContext={operation:'read'};}
         const range=url.searchParams.get('range')||'today',date=url.searchParams.get('date')||undefined;
         if(!['today','24h','7d','30d','all','day','month'].includes(range))return json(400,{error:'invalid_range'});
-        return json(200,{query:fullReader.progressFor({type:'overview',range,date}),initialization:vault.initialization||null,ready:!vault.configured||vault.ready});
+        return json(200,{query:fullReader.progressFor({type:'overview',range,date}),ready:true});
       }
       if(url.pathname==='/api/relay-targets'){
-        vault.owner(bearer);
         if(req.method==='GET'){
           const config=readRelayTargetConfig(dataRoot,settings.RelayHosts),backups=listRelayTargetBackups(dataRoot);
-          const relayDir=path.join(dataRoot,'relay-bypass');let status=null,applied=null;
-          try{status=JSON.parse(fs.readFileSync(path.join(relayDir,'status.json'),'utf8'));if(Date.now()-status.at>150000)status={...status,state:'stale'};}catch{}
-          try{applied=JSON.parse(fs.readFileSync(path.join(relayDir,'targets.json'),'utf8'));}catch{}
+          const relayDir = path.join(dataRoot, 'relay-bypass');
+          const read = filename => {
+            try { return JSON.parse(fs.readFileSync(path.join(relayDir, filename), 'utf8')); }
+            catch (error) { if (error.code === 'ENOENT') return null; throw error; }
+          };
+          let status = read('status.json');
+          if (status && Date.now() - status.at > 150000) status = { ...status, state: 'stale' };
+          const applied = read('targets.json');
           const disabled=fs.existsSync(path.join(relayDir,'disabled'))||fs.existsSync(path.join(dataRoot,'stop.request'));
           const pending=relayHostRevision(config.targets.filter(target=>target.enabled).map(target=>target.host))!==applied?.hostRevision;
           return json(200,{...config,backups,status,applied,disabled,pending});
         }
         if(req.method!=='POST')return json(405,{error:'method_not_allowed'});
-        const body=await readJson(req,65536);vault.owner(bearer);let result;
+        const body=await readJson(req,65536);let result;
         const saveOptions={legacyHosts:settings.RelayHosts,expectedRevision:body.revision};
         if(body.action==='save')result=saveRelayTargets(dataRoot,body.targets,saveOptions);
         else if(body.action==='delete'){
@@ -269,66 +278,40 @@ const server = http.createServer(async (req, res) => {
         else if(body.action==='disable-all')result=saveRelayTargets(dataRoot,readRelayTargetConfig(dataRoot,settings.RelayHosts).targets.map(target=>({...target,enabled:false})),saveOptions);
         else if(body.action==='apply'){
           const at=queueRelayReconcile();
-          vault.actor(bearer,{operation:'update'});vault.audit('owner','relay-targets-apply',{at});
           return json(202,{queued:true,at});
         }else return json(400,{error:'invalid_relay_action'});
-        const at=queueRelayReconcile();vault.actor(bearer,{operation:'update'});vault.audit('owner','relay-targets-'+body.action,{count:result.targets.length,at});
+        const at=queueRelayReconcile();
         return json(200,{...result,at,queued:true});
-      }
-      if(url.pathname==='/api/airport-groups'){
-        if(req.method==='GET'){
-          if(vault.configured){vault.owner(bearer);securityContext={operation:'read',lane:'clash'};}
-          return json(200,await quickReader.query({type:'airport-groups'},{signal:abort.signal}));
-        }
-        if(req.method!=='POST')return json(405,{error:'method_not_allowed'});
-        const body=await readJson(req,65536);if(vault.configured){vault.owner(bearer);securityContext={operation:'update'};}
-        const groups=normalizeAirportGroups(body.groups);
-        if(vault.configured){
-          const saved=await vault.callWriter({action:'airport-groups-set',lane:'clash',groups});vault.owner(bearer);clearCache();return json(200,saved);
-        }
-        const response=await fetch(`http://127.0.0.1:${collectorPorts[1]}/api/airport-groups`,{method:'POST',headers:{'x-codex-flow':'1','content-type':'application/json'},body:JSON.stringify({groups}),signal:AbortSignal.timeout(5000)});
-        if(!response.ok)throw new Error('airport_groups_save_failed');
-        const saved=await response.json();clearCache();return json(200,saved);
       }
       if (req.method === 'POST' && url.pathname === '/api/stop') {
         json(200, { ok: true }); setTimeout(close, 100); return;
       }
-      let actor;
-      if(vault.configured){
-        securityContext={operation:url.pathname==='/api/harness-apps'&&req.method==='POST'?'rules':url.searchParams.get('export')==='1'?'export':'read',lane:['/api/detail','/api/harness'].includes(url.pathname)?(url.searchParams.get('lane')||'windows'):['/api/ladder','/api/ladder/nodes'].includes(url.pathname)?'clash':undefined};
-        actor=vault.actor(bearer,securityContext);
-        if(req.method==='GET'&&url.pathname==='/api/live'){
-          if(!actor.owner)return json(403,{error:'grant_live_not_available'});
-          return json(200,await livePacket());
+      if(url.pathname==='/api/control/status'||url.pathname==='/api/control/action'){
+        if(url.pathname==='/api/control/status'&&req.method==='GET'){
+          if(controlStatusCache&&Date.now()-controlStatusCache.at<10000)return json(200,controlStatusCache.value);
+          controlStatusPending??=Promise.resolve().then(()=>controlRunner('Status',root)).finally(()=>{controlStatusPending=null;});
+          const value=await controlStatusPending;
+          controlStatusCache={at:Date.now(),value};return json(200,value);
         }
-        if(!vault.ready)return json(503,{error:'vault_migrating'});
-        if(vault.storageBusy)return json(503,{error:'vault_storage_busy'});
+        if(url.pathname!=='/api/control/action'||req.method!=='POST')return json(405,{error:'method_not_allowed'});
+        if(req.headers.origin!==`http://${host}`)return json(403,{error:'invalid_control_origin'});
+        const body=await readJson(req);
+        if(typeof body?.action!=='string'||!CONTROL_ACTIONS.has(body.action))return json(400,{error:'invalid_control_action'});
+        if(controlPending||stoppingFromOverview)return json(409,{error:'control_action_busy'});
+        controlPending=Promise.resolve().then(()=>controlRunner(body.action,root));
+        try {
+          const result=await controlPending; controlStatusCache=null; liveCache=null;
+          if (body.action === 'Stop') {
+            // The elevated helper has verified that the other components stopped.
+            // Return its result, then shut down this last component as well.
+            stoppingFromOverview = true;
+            const stopViewer = () => setTimeout(close, 100);
+            if (res.destroyed) stopViewer();
+            else res.once('close', stopViewer);
+          }
+          return json(200,result);
+        } finally { controlPending=null; }
       }
-      const authorization=actor&&!actor.owner?{authorizedWindows:actor.windows,allowedLanes:actor.lanes}:{};
-      const importStatus=vault.backgroundImport;
-      if(actor?.owner&&importStatus?.state==='running'&&(importStatus.remaining==null||importStatus.remaining>=16))authorization.skipRollup=true;
-      if(url.pathname.startsWith('/api/legacy/')){
-        if(vault.configured)vault.owner(bearer);
-        const match=/^\/api\/legacy\/(windows|clash)\/(dashboard|calendar|report|correlation|export|settings|capture|stop|update|diagnostics)$/.exec(url.pathname);
-        if(!match)return json(404,{error:'not_found'});
-        const [,lane,operation]=match,route='/api/'+operation,collectorPort=collectorPorts[lane==='windows'?0:1];
-        if(req.method==='POST'){
-          if(!['settings','capture','stop'].includes(operation))return json(403,{error:'legacy_operation_unavailable'});
-          const body=await readJson(req),response=await fetch(`http://127.0.0.1:${collectorPort}${route}`,{method:'POST',headers:{'x-codex-flow':'1','content-type':'application/json',...(vault.configured?{'x-trafficwatch-command':signCommand(route,body,vault.secrets)}:{})},body:JSON.stringify(body),signal:AbortSignal.timeout(10000)});
-          return json(response.status,await response.json());
-        }
-        if(operation==='update')return json(200,{supported:false,state:'unavailable',current:'0.8.0'});
-        if(operation==='diagnostics')return json(200,{app:'trafficwatch',protected:vault.configured,legacy:true});
-        const packet=await livePacket();
-        const result=await fullReader.query({type:'legacy',options:{lane,route,params:url.searchParams.toString(),live:packet.live[lane==='windows'?'machine':'clash']}},{signal:abort.signal});
-        if(vault.configured)vault.owner(bearer);
-        if(operation==='export'){
-          const columns=['host','process','pid','scope','evidence','network','up','down','last_seen'];
-          res.writeHead(200,{'content-type':'text/csv; charset=utf-8','content-disposition':'attachment; filename="trafficwatch-connections.csv"'});res.end('\uFEFF'+[columns.join(','),...result.rows.map(row=>columns.map(column=>csvCell(row[column])).join(','))].join('\r\n'));return;
-        }
-        return json(200,result);
-      }
-      if(actor&&!actor.owner)vault.audit(actor.id,'query',{route:url.pathname,range:url.searchParams.get('range'),lane:securityContext.lane});
       if (req.method === 'GET' && url.pathname === '/api/harness-apps')
         return json(200, { apps: await harnessApps() });
       if (req.method === 'POST' && url.pathname === '/api/harness-apps') {
@@ -343,29 +326,20 @@ const server = http.createServer(async (req, res) => {
         const apps = await harnessApps();
         const quick = url.searchParams.get('quick') === '1';
         const [data, packet] = await Promise.all([
-          query({ type: 'overview', range, date, options: { apps, quick,...authorization } }, { signal: abort.signal, quick, fresh: url.searchParams.get('fresh') === '1' }),actor&&!actor.owner?{live:{machine:null,clash:null}}:livePacket(),
+          query({ type: 'overview', range, date, options: { apps, quick } }, { signal: abort.signal, quick, fresh: url.searchParams.get('fresh') === '1' }),livePacket(),
         ]);
-        return json(200, { ...data, apps, live: packet.live,backgroundImport:actor?.owner?vault.backgroundImport||null:undefined,...(actor&&!actor.owner?{authorization:{lanes:actor.lanes,windows:actor.windows,expiresAt:actor.expiresAt}}:{}) });
+        return json(200, { ...data, apps, live: packet.live });
       }
       if (req.method === 'GET' && url.pathname === '/api/live') {
-        if(actor&&!actor.owner)return json(403,{error:'grant_live_not_available'});
         return json(200, await livePacket());
       }
-      if(url.pathname==='/api/ladder/nodes'){
-        if(req.method!=='GET')return json(405,{error:'method_not_allowed'});
-        if(vault.configured){vault.owner(bearer);securityContext={operation:'read',lane:'clash'};if(!vault.ready)return json(503,{error:'vault_migrating'});if(vault.storageBusy)return json(503,{error:'vault_storage_busy'});}
-        const range=url.searchParams.get('range')||'today',date=url.searchParams.get('date')||undefined;
-        if(!['today','24h','7d','30d','all','day'].includes(range))return json(400,{error:'invalid_range'});
-        const result=await query({type:'ladder-nodes',range,options:{lane:'clash',date}},{signal:abort.signal,fresh:true});
-        return json(200,result.detail);
-      }
       if(req.method==='GET'&&url.pathname==='/api/ladder'){
-        const range=url.searchParams.get('range')||'today',client=url.searchParams.get('client')||'all',airport=(url.searchParams.get('airport')||'').slice(0,64),date=url.searchParams.get('date')||undefined;
+        const range=url.searchParams.get('range')||'today',client=url.searchParams.get('client')||'all',airport=url.searchParams.get('airport')||'',date=url.searchParams.get('date')||undefined;
         if(!['today','24h','7d','30d','all','day'].includes(range))return json(400,{error:'invalid_range'});
-        if(!['all','verge','flclash','mihomo','legacy'].includes(client)||airport&&!/^__unassigned__$|^[a-zA-Z0-9_-]{1,64}$/.test(airport))return json(400,{error:'invalid_filter'});
-        const options={lane:'clash',client,airport,date,apps:await harnessApps(),...authorization};
+        if(!['all','verge','flclash','mihomo','legacy'].includes(client)||!validAirport(airport))return json(400,{error:'invalid_filter'});
+        const options={lane:'clash',client,airport,date,apps:await harnessApps()};
         const result=await query({type:'ladder',range,options},{signal:abort.signal,fresh:url.searchParams.get('fresh')==='1'});
-        return json(200,{...result.detail,...(actor&&!actor.owner?{authorization:{lanes:actor.lanes,windows:actor.windows,expiresAt:actor.expiresAt}}:{})});
+        return json(200,result.detail);
       }
       if (req.method === 'GET' && ['/api/detail','/api/harness'].includes(url.pathname)) {
         const lane = url.searchParams.get('lane') || 'windows';
@@ -385,21 +359,20 @@ const server = http.createServer(async (req, res) => {
           family: url.searchParams.get('family') || '',
           route,
           client:url.searchParams.get('client')||'',
-          airport:(url.searchParams.get('airport')||'').slice(0,64),
+          airport:url.searchParams.get('airport')||'',
           date: url.searchParams.get('date') || undefined,
           from: url.searchParams.has('from') ? url.searchParams.get('from') : undefined,
           to: url.searchParams.has('to') ? url.searchParams.get('to') : undefined,
           apps: await harnessApps(),
-          ...authorization,
         };
         if (options.family && !['codex', 'claude', 'dsh'].includes(options.family)) return json(400, { error: 'invalid_family' });
         if(options.client&&!['all','verge','flclash','mihomo','legacy'].includes(options.client))return json(400,{error:'invalid_client'});
-        if(options.airport&&!/^__unassigned__$|^[a-zA-Z0-9_-]{1,64}$/.test(options.airport))return json(400,{error:'invalid_airport'});
+        if(!validAirport(options.airport)||options.airport&&lane!=='clash')return json(400,{error:'invalid_airport'});
         if(url.pathname==='/api/harness'&&!options.family)return json(400,{error:'invalid_family'});
         if (options.scope && !['codex','other','unknown'].includes(options.scope)) return json(400, { error: 'invalid_scope' });
         if (options.export) options.export = true;
         const result = await query({ type: url.pathname==='/api/harness'?'harness':'detail', range, options }, { signal: abort.signal,fresh:url.searchParams.get('fresh')==='1' });
-        return json(200, {...result.detail,...(actor&&!actor.owner?{authorization:{lanes:actor.lanes,windows:actor.windows,expiresAt:actor.expiresAt}}:{})});
+        return json(200, result.detail);
       }
       return json(404, { error: 'not_found' });
     }
@@ -408,21 +381,25 @@ const server = http.createServer(async (req, res) => {
     res.writeHead(200, { 'Content-Type': asset[1] });
     fs.createReadStream(path.join(root, 'public', asset[0])).on('error', () => res.destroy()).pipe(res);
   } catch (error) {
-    if (res.destroyed || error.message === 'request_cancelled') return;
-    const publicError=/^(vault_|grant_|relay_|invalid_relay|duplicate_relay|invalid_airport_|airport_groups_)/.test(error.message)||['invalid_range','history_busy','history_timeout'].includes(error.message);
-    if (!res.headersSent) json(['vault_migrating','vault_busy','vault_storage_busy','airport_groups_save_failed'].includes(error.message)?503:/^(vault_|grant_)/.test(error.message)?423:/^(relay_|invalid_relay|duplicate_relay|invalid_airport_)/.test(error.message)||['invalid_range','Invalid range','Invalid date'].includes(error.message)?400:503, { error: publicError ? error.message : 'history_unavailable' });
+    if (res.destroyed || abort.signal.aborted) return;
+    if(!res.headersSent&&controlErrors.has(error.message))return json(503,{error:error.message});
+    const invalid = /^(invalid_|relay_|duplicate_relay)/.test(error.message) || error instanceof RangeError;
+    const known = invalid || /^(history_|storage_|archive_|diagnostic_)/.test(error.message);
+    if (!known) console.error('TrafficWatch request failed:', error.code || error.name);
+    if (!res.headersSent) json(invalid ? 400 : 503, { error: known ? error.message : 'history_unavailable' });
     else res.end();
   }
 });
 
 function close() {
-  server.close(); server.closeIdleConnections();vault.close(); fullReader.close(); quickReader.close();detailReader.close();
+  server.close(); server.closeIdleConnections();
   process.removeListener('SIGINT',close);process.removeListener('SIGTERM',close);
+  return Promise.all([maintenance.close(), fullReader.close(), quickReader.close(), detailReader.close()]);
 }
-server.on('error', () => {vault.close(); fullReader.close(); quickReader.close();detailReader.close(); process.exit(1); });
-server.listen(port, '127.0.0.1');
+server.on('error', () => {maintenance.close(); fullReader.close(); quickReader.close();detailReader.close(); process.exit(1); });
+server.listen(port, '127.0.0.1', () => { if (settings.DataRoot && !maintenance.worker) maintenance.start(); });
 process.once('SIGINT', close);
 process.once('SIGTERM', close);
-return {server,vault,close};
+return {server,close};
 }
 if(process.argv[1]&&path.resolve(process.argv[1])===fileURLToPath(import.meta.url))startOverviewServer();

@@ -8,7 +8,6 @@ import { Store } from '../src/store.mjs';
 import { Monitor } from '../src/monitor.mjs';
 import { createServer } from '../src/server.mjs';
 import { DEFAULT_BUDGET, validateBudget, createBudgetCalendar } from '../src/budgets.mjs';
-import { translateAlert } from '../public/i18n.js';
 
 const at = (value) => Date.parse(value + '+08:00');
 const settings = { ...DEFAULT_BUDGET, dailyGB: 1, monthlyGB: 2 };
@@ -62,7 +61,8 @@ test('retention and restarts preserve daily summaries and alert deduplication', 
   store.checkBudgets(now, settings);
   store.checkBudgets(now, settings);
   assert.equal(store.alerts().length, 1);
-  assert.match(translateAlert(store.alerts()[0].message, 'en'), /Daily Codex only budget warning/);
+  const warning=JSON.parse(store.alerts()[0].message);
+  assert.deepEqual([warning.type,warning.kind,warning.scope,warning.exceeded],['budget','day','codex',false]);
   now += 1000;
   store.record(sample(now, 3e8));
   store.checkBudgets(now, settings);

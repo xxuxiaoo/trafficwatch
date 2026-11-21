@@ -3,11 +3,9 @@ import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import path from 'node:path';
 import os from 'node:os';
-import crypto from 'node:crypto';
 import {normalizeMagpieRequest,normalizeMagpieLog,magpieLogTimestamp,IncidentEngine,errorCategory} from '../src/ai-diagnostic-events.mjs';
-import {DiagnosticHistory,DiagnosticSpool} from '../src/ai-diagnostic-store.mjs';
+import {DiagnosticHistory} from '../src/ai-diagnostic-store.mjs';
 import {IncrementalTail} from '../src/ai-log-tail.mjs';
-import {createVaultKeys} from '../src/vault-crypto.mjs';
 
 const raw={id:7,time:'2026-11-15T04:00:00Z',provider:'synthetic',agent:'codex',done:true,status:200,tries:[
   {id:'same-provider',start:'2026-11-15T04:00:00Z',done:true,status:502,error:'EOF private-error',ms:20000},
@@ -18,27 +16,26 @@ function cleanup(dir){
   fs.rmSync(dir,{recursive:true,force:true,maxRetries:5,retryDelay:100});
 }
 async function withHistory(run){
-  const dir=fs.mkdtempSync(path.join(os.tmpdir(),'tw-diag-repair-'));let history,spool;
+  const dir=fs.mkdtempSync(path.join(os.tmpdir(),'tw-diag-repair-'));let history;
   try{
-    const {metadata,secrets}=await createVaultKeys('synthetic-repair-password');
-    const signing=crypto.generateKeyPairSync('ed25519');metadata.capturePublicKey=signing.publicKey.export({format:'pem',type:'spki'});
-    history=new DiagnosticHistory(dir,metadata,secrets);spool=new DiagnosticSpool(dir,metadata,{signingKey:signing.privateKey});
-    await run({history,spool,dir,metadata,secrets});
-  }finally{history?.close();spool?.close();cleanup(dir);}
+
+    history=new DiagnosticHistory(dir);
+    await run({history,dir});
+  }finally{history?.close();cleanup(dir);}
 }
 
-test('same-provider retries survive encrypted import, repeated snapshots and delayed legacy queues',()=>withHistory(({history,spool})=>{
+test('same-provider retries survive direct writes, repeated snapshots and delayed legacy logs',()=>withHistory(({history})=>{
   const rows=normalizeMagpieRequest(raw),legacy={...rows[1],id:rows[1].legacyId,schemaVersion:1};
   assert.notEqual(rows[0].id,rows[1].id);assert.equal(rows[0].legacyId,rows[1].legacyId);
-  spool.append([legacy]);history.drain();
+  history.append([legacy]);
   const period={from:Date.parse(raw.time),to:Date.parse(raw.time)+3600000};
   const query=()=>history.query({windows:[period],...period,kind:'request'});
   assert.equal(query().quality.legacyRequests,1);
-  spool.append(rows);history.drain();
+  history.append(rows);
   let result=query();assert.equal(result.rows.length,2);assert.equal(new Set(result.rows.map(row=>row.requestId)).size,1);
   assert.deepEqual(result.rows.map(row=>row.category).sort(),['eof','success']);assert.equal(result.quality.legacyRequests,0);
   const updated=normalizeMagpieRequest({...raw,tries:[raw.tries[0],{...raw.tries[1],ms:2000}]});
-  assert.equal(updated[1].id,rows[1].id);spool.append([legacy,...updated]);history.drain();
+  assert.equal(updated[1].id,rows[1].id);history.append([legacy,...updated]);
   result=query();assert.equal(result.rows.length,2);assert.equal(result.rows.find(row=>row.category==='success').durationMs,2000);
   assert.doesNotMatch(JSON.stringify(result),/private-error/);
 }));
@@ -55,7 +52,7 @@ test('Go local dates, ISO offsets and fractions preserve occurrence time; unknow
   assert.equal(errorCategory('',499),'cancelled');
 });
 
-test('replayed timestamps replace incorrect logs, delayed legacy logs cannot regress them, exact date visitors see only known occurrences',()=>withHistory(({history})=>{
+test('replayed timestamps replace incorrect logs, delayed legacy logs cannot regress them, exact date filters see only known occurrences',()=>withHistory(({history})=>{
   const row=normalizeMagpieLog('2026-11-14T12:18:41+08:00 relay.example.test EOF',{observedAt:Date.parse('2026-11-15T12:56:52+08:00'),historicalImport:true,hosts:['relay.example.test']});
   const legacy={id:row.id,kind:'log',at:row.observedAt,gateway:'magpie',category:'eof',fault:true};
   const today={from:Date.parse('2026-11-15T00:00:00+08:00'),to:Date.parse('2026-11-16T00:00:00+08:00')};
@@ -73,11 +70,11 @@ test('replayed timestamps replace incorrect logs, delayed legacy logs cannot reg
   assert.equal(incident.evidence.length,0);assert.deepEqual(incident.triggers,[]);assert.equal(incident.legacyEvidence,true);
 }));
 
-test('opening a real legacy encrypted schema flags unknown log time and supports corrected replay',()=>withHistory(({history,dir,metadata,secrets})=>{
+test('opening a real older SQLite schema flags unknown log time and supports corrected replay',()=>withHistory(({history,dir})=>{
   const row=normalizeMagpieLog('2026/11/15 12:18:41 EOF');
   history.put({id:row.id,kind:'log',at:row.at+3600000,category:'eof',fault:true});
   history.db.exec('ALTER TABLE events DROP COLUMN schema_version;ALTER TABLE events DROP COLUMN time_source;DROP TABLE superseded_events');history.close();
-  const upgraded=new DiagnosticHistory(dir,metadata,secrets);
+  const upgraded=new DiagnosticHistory(dir);
   try{
     // Cover both fixture timestamps regardless of the runner's clock or zone.
     const period={from:row.at,to:row.at+2*3600000};

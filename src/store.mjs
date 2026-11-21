@@ -3,13 +3,19 @@ import path from 'node:path';
 import { DatabaseSync } from './database.mjs';
 import { DEFAULT_BUDGET, createBudgetCalendar, budgetPeriod } from './budgets.mjs';
 import { calendarSummary, reportSummary } from './reports.mjs';
-import { historyBounds } from './history-archive.mjs';
+import { archivedSampleExists, historyBounds, initializeArchives } from './history-archive.mjs';
+
+export const RETIRED_AIRPORT_SETTING = 'airportGroups';
 
 export class Store {
-  constructor(dir, { filename = 'monitor.sqlite', encryptionKey, onProgress = () => {} } = {}) {
+  constructor(dir, { filename = 'monitor.sqlite', onProgress = () => {} } = {}) {
     fs.mkdirSync(dir, { recursive: true });
     this.excludedSessions = new Set();
-    this.db = new DatabaseSync(path.join(dir, filename), { encryptionKey });
+    const file = path.join(dir, filename);
+    const fresh = !fs.existsSync(file);
+    this.db = new DatabaseSync(file);
+    this.db.exec('PRAGMA busy_timeout=3000');
+    if (fresh) this.db.exec('PRAGMA auto_vacuum=INCREMENTAL');
     const version = this.db.prepare('PRAGMA user_version').get().user_version;
     if (version > 4) {
       this.db.close();
@@ -61,13 +67,15 @@ export class Store {
       );
       CREATE INDEX IF NOT EXISTS anomalies_time ON anomalies(ended_at);
     `);
-    // Keep application attribution on a small covering index instead of
-    // decrypting the full domain/rule payload for every selected identity.
-    // The index lives inside the same (possibly encrypted) history database.
+    this.db.prepare('DELETE FROM settings WHERE key=?').run(RETIRED_AIRPORT_SETTING);
+    initializeArchives(this);
+    this.archivedSampleExists = at => archivedSampleExists(this.db, at);
+    // Avoid reading domain and rule columns when grouping by process.
     if(!this.db.prepare("SELECT 1 FROM sqlite_master WHERE type='index' AND name='connections_programs'").get()){
       onProgress({stage:'program_index'});
       this.db.exec('CREATE INDEX connections_programs ON connections(id,process,evidence)');
     }
+    this.db.exec('CREATE INDEX IF NOT EXISTS connections_process_name ON connections(process COLLATE NOCASE, id)');
     const bucketColumns = this.db
       .prepare('PRAGMA table_info(buckets)')
       .all()
@@ -255,6 +263,8 @@ export class Store {
     return this.db.prepare('SELECT * FROM alerts ORDER BY at DESC,id DESC LIMIT 20').all();
   }
   set(key, value) {
+    // Older sealed capture batches can still replay this setting after an upgrade.
+    if (key === RETIRED_AIRPORT_SETTING) return;
     this.db.prepare('INSERT OR REPLACE INTO settings VALUES (?,?)').run(key, JSON.stringify(value));
   }
   setHarnessApps(apps, at = Date.now()) {

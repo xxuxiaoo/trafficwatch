@@ -12,17 +12,11 @@ The optional Windows package includes official **Node.js 24.22.1 for Windows x64
 
 ## better-sqlite3-multiple-ciphers / SQLite3MultipleCiphers
 
-The optional encrypted vault uses **better-sqlite3-multiple-ciphers 13.1.1**, MIT licensed, including SQLite3MultipleCiphers. Source: https://github.com/m4heshd/better-sqlite3-multiple-ciphers . Package integrity is pinned in `package-lock.json`; installation scripts are disabled. The Windows package includes only its JavaScript runtime, Windows x64 N-API binary, package metadata and complete MIT license at `node_modules/better-sqlite3-multiple-ciphers/LICENSE`.
+The one-time encrypted-history converter uses **better-sqlite3-multiple-ciphers 13.1.1**, MIT licensed, including SQLite3MultipleCiphers. Source: https://github.com/m4heshd/better-sqlite3-multiple-ciphers . Package integrity is pinned in `package-lock.json`; installation scripts are disabled. The Windows package includes the converter dependency’s JavaScript runtime, Windows x64 N-API binary, package metadata and complete MIT license at `migration/node_modules/better-sqlite3-multiple-ciphers/LICENSE`.
 
 Copyright (c) 2021–2026 Mahesh Bandara Wijerathna; Copyright (c) 2017 Joshua Wise; Copyright (c) 2019–2026 Ulrich Telle. Keep the full bundled license with redistributed binaries. Other operating systems obtain their native binary from the locked npm package.
 
-The pinned transitive dependency **node-addon-api 8.9.2** is MIT licensed, copyright (c) 2017 Node.js API collaborators. Its headers support the SQLite native addon; the Windows package retains its full notice at `node_modules/better-sqlite3-multiple-ciphers/NODE-ADDON-API-LICENSE.md`. Source: https://github.com/nodejs/node-addon-api .
-
-## Microsoft Edge WebView2 SDK
-
-The optional Windows tray build uses Microsoft's official **Microsoft.Web.WebView2 1.0.4258.31** NuGet package. It includes the WinForms/Core managed bindings and the x64 loader. The package's complete `LICENSE.txt` and `NOTICE.txt` are copied to `WEBVIEW2-LICENSE.txt` and `WEBVIEW2-NOTICE.txt` in the generated distribution. Keep these files when redistributing that distribution. Package URL: https://www.nuget.org/packages/Microsoft.Web.WebView2/1.0.4258.31 .
-
-The WebView2 Evergreen Runtime and Windows/.NET Framework are system prerequisites. The build does not bundle or silently install those runtimes. No Microsoft or upstream endorsement is claimed.
+The pinned transitive dependency **node-addon-api 8.9.2** is MIT licensed, copyright (c) 2017 Node.js API collaborators. Its headers support the SQLite native addon. The Windows package retains its full notice at `migration/node_modules/better-sqlite3-multiple-ciphers/NODE-ADDON-API-LICENSE.md`. Source: https://github.com/nodejs/node-addon-api .
 
 ## Microsoft PerfView / TraceEvent
 

@@ -1,5 +1,17 @@
 # Changelog
 
+## 0.10.16
+
+- Write traffic and diagnostic history directly to local SQLite WAL and open a single dashboard without a password or visitor card.
+- Upgrade existing Windows installs with an offline, checked conversion of old encrypted databases, archives, captures, and diagnostic attachments. Retain the original files and the previous program for rollback.
+- Combine the same airport across Clash clients and retain client, node, application, and destination drill-down.
+
+## 0.10.15 — 2026-11-21
+
+- Bring capture controls, traffic trends and airport rankings into the main overview. Open it from the same desktop shortcut and from a smaller tray menu.
+- Combine automatically identified airport labels across clients. Drill down from an airport to its clients, exit nodes and connection details. Remove the manual assignment API and retire stored manual groups during database migration.
+- Retire the old dashboard and embedded desktop windows. The Windows package opens the viewer in the default browser and drops the WebView2 dependency.
+
 ## 0.10.14 — 2026-11-19
 
 - Show which Clash client owns the Windows TUN route, including while it is idle. Record each reachable controller's byte deltas independently during switches and mark gaps when an active controller cannot be read.

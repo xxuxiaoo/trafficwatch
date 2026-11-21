@@ -2,11 +2,11 @@
 
 ## Source development
 
-Use Node.js 24+. Run `npm ci --ignore-scripts --no-audit --no-fund` to install the pinned multiple-cipher SQLite runtime; install scripts are disabled. The legacy collector still uses built-in `node:sqlite` until password encryption is configured. Run `npm run check` and `npm test` from the checkout.
+Use Node.js 24+. Run `npm ci --ignore-scripts --no-audit --no-fund` to install the pinned dependencies. The collectors and viewer use built-in `node:sqlite`. The multiple-cipher driver serves the one-time history converter and its tests. Run `npm run check` and `npm test` from the checkout.
 
-`npm run demo` starts the inherited synthetic-data collector on port 43128 with isolated `data/demo`. Set `CODEX_FLOW_PORT` to an unused port if another collector is running. This command previews the legacy dashboard, without changing boot tasks. `npm start` starts only the unified viewer on port 43131 and needs `windows/monitor.sqlite` and `clash/monitor.sqlite` under its data root. `TRAFFICWATCH_DATA_ROOT` and `TRAFFICWATCH_CACHE_ROOT` can select those directories for a development viewer; `TRAFFICWATCH_OVERVIEW_PORT` selects an unused viewer port. Use an administrator-installed collector for real ETW data.
+On Windows, `npm run demo` starts an isolated synthetic collector on port 43129 and opens the overview on port 43139. It uses `data/demo`. `CODEX_FLOW_PORT` and `TRAFFICWATCH_OVERVIEW_PORT` can select unused ports. `npm start` starts only the viewer on port 43131. `TRAFFICWATCH_DATA_ROOT` and `TRAFFICWATCH_CACHE_ROOT` can select development histories and cache location. Use an administrator-installed collector for real ETW data.
 
-The viewer isolates quick totals, complete overviews and interactive connection details in separate bounded workers. `/api/health` exposes each worker's current stage, elapsed time, queued work, completions and failures without returning traffic records. A detail click shows its time window before waiting for SQL; abandoned page selections cancel their work. Queries retain exact minute attribution and authorized dates across online and archived history.
+The viewer isolates quick totals, complete overviews and interactive connection details in separate bounded workers. `/api/health` exposes each worker's current stage, elapsed time, queued work, completions and failures without returning traffic records. A detail click shows its time window before waiting for SQL; abandoned page selections cancel their work. Queries retain exact minute attribution across online and archived history.
 
 ## Windows package
 
@@ -14,7 +14,7 @@ The viewer isolates quick totals, complete overviews and interactive connection 
 powershell.exe -NoProfile -ExecutionPolicy Bypass -File scripts/build-windows.ps1
 ```
 
-The build requires Windows x64, the .NET Framework C# compiler, and `curl.exe`. It downloads official Node.js 24.22.1 and WebView2 SDK 1.0.4258.31 with pinned SHA256 values. The diagnostic-helper build also downloads Microsoft.Diagnostics.Tracing.TraceEvent 2.0.77 and System.Runtime.CompilerServices.Unsafe 4.5.2 from the official NuGet flat-container API when absent from `.build/dependencies`; it verifies each SHA256 before publishing the downloaded cache file. Generated dependencies, native binaries, desktop executables, staging and archives remain in `.build/`, except a separately invoked `scripts/build-native.ps1` writes its ignored helper under `native/`.
+The build requires Windows x64, the .NET Framework C# compiler, and `curl.exe` for fetching dependencies. It verifies official Node.js 24.22.1, TraceEvent 2.0.77 and System.Runtime.CompilerServices.Unsafe 4.5.2 against pinned SHA256 values. The static front end is staged from `public/`. Package output and dependency caches are under `.build/`.
 
 Outputs:
 
@@ -24,9 +24,9 @@ Outputs:
 
 To keep an existing build available, pass a new staging path under `.build` and a separate archive name, for example `-StageRoot .build/windows-0.10.13 -OutputFile .build/release-0.10.13/trafficwatch-windows-x64.zip`. A custom staging path must not already exist; the default `.build/windows` path is refreshed in place.
 
-The Node.js, WebView2, encrypted SQLite, YAML and diagnostic dependency licenses/notices are copied into the package. Edge WebView2 Evergreen Runtime and .NET Framework 4.8 are installed system prerequisites. Generated EXEs are unsigned. Digest checks verify the pinned dependencies and archive contents, not Windows publisher identity.
+The build includes Node.js, SQLite, YAML and diagnostic dependency notices. The tray requires .NET Framework 4.8 and opens the viewer in the default browser. Generated EXEs are unsigned. Check the release archive and manifest hashes before use.
 
-For an offline build, install the locked npm dependencies ahead of time, and pass `-DependencyRoot` pointing to an extracted, already available official-compatible package containing `runtime/node.exe`, the Node.js licenses/checksums, the three WebView2 DLLs and their license/notice files. The same executable/DLL hashes are checked. Also prepopulate this checkout's `.build/dependencies/traceevent-2.0.77.nupkg` and `.build/dependencies/unsafe-4.5.2.nupkg` using the official URLs and SHA256 pins in `scripts/build-diagnostics.ps1`; those packages are checked even when cached. Staging must stay inside this checkout's `.build` directory; a supplied custom stage must not already exist.
+For an offline build, install the locked npm dependencies ahead of time and pass `-DependencyRoot` pointing to an existing package with `runtime/node.exe`, `runtime/NODE-LICENSE.txt` and `runtime/SHASUMS256.txt`. Prepopulate `.build/dependencies/traceevent-2.0.77.nupkg` and `.build/dependencies/unsafe-4.5.2.nupkg` using the official URLs and SHA256 pins in `scripts/build-diagnostics.ps1`. The build checks cached dependencies too.
 
 ## Fresh installation
 
@@ -50,19 +50,21 @@ Run as the Windows user who owns the Clash configuration and accept elevation fo
 - Configuration: the installing user's Clash Verge Rev application-data directory.
 - `TrafficWatch - Open-source Netwatch`: SYSTEM boot task; starts two independent collectors before user login.
 - `TrafficWatch - Tray`: limited user task at login; exiting the tray keeps collection running.
-- Desktop shortcut: `TrafficWatch.lnk`, opening the suite controller. An existing shortcut with that name is left alone.
+- Desktop shortcut: `TrafficWatch.lnk`, opening the traffic and control view. An existing shortcut with that name is left alone.
 
-The installer creates local `config.local.json` and `suite-settings.json`; neither contains a copied controller secret. The supervisor reads the local configured secret when starting the Mihomo collector. The owner gets Modify access to the chosen data directory, while executables stay under Program Files. `-NoStart` creates the installation and tasks without starting them immediately.
+The installer creates local `config.local.json` and `suite-settings.json`; neither contains a copied controller secret. The supervisor reads the local configured secret when starting the Mihomo collector. The data directory grants access to the installation owner, SYSTEM and Administrators. Executables stay under Program Files. `-NoStart` creates the installation and tasks without starting them immediately.
 
-This is a **fresh installer**. It refuses an existing program directory, same-name tasks, occupied monitoring ports or a non-empty data directory. It does not migrate or overwrite an existing installation. A setup error removes only tasks created by that attempt and leaves its partial program/data directories for inspection. No user history is recursively deleted. A future migration installer must separately handle backups and rollback.
+This is a **fresh installer**. It refuses an existing program directory, same-name tasks, occupied monitoring ports or a non-empty data directory. A setup error removes only tasks created by that attempt and leaves its partial program/data directories for inspection. Use the upgrade script below for an existing installation.
+
+## In-place upgrade
+
+Extract the reviewed Windows package into a separate folder. Run its `scripts/upgrade-windows.ps1 -Preflight` from normal PowerShell to verify files, version, access and free space. Run the same script without `-Preflight` from administrator PowerShell to replace the existing installation.
+
+An encrypted installation asks for the old TrafficWatch password or recovery code once in that window. The upgrade verifies three converted SQLite databases and their pending captures from copies, then switches them together. It retains the original history, keys and backups under the existing data path. Failed validation stops the switch. The previous program is kept for rollback, and the task names, user preferences and tray shortcut stay at their existing locations.
 
 ## Viewing and control
 
-Open the desktop shortcut to start/stop the suite, reopen the tray or enable/disable startup. The controller starts the overview service when opening the main view. Addresses:
-
-- Unified view: http://127.0.0.1:43131/
-- Legacy Windows view: http://127.0.0.1:43128/?legacy=1
-- Legacy Mihomo view: http://127.0.0.1:43130/?legacy=1
+Open the desktop shortcut or choose **Open TrafficWatch** in the tray. Both open http://127.0.0.1:43131/ in your Windows session. The overview can start or pause the collectors, reopen the tray or change startup preferences. To close the entire suite, choose **More controls → Stop TrafficWatch**. This closes the background components and the viewer. Reopen the desktop shortcut for access and choose **Start collection** to resume recording. The 43128 and 43130 collector interfaces redirect browser visits to the overview.
 
 Native collection can continue while Clash is closed. The proxy lane will report its source unavailable until the controller is accessible. Controller counters cannot reconstruct missed proxy connections.
 

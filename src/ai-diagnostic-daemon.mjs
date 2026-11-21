@@ -7,13 +7,12 @@ import os from 'node:os';
 import {spawn} from 'node:child_process';
 import {createInterface} from 'node:readline';
 import {fileURLToPath} from 'node:url';
-import {DiagnosticSpool} from './ai-diagnostic-store.mjs';
+import {DiagnosticHistory} from './ai-diagnostic-store.mjs';
 import {normalizeMagpieRequest,normalizeMagpieLog,IncidentEngine,eventId,errorCategory,DIAGNOSTIC_SCHEMA_VERSION} from './ai-diagnostic-events.mjs';
 import {IncrementalTail} from './ai-log-tail.mjs';
 import {appRoot,readSettings,discoverPhysical,physicalDns,probeRelay,runNetworkScript} from './ai-windows.mjs';
 import {activeRelayHosts} from './relay-targets.mjs';
 import {productionController,controllerCall} from './relay-clash-overlay.mjs';
-import {commandVerifier} from './vault-commands.mjs';
 import {DiagnosticLogSources} from './ai-log-sources.mjs';
 import {requestCoverage,collectionSnapshot} from './ai-diagnostic-quality.mjs';
 import {buildProviderTargets,mappedProviderHost} from './ai-provider-targets.mjs';
@@ -23,12 +22,11 @@ export async function startAiDiagnostics({settings=readSettings()}={}){
   const baseSettings=settings;settings={...settings,RelayHosts:activeRelayHosts(settings)};
   const dataRoot=settings.DataRoot,dir=path.join(dataRoot,'diagnostics');fs.mkdirSync(dir,{recursive:true});
   if(fs.existsSync(path.join(dir,'disabled'))||fs.existsSync(path.join(dataRoot,'stop.request')))return;
-  if(!fs.existsSync(path.join(dataRoot,'vault','vault.json')))return;
-  const metadata=JSON.parse(fs.readFileSync(path.join(dataRoot,'vault','vault.json'),'utf8')),verify=commandVerifier(metadata.commandPublicKey),spool=new DiagnosticSpool(dataRoot,metadata);
+  const history = new DiagnosticHistory(dataRoot);
   const startedAt=Date.now();
   let pending=[],stopping=false,flushing=false,lastTick=0,trace=null,traceState='starting',traceRetry=0,lost=0,localDrops=0,resourceStart=process.cpuUsage(),lastResource=Date.now(),activeHost='',controller=null,pktmonState='starting',lastPktIncident=null,feedState='detecting',feedCursor='now',feedOrigin='',feedNextCheck=0,lastTraceAt=0,pktmonCheckedAt=0,lastCollectionCheck=0,magpieParseFailures=0;
   // A new cursor generation replays available source logs once through the
-  // corrected parser. Corrected events supersede legacy IDs in encrypted storage.
+  // corrected parser. Corrected events supersede legacy IDs in history.
   const seen=new Map(),tails=new Map(),checkpointFile=path.join(dir,'cursors-v3.json');
   let checkpoints={};try{checkpoints=JSON.parse(fs.readFileSync(checkpointFile,'utf8'));}catch{}
   const metrics={events:0,requests:0,faults:0,polls:0,errors:0,probeBytes:0,traceEventsLost:0,boundedDrops:0,pending:0};
@@ -40,7 +38,7 @@ export async function startAiDiagnostics({settings=readSettings()}={}){
     if(!event.historicalImport)engine.observe((event.end||event.at)<Date.now()-30*60000?{...event,lateHistoricalRecord:true}:event);
     if(['request','probe','gap','mark','log','route','resource','status'].includes(event.kind))persist(event);
   };
-  function flush(){if(flushing||!pending.length)return;flushing=true;try{spool.append(pending);pending=[];}finally{flushing=false;}}
+  function flush(){if(flushing||!pending.length)return;flushing=true;try{history.append(pending);pending=[];}finally{flushing=false;}}
   const gapTimes=new Map();
   function gap(category,source=''){metrics.errors++;const key=category+source,now=Date.now();if(now-(gapTimes.get(key)||0)<60000)return;gapTimes.set(key,now);observe({id:crypto.randomUUID(),kind:'gap',at:now,category,...(source?{source}:{})});}
   function withCoverage(event){return {...event,coverage:requestCoverage(event,{ring:engine.ring,startedAt,traceState,lastTraceAt,targets:targetState()?.targets||[]})};}
@@ -159,9 +157,9 @@ export async function startAiDiagnostics({settings=readSettings()}={}){
       if(result?.file){
         const expected=path.resolve(dir,'pktmon-private'),file=path.resolve(result.file);if(path.dirname(file)!==expected||!file.endsWith('.etl'))throw new Error('invalid_pktmon_file');
         const bytes=fs.readFileSync(file);try{
-          // Packet payload flag is disabled. Store a signed public-key encrypted attachment before removing the native temporary.
-          const {sealPacket,packetFormat}=await import('./vault-crypto.mjs');const id=crypto.randomUUID(),packet=sealPacket({bytes:bytes.toString('base64'),from:result.from,to:result.to},metadata.publicKey,{format:packetFormat,vault:metadata.id,lane:'diagnostics',id},spool.signingKey);
-          const attachments=path.join(dir,'attachments');fs.mkdirSync(attachments,{recursive:true});fs.writeFileSync(path.join(attachments,id+'.sealed'),JSON.stringify(packet));
+          // PktMon records trace metadata only. Persist it before removing its temporary file.
+          const id = crypto.randomUUID();
+          history.putAttachment(id,result.from,result.to,bytes);
           observe({kind:'status',category:'pktmon_attachment',id,at:Date.now(),from:result.from,to:result.to,incidentId,stage,bytes:bytes.length,packetPayload:false});
           fs.unlinkSync(file);
         }finally{bytes.fill(0);}
@@ -182,10 +180,10 @@ export async function startAiDiagnostics({settings=readSettings()}={}){
   function checkCollection(){
     const routing=[...tails].filter(([key])=>!key.startsWith('app')).map(([,tail])=>tail.status),available=routing.filter(item=>item.state!=='missing');
     const magpie={id:'magpie',state:available.some(item=>item.state==='read_error')?'read_error':available.some(item=>item.bytesBehind)?'backlog':available.length?'caught_up':'missing',capability:'attempts_and_phases',files:available.length,bytesBehind:available.reduce((sum,item)=>sum+(item.bytesBehind||0),0),lastPollAt:Date.now(),parseFailures:magpieParseFailures,timeFailures:metrics.unknownLogTimes||0,feedState};
-    const snapshot=collectionSnapshot({sources:[magpie,...logSources.snapshot()],traceState,lastTraceAt,pktmonState,pktmonCheckedAt,metrics,queuePending:pending.length>1024});
+    const snapshot=collectionSnapshot({sources:[magpie,...logSources.snapshot()],traceState,lastTraceAt,pktmonState,pktmonCheckedAt,metrics,writePending:pending.length>1024});
     observe(snapshot);flush();logSources.resetCounters();magpieParseFailures=0;metrics.unknownLogTimes=0;lastCollectionCheck=Date.now();
   }
-  const health=()=>({app:'trafficwatch-ai-diagnostics',pid:process.pid,state:stopping?'stopped':'recording',at:Date.now(),trace:traceState,pktmon:pktmonState,metrics:{traceEventsLost:metrics.traceEventsLost,boundedDrops:metrics.boundedDrops,unknownLogTimes:metrics.unknownLogTimes||0},resources:{rssBytes:process.memoryUsage().rss,ringBytes:engine.ring.bytes},features:{magpie:'incremental_files',requestFeed:feedState,traceEvent:'2.0.77',pktmonPayload:false,eventSchema:DIAGNOSTIC_SCHEMA_VERSION,slowRequestCapture:true,logAdapters:['magpie','cc-switch','codex','claude','dsh'],collectionChecks:true,providerTargetMapping:2,tcpConnectRetry:true},encrypted:true});
+  const health=()=>({app:'trafficwatch-ai-diagnostics',pid:process.pid,state:stopping?'stopped':'recording',at:Date.now(),trace:traceState,pktmon:pktmonState,metrics:{traceEventsLost:metrics.traceEventsLost,boundedDrops:metrics.boundedDrops,unknownLogTimes:metrics.unknownLogTimes||0},resources:{rssBytes:process.memoryUsage().rss,ringBytes:engine.ring.bytes},features:{magpie:'incremental_files',requestFeed:feedState,traceEvent:'2.0.77',pktmonPayload:false,eventSchema:DIAGNOSTIC_SCHEMA_VERSION,slowRequestCapture:true,logAdapters:['magpie','cc-switch','codex','claude','dsh'],collectionChecks:true,providerTargetMapping:2,tcpConnectRetry:true},storage:'sqlite-wal'});
   const server=http.createServer(async(req,res)=>{
     const json=(code,data)=>{res.writeHead(code,{'content-type':'application/json','cache-control':'no-store'});res.end(JSON.stringify(data));};
     if(req.headers.host!=='127.0.0.1:43132'||req.headers.origin&&req.headers.origin!=='http://127.0.0.1:43132')return json(403,{error:'local_origin_required'});
@@ -193,7 +191,7 @@ export async function startAiDiagnostics({settings=readSettings()}={}){
     if(req.method!=='POST'||req.headers['x-codex-flow']!=='1')return json(403,{error:'local_header_required'});
     let raw='';for await(const chunk of req){raw+=chunk;if(raw.length>4096)return json(400,{error:'invalid_body'});}
     let body;try{body=JSON.parse(raw||'{}');}catch{return json(400,{error:'invalid_body'});}
-    if(!verify(req.headers['x-trafficwatch-command'],req.url,body))return json(403,{error:'signed_owner_command_required'});
+    if (req.headers['content-type']?.split(';', 1)[0] !== 'application/json') return json(415,{error:'json_content_type_required'});
     if(req.url==='/api/mark'){const at=Date.now();observe({id:crypto.randomUUID(),kind:'mark',at,category:'manual',fault:true});flush();return json(200,{ok:true,at});}
     if(req.url==='/api/stop'){json(200,{ok:true});setTimeout(stop,100);return;}json(404,{error:'not_found'});
   });
@@ -221,7 +219,7 @@ export async function startAiDiagnostics({settings=readSettings()}={}){
     const deadline=Date.now()+15000;while(pktBusy&&Date.now()<deadline)await new Promise(resolve=>setTimeout(resolve,100));
     engine.finish('interrupted');flush();
     try{await runNetworkScript('TrafficWatch-PktMon.ps1','Stop');}catch{}
-    logSources.close();spool.close();server.close();
+    logSources.close();history.close();server.close();
   }
   let timer,probing=false;
   const probeTimer=setInterval(()=>{if(!probing&&!stopping){probing=true;connectivity().catch(()=>gap('connectivity_poll_failed')).finally(()=>{probing=false;});}},60000);

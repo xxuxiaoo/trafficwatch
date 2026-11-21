@@ -8,22 +8,38 @@ import { once } from 'node:events';
 import { fileURLToPath } from 'node:url';
 
 if (process.platform !== 'win32') throw new Error('The portable smoke test requires Windows.');
-const root = path.resolve(
-  process.argv[2] ||
-    fileURLToPath(new URL('../data/windows-package-stage/codex-netwatch', import.meta.url)),
-);
+const root = path.resolve(process.argv[2] || fileURLToPath(new URL('../.build/windows/TrafficWatch', import.meta.url)));
 const exe = path.join(root, 'Codex-Netwatch.exe');
 assert.ok(fs.existsSync(exe), 'Build the portable ZIP before running this test.');
 const data = fs.mkdtempSync(path.join(os.tmpdir(), 'netwatch-portable-'));
 const pause = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 const children = [];
-let env, port, observedToken, smokeError;
-async function freePort() {
-  const server = http.createServer();
-  await new Promise((resolve) => server.listen(0, '127.0.0.1', resolve));
-  const value = server.address().port;
-  await new Promise((resolve) => server.close(resolve));
-  return value;
+let env, port, host, observedToken, smokeError, lastProbe, stage;
+function listen(server, port) {
+  return new Promise((resolve, reject) => {
+    server.once('error', reject);
+    server.listen(port, '127.0.0.1', () => {
+      server.removeListener('error', reject);
+      resolve(server.address().port);
+    });
+  });
+}
+const close = server => new Promise((resolve, reject) => server.close(error => error ? reject(error) : resolve()));
+function overviewPort(port) { return port === 43129 ? 43139 : port === 65535 ? port - 1 : port + 1; }
+async function freePorts() {
+  for (let attempt = 0; attempt < 10; attempt++) {
+    const collector = http.createServer(), overview = http.createServer();
+    const candidate = await listen(collector, 0);
+    try {
+      await listen(overview, overviewPort(candidate));
+      await close(overview);
+      return candidate;
+    } catch (error) {
+      if (error.code !== 'EADDRINUSE') throw error;
+      console.log(`Selecting another port pair: ${error.message}`);
+    } finally { await close(collector); }
+  }
+  throw new Error('No free pair of collector and overview ports');
 }
 function launch(args = []) {
   const child = spawn(exe, ['--demo', '--no-browser', ...args], {
@@ -37,29 +53,42 @@ function launch(args = []) {
 }
 async function command(name) {
   const child = launch([name]);
-  const done = once(child, 'exit');
-  let timeout;
-  try {
-    const result = await Promise.race([
-      done,
-      new Promise((_, reject) => {
-        timeout = setTimeout(() => reject(new Error(`Tray control timeout: ${name}`)), 12000);
-      }),
-    ]);
-    assert.equal(result[0], 0, `Tray control failed: ${name}`);
-  } finally {
-    clearTimeout(timeout);
+  await expectExit(child, `Tray control ${name}`);
+}
+async function expectExit(child, label) {
+  let code = child.exitCode;
+  if (code === null && !child.signalCode) {
+    try { [code] = await once(child, 'exit', { signal: AbortSignal.timeout(12000) }); }
+    catch (error) { throw new Error(`${label} did not exit: ${error.message}`, { cause: error }); }
   }
+  assert.equal(code, 0, `${label} exit code`);
+}
+function request(port, route, init = {}, timeout = 8000) {
+  return new Promise((resolve, reject) => {
+    const req = http.request({
+      host: '127.0.0.1', port, path: route, method: init.method, headers: init.headers,
+      agent: false, signal: AbortSignal.timeout(timeout),
+    }, res => {
+      let body = '';
+      res.setEncoding('utf8');
+      res.on('data', chunk => { body += chunk; });
+      res.once('error', reject);
+      res.once('end', () => resolve({ status: res.statusCode, headers: res.headers, body }));
+    });
+    req.once('error', reject);
+    req.end(init.body);
+  });
 }
 async function health() {
   try {
-    const result = await fetch(`http://127.0.0.1:${port}/api/health`, {
-      signal: AbortSignal.timeout(1000),
-    });
-    return result.ok ? await result.json() : null;
-  } catch {
+    const result = await request(port, '/api/health', {}, 1000);
+    if (result.status === 200) { lastProbe = undefined; return JSON.parse(result.body); }
+    lastProbe = `HTTP ${result.status}`;
+  } catch (error) {
+    lastProbe = error.code || error.message;
     return null;
   }
+  return null;
 }
 async function until(predicate, message, duration = 20000) {
   const end = Date.now() + duration;
@@ -67,12 +96,16 @@ async function until(predicate, message, duration = 20000) {
     if (await predicate()) return;
     await pause(100);
   }
-  throw new Error(message);
+  throw new Error(`${message}${lastProbe ? ` (${lastProbe})` : ''}`);
 }
+const step = message => { stage = message; console.log(`Portable smoke: ${message}`); };
 try {
-  port = await freePort();
+  stage = 'select test ports';
+  port = await freePorts();
   env = { ...process.env, NETWATCH_TEST_SILENT: '1', CODEX_FLOW_PORT: String(port), CODEX_FLOW_DATA_DIR: data };
-  const host = launch();
+  const viewPort = overviewPort(port);
+  step(`start isolated demo on ${port}, overview on ${viewPort}`);
+  host = launch();
   await until(
     async () => /^[a-f0-9]{64}$/.test((await health())?.desktopInstance || ''),
     'Desktop collector readiness timeout',
@@ -82,15 +115,49 @@ try {
   assert.equal(first.demo, true);
   assert.equal(first.app, 'codex-flow');
   assert.ok(fs.existsSync(path.join(data, 'demo', 'monitor.sqlite')));
-  const result = await fetch(`http://127.0.0.1:${port}/api/stop`, {
+  step('reject stop without ownership token');
+  const result = await request(port, '/api/stop', {
     method: 'POST',
     headers: { 'X-Codex-Flow': '1' },
     body: '{}',
   });
   assert.equal(result.status, 403, 'Desktop stop must reject requests without the ownership token');
+  step('verify single instance and launch overview');
   const duplicate = launch();
-  assert.equal((await once(duplicate, 'exit'))[0], 0);
+  await expectExit(duplicate, 'Duplicate launch');
   assert.equal((await health()).desktopInstance, first.desktopInstance);
+  const open = spawn(exe, ['--demo'], { cwd:root,env,stdio:'ignore',windowsHide:true });
+  children.push(open);
+  await expectExit(open, 'Open overview');
+  const viewBase=`http://127.0.0.1:${viewPort}`;
+  const redirect=await request(port,'/');
+  assert.equal(redirect.status,302);
+  assert.equal(redirect.headers.location,viewBase+'/');
+  await until(async()=>{
+    try {
+      const response = await request(viewPort, '/api/health', {}, 800);
+      const info = JSON.parse(response.body);
+      lastProbe = `${info.app || 'unknown app'} (HTTP ${response.status})`;
+      return response.status === 200 && info.app === 'trafficwatch-overview' && info.singleCollector === 'demo';
+    } catch (error) { lastProbe = error.code || error.message; return false; }
+  },'Portable overview did not start',8000);
+  step('read the demo data in the overview');
+  let overviewResponse;
+  try {
+    overviewResponse = await request(viewPort, '/api/overview?range=24h', { headers: { 'x-codex-flow': '1' } });
+  } catch (error) {
+    const results = await Promise.allSettled([request(viewPort, '/api/health'),
+      request(viewPort, '/api/overview-progress?range=24h', { headers: { 'x-codex-flow': '1' } }),
+      request(port, '/api/harness-apps', { headers: { 'x-codex-flow': '1' } })
+    ].map(async probe => JSON.parse((await probe).body)));
+    console.error('Overview diagnostics after timeout:', JSON.stringify(results));
+    throw error;
+  }
+  assert.equal(overviewResponse.status,200);
+  const overview=JSON.parse(overviewResponse.body);
+  assert.equal(overview.machine.available,true);assert.equal(overview.clash.available,false);
+  assert.equal(overview.live.singleCollector,'demo');assert.equal(overview.live.installedControls,false);
+  step('stop and restart the collector');
   await command('--stop');
   await until(async () => !(await health()), 'Tray stop did not stop collector');
   assert.equal(host.exitCode, null, 'Stopping collector must retain the tray');
@@ -106,17 +173,27 @@ try {
     async () => (await health())?.desktopInstance === first.desktopInstance,
     'Tray restart failed',
   );
-  const exit = once(host, 'exit');
+  step('exit tray and confirm collector stops');
   await command('--exit');
-  await exit;
-  assert.equal(host.exitCode, 0);
+  await expectExit(host, 'Portable tray');
   await until(async () => !(await health()), 'Exiting tray left collector running');
   await until(
     () => !fs.existsSync(path.join(data, 'demo', 'collector.lock')),
     'Exited collector did not release its data-directory lock',
     6000,
   );
+  await until(async () => {
+    try {
+      const response = await request(viewPort, '/api/health', {}, 800);
+      lastProbe = `HTTP ${response.status}`;
+      return false;
+    } catch (error) {
+      lastProbe = error.code || error.message;
+      return error.code === 'ECONNREFUSED';
+    }
+  }, 'Exiting tray left its overview listening', 6000);
 
+  step('ensure the tray never stops a foreign listener');
   let stopRequests = 0;
   const foreign = http.createServer((req, res) => {
     if (req.url === '/api/stop') stopRequests++;
@@ -130,49 +207,48 @@ try {
       }),
     );
   });
-  await new Promise((resolve) => foreign.listen(port, '127.0.0.1', resolve));
+  await listen(foreign, port);
   try {
-    const attached = launch();
+    const attached = host = launch();
     // The foreign HTTP server is already ready; give the tray time to construct its controls.
     await pause(1000);
     await command('--stop');
     assert.equal(stopRequests, 0, 'Tray must never stop a pre-existing HTTP service');
-    const attachedExit = once(attached, 'exit');
     await command('--exit');
-    await attachedExit;
+    await expectExit(attached, 'Tray attached to foreign listener');
     assert.equal(stopRequests, 0);
     assert.equal((await health()).desktopInstance, 'foreign-owner');
   } finally {
-    await new Promise((resolve) => foreign.close(resolve));
+    await close(foreign);
   }
   console.log(
-    'Portable smoke: bundled runtime, own collector startup/stop/restart/exit, single instance, lock cleanup, and foreign-service safety passed.',
+    'Portable smoke: bundled runtime, own collector startup/stop/restart/exit, single instance, overview redirect and isolated demo data, lock cleanup, and foreign-service safety passed.',
   );
 } catch (error) {
-  smokeError = error;
-  throw error;
+  smokeError = new Error(`Portable smoke failed at "${stage}": ${error.message}`, { cause: error });
+  const log = path.join(data, 'demo', 'tray.log');
+  if (fs.existsSync(log)) console.error(fs.readFileSync(log, 'utf8').trimEnd());
+  throw smokeError;
 } finally {
   // Signal the exact tray/data-directory group before terminating any remaining test hosts.
-  try {
-    await command('--exit');
-  } catch {
-    /* No host remaining is expected. */
+  if (env && children.some(child => child.exitCode === null && !child.signalCode)) {
+    try { await command('--exit'); if (host) await expectExit(host, 'Test tray cleanup'); }
+    catch (error) { console.error(`Test tray cleanup: ${error.message}`); }
   }
   if (observedToken && (await health())?.desktopInstance === observedToken) {
     try {
-      await fetch(`http://127.0.0.1:${port}/api/stop`, {
+      const stopped = await request(port, '/api/stop', {
         method: 'POST',
         headers: { 'X-Codex-Flow': '1', 'X-Codex-Desktop-Token': observedToken },
         body: '{}',
-        signal: AbortSignal.timeout(2000),
-      });
+      }, 2000);
+      assert.equal(stopped.status, 200);
       await until(async () => !(await health()), 'Test collector cleanup failed', 6000);
-    } catch {
-      /* Remaining exact test host handles are closed below. */
-    }
+    } catch (error) { console.error(`Test collector cleanup: ${error.message}`); }
   }
   for (const child of children) if (child.exitCode === null) child.kill();
   await pause(150);
+  assert.equal(path.dirname(fs.realpathSync(data)), fs.realpathSync(os.tmpdir()), 'Test data must remain inside the temporary directory');
   try { fs.rmSync(data, { recursive: true, force: true, maxRetries: 10, retryDelay: 300 }); }
   catch (error) {
     if (!smokeError) throw error;

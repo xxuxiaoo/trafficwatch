@@ -1,24 +1,12 @@
-import {initializeVault,vaultHeaders,checkVaultResponse,importProgressText} from './vault-browser.mjs';
-import {queryProgressView,createImportRefreshTracker} from './history-progress.mjs';
+import {queryProgressView} from './history-progress.mjs';
 const $ = (id) => document.getElementById(id);
-const importRefreshTracker=createImportRefreshTracker();
-let vaultState;
-await initializeVault({overview:true,onStatus:value=>{
-  vaultState=value;renderImportState();
-  if(importRefreshTracker(value)){if(refreshPromise)refreshAfterImport=true;else refresh(true);}
-}});
-function renderImportState(){
-  const target=$('backgroundImportNotice');if(!target)return;
-  const text=importProgressText(vaultState?.backgroundImport);
-  target.hidden=!text;if(target.textContent!==text)target.textContent=text;
-}
 const pageNames = {
   overview: '流量总览',
   apps: '本机全部应用',
   ladder: '梯子流量',
   harness: 'Harness 用量',
   investigate: '高峰与采集缺口',
-  settings: '设置与旧版备份',
+  settings: '设置',
 };
 const familyNames = { codex: 'Codex', claude: 'Claude Code', dsh: 'dsh', other: '其他应用', unknown: '待识别' };
 const evidenceNames = {
@@ -38,13 +26,14 @@ let refreshTimer = 0, refreshSequence = 0, detailSequence = 0, harnessSequence =
 let activeAppDetail = null, activeLadderDetail = null, activeFamily = 'codex', harnessLoadedKey = '';
 let appDetailData = null, ladderDetailData = null;
 let liveTimer = 0, livePacket = null, detailHistory = [], harnessResult = null;
-let ladderFilterAbort=null,ladderFilterData=null,ladderFilterDataKey='',ladderFilterPendingKey='',ladderFilterError='',ladderFilterSequence=0,airportNodeSelection=null;
-let airportInventory=null,airportInventoryKey='',airportInventoryPendingKey='',airportInventoryError='',airportInventoryAbort=null,airportNodeLimit=120;
+let ladderFilterAbort=null,ladderFilterData=null,ladderFilterDataKey='',ladderFilterPendingKey='',ladderFilterError='',ladderFilterSequence=0;
 let harnessLoadedAt = 0,harnessResultKey='';
 let preferences = readPreferences();
-let historyAbort, detailAbort, harnessAbort, liveAbort, refreshPromise, refreshKey = '', dataKey = '';
+let historyAbort, detailAbort, harnessAbort, liveAbort, controlStatusAbort, refreshPromise, refreshKey = '', dataKey = '';
 let historyState = 'loading', historyError = '', monthLoadedAt = 0, appPage = 0, settingsInitialized = false;
-let progressTimer=0,historyProgress=null,historyStartedAt=0,refreshAfterImport=false;
+let progressTimer=0,historyProgress=null,historyStartedAt=0;
+let controlStatusTimer=0,controlStatus=null,controlStatusError='',controlActionPending=false;
+let installedControls=false;
 const snapshotCache = new Map();
 const queryKey = () => `${range}|${range === 'day' ? selectedDate : calendarDate()}`;
 const isCancelled = (error) => error?.name === 'AbortError' || error?.message === 'request_cancelled';
@@ -132,12 +121,11 @@ async function api(url, options = {}) {
   const response = await fetch(url, {
     ...options,
     signal: options.signal ? AbortSignal.any([options.signal, AbortSignal.timeout(options.timeoutMs || 55000)]) : AbortSignal.timeout(options.timeoutMs || 55000),
-    headers: { 'X-Codex-Flow': '1',...vaultHeaders(), ...(options.body ? { 'Content-Type': 'application/json' } : {}), ...options.headers },
+    headers: { 'X-Codex-Flow': '1',...(options.body ? { 'Content-Type': 'application/json' } : {}), ...options.headers },
   });
-  await checkVaultResponse(response);
   if (!response.ok) {
     const value = await response.json().catch(() => ({}));
-    const labels = { history_timeout: '历史查询超时，请重试', history_busy: '历史查询繁忙，请稍后重试', history_unavailable: '历史暂时不可读', invalid_range: '日期或时段无效',vault_migrating:'正在打开加密记录，完成后会自动加载。',vault_storage_busy:'正在回收数据库空页，完成后恢复查询；采集照常继续' };
+    const labels = { history_timeout: '历史查询超时，请重试', history_busy: '历史查询繁忙，请稍后重试', history_unavailable: '历史暂时不可读', invalid_range: '日期或时段无效',history_migration_required:'请先完成旧版历史迁移，原记录已保留。',control_helper_missing:'当前是查看模式，Windows 套件未安装',control_action_cancelled:'已取消 Windows 管理员确认',control_action_busy:'另一个控制操作正在进行',control_action_timeout:'控制操作超时，请刷新状态',control_action_failed:'Windows 控制操作失败，请查看安装目录的 logs/control.log',control_session_required:'请从当前 Windows 登录会话打开流量中心' };
     throw Object.assign(new Error(labels[value.error] || value.error || `本机服务响应 ${response.status}`),{code:value.error});
   }
   return response.json();
@@ -160,6 +148,8 @@ function setView(next,{resumeDetails=true}={}) {
   if (!Object.hasOwn(pageNames, next)) return;
   if(view!==next){
     if(['apps','ladder'].includes(view)){detailAbort?.abort();detailSequence++;}
+    if(view==='ladder'){ladderFilterAbort?.abort();ladderFilterPendingKey='';ladderFilterSequence++;}
+    if(view==='overview'){clearTimeout(controlStatusTimer);controlStatusAbort?.abort();}
     if(view==='harness'){harnessAbort?.abort();harnessSequence++;harnessLoadedKey='';}
   }
   hideChartTooltip();
@@ -176,14 +166,14 @@ function setView(next,{resumeDetails=true}={}) {
   }
   $('pageTitle').textContent = view === 'overview' ? '流量总览' : pageNames[view];
   renderHeader();
-  if (view === 'overview') renderOverview();
+  if (view === 'overview') {renderOverview();refreshControlStatus();}
   if (view === 'apps') {renderApps();if(resumeDetails&&activeAppDetail&&!appDetailData)loadAppDetail(activeAppDetail);}
   if (view === 'ladder') {renderLadder();if(resumeDetails&&activeLadderDetail&&!ladderDetailData)loadLadderDetail(activeLadderDetail);}
   if (view === 'harness') { renderHarnessTabs(); if (harnessResult?.[0] === activeFamily) renderHarness(...harnessResult); if (dataKey === queryKey()) loadHarness(activeFamily); }
   if (view === 'investigate') renderInvestigation();
   if (view === 'settings') renderSettings();
 }
-for (const button of document.querySelectorAll('[data-view-button]')) button.addEventListener('click', () => setView(button.dataset.viewButton));
+for (const button of document.querySelectorAll('[data-view-button]')) button.addEventListener('click', event => {event.preventDefault();setView(button.dataset.viewButton);});
 
 function proxyStatusLabel(proxy) {
   if (proxy.state === 'partial') return proxy.routeClient ? `${proxyClientName(proxy.routeClient)} 接管 · 控制器不可读` : '部分控制器不可读';
@@ -230,16 +220,42 @@ function setSourceStatus(id, live, expected) {
   return fresh;
 }
 function renderLiveStatus() {
-  const machineLive = setSourceStatus('machineStatus', livePacket ? livePacket.machine : data?.live?.machine, 'native');
-  const clashLive = setSourceStatus('clashStatus', livePacket ? livePacket.clash : data?.live?.clash, 'mihomo');
-  const selection=livePacket?.clash?.capture?.proxy||data?.live?.clash?.capture?.proxy;
-  const selectionFresh=Number.isFinite(selection?.observedAt)&&Date.now()>=selection.observedAt&&Date.now()-selection.observedAt<(livePacket?.clash?.intervalMs||data?.live?.clash?.intervalMs||1000)+6000;
+  const packet=livePacket||data?.live||{},single=packet.singleCollector;
+  const machineLive = setSourceStatus('machineStatus',packet.machine,single==='demo'?'demo':single==='auto'?packet.machine?.capture?.active||'native':'native');
+  const clashLive = setSourceStatus('clashStatus',packet.clash,'mihomo');
+  $('machineStatus').hidden=single==='mihomo';$('clashStatus').hidden=Boolean(single&&single!=='mihomo');
+  if(typeof packet.installedControls==='boolean')installedControls=packet.installedControls;
+  $('collectorControls').hidden=!installedControls;
+  $('portableNotice').hidden=!single;
+  if(single)setText($('portableNotice'),single==='demo'?'演示数据 · 不计入实际流量':single==='mihomo'?'便携模式 · 仅采集 Mihomo':'便携模式 · 单路采集，自动模式可能在本机与代理来源间切换');
+  setText($('overviewMachineLabel'),single==='auto'||single==='demo'?'便携采集':'本机已观测');
+  const selection=packet.clash?.capture?.proxy;
+  const selectionFresh=Number.isFinite(selection?.observedAt)&&Date.now()>=selection.observedAt&&Date.now()-selection.observedAt<(packet.clash?.intervalMs||1000)+6000;
   const uncertain=selectionFresh&&(selection.state==='partial'||selection.routing==='multiple');
-  const status = uncertain?'is-warning':machineLive&&clashLive?'is-live':'is-offline';
+  const active=single?(machineLive||clashLive):(machineLive&&clashLive);
+  const status = uncertain?'is-warning':active?'is-live':'is-offline';
   if ($('sidebarCollectorDot').className !== status) $('sidebarCollectorDot').className = status;
-  const collectorText=selectionFresh&&proxyStatusLabel(selection)||(!machineLive||!clashLive?'历史可看 · 部分采集未运行':'两路采集均在运行');
+  const collectorText=selectionFresh&&proxyStatusLabel(selection)||(single?(active?'便携采集运行中':'便携采集未连接'):active?'两路采集均在运行':'历史可看 · 部分采集未运行');
   setText($('sidebarCollectorText'),collectorText);
   setAttribute($('selectedDate'), 'max', calendarDate());
+  renderCollectorControlStatus();
+}
+function renderCollectorControlStatus(){
+  const live=livePacket||data?.live||{};
+  const machine=live.machine,clash=live.clash;
+  const machineName=machine?.state==='connected'?'本机采集运行中':machine?'本机采集未连接':'本机状态未知';
+  const clashName=clash?.state==='connected'?proxyStatusLabel(clash.capture?.proxy||{})||'梯子采集运行中':clash?'梯子采集未连接':'梯子状态未知';
+  setText($('collectorControlStatus'),live.capturePaused?'流量采集已暂停 · 可以查看历史':`${machineName} · ${clashName}`);
+  const extended=controlStatusError?`控制状态暂不可读：${controlProblem(controlStatusError)}`:controlStatus
+    ? `${controlStatus.Startup} · 诊断：${controlStatus.Diagnostics} · 路由：${controlStatus.Bypass} · 托盘：${controlStatus.Tray}`
+    : '正在读取控制状态…';
+  setText($('collectorControlAdvancedStatus'),extended);
+  $('controlStart').disabled=controlActionPending||Boolean(!live.capturePaused&&machine&&clash);
+  $('controlStop').disabled=controlActionPending||Boolean(live.capturePaused&&!machine&&!clash);
+  for(const button of document.querySelectorAll('[data-control-action]'))button.disabled=controlActionPending;
+}
+function controlProblem(reason){
+  return ({control_helper_missing:'控制助手未安装',control_action_cancelled:'已取消管理员确认',control_action_busy:'已有操作在执行',control_session_required:'请从已登录的 Windows 桌面打开流量中心',control_action_timeout:'操作未在规定时间内结束，请刷新状态',control_action_failed:'控制助手执行失败，请查看 TrafficWatch 控制日志',control_status_invalid:'控制助手返回了无法识别的状态'})[reason]||reason;
 }
 function renderHeader() {
   setText($('pageTitle'), pageNames[view]);
@@ -537,15 +553,16 @@ function renderOverview() {
   $('overviewProxyDirections').textContent = `↑ ${bytes(clash.groups?.proxy?.up)}　↓ ${bytes(clash.groups?.proxy?.down)}`;
   const familyTotals = machine.familyTotals || {};
   const harnessBytes = ['codex', 'claude', 'dsh'].reduce((n, key) => n + total(familyTotals[key]), 0);
-  $('overviewHarness').textContent = bytes(harnessBytes);
+  $('overviewHarness').textContent = machine.available?bytes(harnessBytes):'不可用';
   $('overviewHarnessBreakdown').textContent = ['codex', 'claude', 'dsh'].map((key) => `${familyNames[key]} ${bytes(total(familyTotals[key]))}`).join('　');
   const unknownBytes = total(familyTotals.unknown) + total(machine.unassigned);
-  $('overviewUnknown').textContent = bytes(unknownBytes);
+  $('overviewUnknown').textContent = machine.available?bytes(unknownBytes):'不可用';
   $('overviewUnknownNote').textContent = `待识别进程 ${bytes(total(familyTotals.unknown))} · 未归因差额 ${bytes(total(machine.unassigned))}`;
   if (machine.detailReady === false) {
     renderPendingAttribution();
   }
   $('measurementNote').textContent = '本机总量来自 Windows 进程事件；梯子只计 Clash 已归因到代理节点的连接。两种位置分别记数，代理进程与应用可重复出现，不要相加当账单。';
+  renderCollectorControlStatus();
 
   drawChart($('overviewChart'), [
     chartSeries('本机已观测', machine.timeline, machine),
@@ -555,6 +572,7 @@ function renderOverview() {
   });
   renderPeaks($('peakRows'), machine.peaks, 'machine');
   renderCompactPrograms($('topProcessRows'), machine.allPrograms, 6, (row) => selectApp(row));
+  renderAirportUsage(clash,'overviewAirportRows',6);
   if (machine.detailReady === false) renderPendingAttribution();
   renderIntegrity(machine, clash);
   renderOverviewWarnings(machine, clash);
@@ -596,15 +614,30 @@ function renderIntegrity(machine, clash) {
 }
 function renderOverviewWarnings(machine, clash) {
   const target = $('overviewWarnings'); target.replaceChildren();
+  const labels={upload_burst:'Codex 上传突增',download_burst:'Codex 下载突增',sustained_upload:'Codex 持续上传'};
   const messages = [];
   if (machine.firstAt > machine.range?.from) messages.push(`已选${rangeLabel()}；本机记录从 ${time(machine.firstAt,true)} 开始，更早的时间没有历史数据。`);
   if (machine.available && machine.coverage?.percent < 70) messages.push(`本机所选时段覆盖率 ${percent(machine.coverage.percent)}；合计只代表实际采集到的时间。`);
   if (machine.available && machine.connectionCountersExceedGlobal) messages.push('按连接累加的进程流量超过本机全局采样值。代理本机链路可能在多个进程层出现，进程排行用于定位，不能代替网卡账单。');
   if (clash.available && clash.connectionCountersExceedGlobal) messages.push('Clash 连接快照累计与其全局计数存在差异；代理出口用量仅作定位参考。');
-  if (messages.length) {
-    target.classList.add('has-warning');
-    for (const message of messages) target.append(node('p', message));
-  } else target.classList.remove('has-warning');
+  for (const message of messages) target.append(node('p', message));
+  for (const [history,lane] of [[machine,'windows'],[clash,'clash']]) {
+    const finding=history.anomalies?.find(item=>Object.hasOwn(labels,item.kind));
+    if(!finding)continue;
+    const title=`${lane==='clash'?'Clash 观测':'本机观测'} · ${labels[finding.kind]}`;
+    const label=`${time(finding.endedAt,true)} · ${title} ${bytes(finding.bytes)}${finding.process?' · '+finding.process:''}`;
+    const button=node('button',label,'traffic-alert');button.type='button';
+    const from=Math.max(history.range.from,finding.startedAt),to=Math.min(history.range.to,finding.endedAt+1);
+    button.addEventListener('click',()=>{
+      if(lane==='windows')showTimeDetail(from,to,title,{family:'codex'});
+      else {
+        $('proxyAirportFilter').value='all';$('proxyClientFilter').value='all';$('routeFilter').value='all';
+        clearLadderDetail();setView('ladder',{resumeDetails:false});loadLadderDetail({from,to,title,family:'codex'});
+      }
+    });
+    target.append(button);
+  }
+  target.classList.toggle('has-warning',target.childElementCount>0);
 }
 function renderBudgetStrip() {
   const target = $('budgetStrip'); target.replaceChildren();
@@ -749,7 +782,7 @@ function showTimeDetail(from, to, title, filters = {}) {
   openAppSelection({ ...filters, from, to, page: 0, title: `${title} · ${time(from, true)}` });
 }
 function proxyClientName(client){return ({verge:'Clash Verge',flclash:'FlClash',mihomo:'Mihomo / 其他',legacy:'旧记录（客户端未标记）'})[client]||'未知客户端';}
-function airportName(clash,id){return clash.airportGroups?.find(group=>group.id===id)?.name||clash.airportUsage?.find(row=>row.airport===id&&row.airportName)?.airportName||'未归类机场';}
+function airportName(row){return row?.airportName||'未归类机场';}
 function selectedLadderFilter(){return {client:$('proxyClientFilter').value||'all',airport:$('proxyAirportFilter').value||'all'};}
 function ladderFilterKey(){const filter=selectedLadderFilter();return `${queryKey()}|${filter.client}|${filter.airport}`;}
 function currentLadderData(){
@@ -772,89 +805,71 @@ async function loadLadderFilter(force=false){
   }catch(error){if(signal.aborted||sequence!==ladderFilterSequence||isCancelled(error))return;ladderFilterError=error.message;ladderFilterData=null;ladderFilterDataKey=key;}
   finally{if(sequence===ladderFilterSequence){ladderFilterPendingKey='';if(view==='ladder')renderLadder();}}
 }
-async function loadAirportInventory(force=false){
-  const key=queryKey();if(airportInventoryKey&&airportInventoryKey!==key)airportNodeLimit=120;if(!force&&airportInventoryKey===key&&airportInventory)return;
-  if(airportInventoryPendingKey===key)return;
-  airportInventoryAbort?.abort();airportInventoryAbort=new AbortController();const signal=airportInventoryAbort.signal,sequence=(loadAirportInventory.sequence||0)+1;loadAirportInventory.sequence=sequence;
-  airportInventoryPendingKey=key;airportInventoryError='';setText($('airportNodeCount'),'正在读取此时间范围的代理节点…');
-  try{
-    const result=await api('/api/ladder/nodes?'+rangeParams(),{signal});if(signal.aborted||sequence!==loadAirportInventory.sequence)return;
-    if(!result.available)throw new Error('梯子历史暂不可读');airportInventory=result.clientNodes||[];airportInventoryKey=key;airportInventoryError='';
-  }catch(error){if(signal.aborted||sequence!==loadAirportInventory.sequence||isCancelled(error))return;airportInventory=null;airportInventoryKey=key;airportInventoryError=error.message;}
-  finally{if(sequence===loadAirportInventory.sequence){airportInventoryPendingKey='';if(view==='ladder'&&data?.clash)renderAirportManager(data.clash);}}
-}
 function renderAirportControls(clash){
-  const select=$('proxyAirportFilter'),current=select.value||'all',options=[['all','全部机场'],['__unassigned__','未归类机场'],...(clash.airportGroups||[]).map(group=>[group.id,group.name])];
-  const known=new Set(options.map(([id])=>id));
-  for(const row of clash.airportUsage||[])if(row.airport&&row.airportName&&!known.has(row.airport)){
-    options.push([row.airport,row.airportName]);known.add(row.airport);
-  }
+  const select=$('proxyAirportFilter'),current=select.value||'all',options=[['all','全部机场'],...(clash.airportUsage||[]).map(row=>[row.airport,airportName(row)])];
+  if(!options.some(([key])=>key===current)&&select.selectedOptions[0])options.push([current,select.selectedOptions[0].textContent]);
+  if(JSON.stringify(options)===select.dataset.options)return;
+  select.dataset.options=JSON.stringify(options);
   select.replaceChildren(...options.map(([value,label])=>{const option=node('option',label);option.value=value;return option;}));
   select.value=options.some(([value])=>value===current)?current:'all';
 }
-function renderAirportUsage(clash){
-  const target=$('airportUsageRows'),rows=clash?.airportUsage||[],proxyTotal=total(clash?.groups?.proxy);target.replaceChildren();
-  if(ladderFilterError){const retry=node('button',`机场统计未完成：${ladderFilterError}。点击重试`,'empty-state');retry.type='button';retry.addEventListener('click',()=>loadLadderFilter(true));target.append(retry);return;}
-  if(!clash){target.append(node('p',ladderFilterPendingKey?'正在按客户端与机场重新汇总…':'选择客户端或机场后显示用量。','empty-state'));return;}
-  if(clash.detailReady===false){target.append(node('p','正在汇总机场用量…','empty-state'));return;}
-  if(!rows.length){target.append(node('p','当前范围没有可归因到代理节点的流量。','empty-state'));return;}
-  for(const row of rows){
-    const button=node('button');button.type='button';button.className='airport-usage-row';
-    const identity=node('span',undefined,'airport-usage-identity'),title=node('strong',row.airportName||airportName(clash,row.airport)),client=node('small',proxyClientName(row.client)+(row.airportName?' · 自动识别':''));identity.append(title,client);
+function selectAirport(row,client='all'){
+  if(!data?.clash?.available)return;
+  renderAirportControls(data.clash);
+  $('proxyClientFilter').value=client;
+  $('proxyAirportFilter').value=row.airport;
+  $('routeFilter').value='proxy';
+  clearLadderDetail();
+  setView('ladder',{resumeDetails:false});
+  document.querySelector('.airport-usage-section').scrollIntoView({behavior:'instant',block:'start'});
+}
+function renderAirportUsage(clash,targetId='airportUsageRows',limit=Infinity){
+  const target=$(targetId),rows=clash?.airportUsage||[],proxyTotal=total(clash?.groups?.proxy);target.replaceChildren();
+  if(targetId==='airportUsageRows'&&ladderFilterError){const retry=node('button',`机场统计未完成：${ladderFilterError}。点击重试`,'empty-state');retry.type='button';retry.addEventListener('click',()=>loadLadderFilter(true));target.append(retry);return;}
+  if(!clash){target.append(node('p','正在读取机场统计…','empty-state'));return;}
+  if(!clash.available){target.append(node('p','代理历史暂不可读。','empty-state'));return;}
+  if(!rows.length){target.append(node('p',clash.detailReady===false?'正在汇总机场用量…':'当前范围没有可归因到代理节点的流量。','empty-state'));return;}
+  const selected=targetId==='airportUsageRows'&&selectedLadderFilter().airport!=='all';
+  for(const row of rows.slice(0,limit)){
+    const item=node('article',undefined,'airport-usage-item'),button=node('button');button.type='button';button.className='airport-usage-row';
+    const identity=node('span',undefined,'airport-usage-identity');identity.append(node('strong',airportName(row)));
     const directions=node('span',undefined,'airport-usage-directions');directions.append(node('small',`↑ ${bytes(row.up)}　↓ ${bytes(row.down)}`),node('small',`${row.connections.toLocaleString('zh-CN')} 条连接 · ${proxyTotal?percent(total(row)/proxyTotal*100):'—'}`));
-    const amount=node('strong',bytes(total(row)),'airport-usage-amount');button.append(identity,directions,amount);
-    button.addEventListener('click',()=>{
-      $('proxyClientFilter').value=row.client;$('proxyAirportFilter').value=row.airport||'__unassigned__';clearLadderDetail();loadLadderFilter();
-    });target.append(button);
+    button.append(identity,directions,node('strong',bytes(total(row)),'airport-usage-amount'));
+    button.addEventListener('click',()=>selectAirport(row,'all'));
+    if(!selected)item.append(button);
+    const clients=node('div',undefined,'airport-client-breakdown');
+    for(const entry of row.clients||[]){const client=node('button',`${proxyClientName(entry.client)} · ${bytes(total(entry))}`,'airport-client-filter');client.type='button';client.title=`上传 ${bytes(entry.up)}，下载 ${bytes(entry.down)}，${entry.connections} 条连接`;client.setAttribute('aria-pressed',String(targetId==='airportUsageRows'&&selectedLadderFilter().client===entry.client));client.addEventListener('click',()=>selectAirport(row,entry.client));clients.append(client);}
+    if(selected&&selectedLadderFilter().client!=='all'){
+      const all=node('button','全部客户端','airport-client-filter');all.type='button';all.addEventListener('click',()=>selectAirport(row,'all'));clients.append(all);
+    }
+    item.classList.toggle('airport-selected',selected);item.append(clients);target.append(item);
   }
-}
-function renderAirportManager(clash){
-  const groups=clash.airportGroups||[],inventoryReady=airportInventoryKey===queryKey()&&airportInventory!==null,nodes=inventoryReady?airportInventory:[],search=$('airportNodeSearch').value.trim().toLocaleLowerCase(),name=$('airportGroupName').value.trim();
-  if(document.querySelector('.airport-manager').open&&!inventoryReady&&!airportInventoryPendingKey&&!(airportInventoryKey===queryKey()&&airportInventoryError))loadAirportInventory();
-  const editing=groups.find(group=>group.name.toLocaleLowerCase()===name.toLocaleLowerCase());
-  if(airportNodeSelection===null)airportNodeSelection=new Set((editing?.members||[]).map(member=>`${member.client}\0${member.node}`));
-  const matching=nodes.filter(item=>!search||`${proxyClientName(item.client)} ${item.name}`.toLocaleLowerCase().includes(search));
-  const choices=$('airportNodeChoices');choices.replaceChildren();
-  for(const item of matching.slice(0,airportNodeLimit)){
-    const label=node('label',undefined,'airport-node-choice'),checkbox=node('input');checkbox.type='checkbox';checkbox.dataset.client=item.client;checkbox.dataset.node=item.name;checkbox.checked=airportNodeSelection.has(`${item.client}\0${item.name}`);
-    checkbox.addEventListener('change',()=>{const key=`${item.client}\0${item.name}`;if(checkbox.checked)airportNodeSelection.add(key);else airportNodeSelection.delete(key);});
-    label.append(checkbox,node('span',`${proxyClientName(item.client)} · ${item.name}`),node('small',bytes(Number(item.up||0)+Number(item.down||0))));choices.append(label);
-  }
-  const count=$('airportNodeCount'),countText=airportInventoryError?`节点列表读取失败：${airportInventoryError}`:!inventoryReady?`展开后读取当前时段已采集到的客户端与出口节点。`:nodes.length?`显示 ${Math.min(airportNodeLimit,matching.length)} / ${matching.length} 个匹配节点 · 历史中共 ${nodes.length} 个客户端节点；可输入关键词缩小范围。`:'这个时段没有新采集到可识别客户端的代理节点。';
-  count.replaceChildren(node('span',countText));
-  if(airportInventoryError){const retry=node('button','重试读取','quiet-button');retry.type='button';retry.addEventListener('click',()=>loadAirportInventory(true));count.append(' ',retry);}
-  else if(inventoryReady&&matching.length>airportNodeLimit){const more=node('button','显示更多节点','quiet-button');more.type='button';more.addEventListener('click',()=>{airportNodeLimit+=120;renderAirportManager(clash);});count.append(' ',more);}
-  const groupList=$('airportGroupRows');groupList.replaceChildren();
-  if(!groups.length)groupList.append(node('p','可手动归类旧记录或未识别的节点。','empty-state'));
-  for(const group of groups){
-    const row=node('div',undefined,'airport-group-row'),edit=node('button',`${group.name} · ${group.members.length} 个节点`,'quiet-button');edit.type='button';edit.addEventListener('click',()=>{airportNodeSelection=new Set(group.members.map(member=>`${member.client}\0${member.node}`));$('airportGroupName').value=group.name;$('airportNodeSearch').value='';renderAirportManager(clash);});
-    const remove=node('button','删除归类','quiet-button');remove.type='button';remove.addEventListener('click',()=>{if($('airportGroupName').value===group.name){$('airportGroupName').value='';airportNodeSelection=new Set();}saveAirportGroups(groups.filter(item=>item.id!==group.id),'已删除机场归类；历史连接会回到未归类。');});
-    row.append(edit,remove);groupList.append(row);
-  }
-}
-async function saveAirportGroups(groups,successText){
-  const button=$('saveAirportGroup');button.disabled=true;$('airportGroupStatus').textContent='正在保存机场归类…';
-  try{
-    const saved=await api('/api/airport-groups',{method:'POST',body:JSON.stringify({groups})});
-    if(data?.clash)data.clash.airportGroups=saved.groups;
-    $('airportGroupStatus').textContent=successText||'机场归类已保存，所选历史时段正在重新汇总。';dataKey='';clearDetails();renderLadder();refresh(true);
-  }catch(error){$('airportGroupStatus').textContent=`保存失败：${error.message}`;}
-  finally{button.disabled=false;}
+  if(rows.length>limit)target.append(node('p',`还有 ${rows.length-limit} 个机场，请打开梯子流量查看。`,'muted'));
 }
 function renderLadder() {
   const base=data?.clash;
   if (!base?.available) {
-    if(data) {$('routeSummary').replaceChildren(node('p','梯子历史暂不可读，点击刷新可重试。','empty-state'));for(const id of ['ladderProcessRows','ladderDomainRows','ladderNodeRows'])$(id).replaceChildren(node('p','等待历史记录…','empty-state'));$('ladderChart').width=1;$('ladderChart').height=1;}
+    if(data) {$('routeSummary').hidden=false;$('routeSummary').replaceChildren(node('p','梯子历史暂不可读。','empty-state'));renderAirportUsage(base);for(const id of ['ladderProcessRows','ladderDomainRows','ladderNodeRows'])$(id).replaceChildren(node('p','没有可读取的历史记录','empty-state'));releaseChart($('ladderChart'));$('ladderTicks').replaceChildren();}
     return;
   }
-  renderAirportControls(base);renderAirportManager(base);
+  renderAirportControls(base);
+  const filter=selectedLadderFilter();
+  const isAirport=filter.airport!=='all';
+  $('clearProxyFilters').hidden=!isAirport&&filter.client==='all';
+  setText($('activeAirportTitle'),isAirport?$('proxyAirportFilter').selectedOptions[0].textContent:'机场用量');
+  $('routeFilter').disabled=isAirport;
+  if(isAirport)$('routeFilter').value='proxy';
   const ladder=currentLadderData();renderAirportUsage(ladder);
+  const airportUsage=ladder?.available?ladder.groups.proxy:null;
+  $('showAirportConnections').hidden=!isAirport||!airportUsage;
+  setText($('activeAirportMeta'),isAirport?`${filter.client==='all'?'全部客户端':proxyClientName(filter.client)} · ${airportUsage?`${bytes(total(airportUsage))}（↑ ${bytes(airportUsage.up)}　↓ ${bytes(airportUsage.down)}）`:ladderFilterError?'暂不可读':'正在读取'}`:'');
+  $('routeSummary').hidden=isAirport;
   if(!ladder){
-    $('routeSummary').replaceChildren(node('p','正在按客户端与机场汇总所选时段…','empty-state'));
+    $('routeSummary').replaceChildren(node('p',ladderFilterError?'筛选未完成':'正在汇总所选时段…','empty-state'));
     for(const id of ['ladderProcessRows','ladderDomainRows','ladderNodeRows'])$(id).replaceChildren(node('p','正在汇总筛选结果…','empty-state'));
     releaseChart($('ladderChart'));if(!ladderFilterPendingKey&&!ladderFilterError)loadLadderFilter();return;
   }
-  renderTotals($('routeSummary'), { ...ladder.groups,...(ladder.unassigned?{unassigned:ladder.unassigned}:{}) }, (route) => {
+  if(!isAirport)renderTotals($('routeSummary'), { ...ladder.groups,...(ladder.unassigned?{unassigned:ladder.unassigned}:{}) }, (route) => {
     $('routeFilter').value = route;
     detailAbort?.abort();detailSequence++;
     activeLadderDetail = null; ladderDetailData = null; $('ladderDetail').hidden = true;
@@ -884,19 +899,20 @@ async function loadLadderDetail(selection) {
   activeLadderDetail = selection;
   ladderDetailData = null;
   $('ladderDetail').hidden = false;
-  $('ladderDetailTitle').textContent = selection.title;
+    $('ladderDetailTitle').textContent = selection.title;
   $('ladderDetailMeta').textContent = `${selection.from ? time(selection.from,true)+' 至 '+time(selection.to,true)+' · ' : ''}正在读取这个范围的应用与连接…`;
   $('ladderDetail').setAttribute('aria-busy','true');$('exportLadderDetail').disabled=true;$('ladderDetailRetry').hidden=true;
   $('ladderConnectionRows').replaceChildren();$('ladderPager').replaceChildren();releaseChart($('ladderDetailChart'));
   // Navigate as soon as the click is accepted. History work must not hold the
   // user at the chart with no visible acknowledgement of the selected interval.
-  $('ladderDetail').scrollIntoView({behavior:'smooth',block:'start'});
+  $('ladderDetail').scrollIntoView({behavior:'instant',block:'start'});
   const current = ++detailSequence;
   try {
     const result = await requestDetail('clash', {
       process: selection.process,
       host: selection.host,
       node: selection.node,
+      family: selection.family,
       route: $('routeFilter').value,
       client:selection.client??$('proxyClientFilter').value,
       airport:(selection.airport??$('proxyAirportFilter').value)==='all'?'':selection.airport??$('proxyAirportFilter').value,
@@ -924,7 +940,9 @@ function renderLadderDetail(selection, result) {
   if (!result.connections.length) { const tr = node('tr'); const td = node('td', '这个时段没有匹配的代理连接。', 'empty-state'); td.colSpan = 9; tr.append(td); body.append(tr); }
   for (const row of result.connections) {
     const tr = node('tr');
-    tr.append(node('td',proxyClientName(row.client)),node('td',row.airportName||airportName(data?.clash||{},row.airport)),node('td', time(row.lastAt, true)), node('td', row.process || '未识别'), node('td', row.host), node('td', row.node || '未知出口'), node('td', bytes(row.up)), node('td', bytes(row.down)), node('td', bytes(row.amount), 'numeric-strong'));
+    const address=row.destinationIP||row.host, ipPort=row.destinationPort?`${address?.includes(':')?`[${address}]`:address}:${row.destinationPort}`:address;
+    const target=row.host&&row.host!==address?[row.host,ipPort].filter(Boolean).join(' · '):ipPort||'未知目标';
+    tr.append(node('td',proxyClientName(row.client)),node('td',airportName(row)),node('td', time(row.lastAt, true)), node('td', row.process || '未识别'), node('td', target), node('td', row.node || '未知出口'), node('td', bytes(row.up)), node('td', bytes(row.down)), node('td', bytes(row.amount), 'numeric-strong'));
     body.append(tr);
   }
   renderPager('ladderPager', result.pagination, (page) => loadLadderDetail({ ...selection, page }));
@@ -1108,7 +1126,8 @@ function exportAppsCsv(rows, name) {
 function exportConnectionsCsv(rows, filename) {
   exportCsv(filename, [
     { label: '进程名', value: 'process' }, { label: 'PID', value: 'pid' }, { label: '目标', value: 'host' },
-    { label: '客户端', value: (row) => proxyClientName(row.client) }, { label: '机场', value: (row) => row.airportName||airportName(data?.clash||{},row.airport) },
+    { label: '目标 IP', value: 'destinationIP' }, { label: '目标端口', value: 'destinationPort' },
+    { label: '客户端', value: (row) => proxyClientName(row.client) }, { label: '机场', value: (row) => airportName(row) },
     { label: 'Harness', value: (row) => familyNames[row.family] || row.family }, { label: '出口', value: (row) => row.node || row.route || '' },
     { label: '证据', value: (row) => evidenceNames[row.evidence] || row.evidence }, { label: '上传字节', value: 'up' },
     { label: '下载字节', value: 'down' }, { label: '合计字节', value: total },
@@ -1125,11 +1144,22 @@ function renderCurrentView() {
   else if (view === 'investigate') renderInvestigation();
   else if (view === 'settings' && !settingsInitialized) renderSettings();
 }
+function expectedHistoryLanes(snapshot) {
+  const mode = snapshot?.live?.singleCollector;
+  if (mode === 'mihomo') return ['clash'];
+  if (mode) return ['machine'];
+  return ['machine', 'clash'];
+}
+function completeOverview(snapshot) {
+  return Boolean(snapshot) && expectedHistoryLanes(snapshot).every(lane => {
+    const history = snapshot[lane];
+    return history?.available && history.detailReady !== false;
+  });
+}
 function acceptOverview(next, key, quick) {
   const previous = dataKey === key ? data : null;
   if (!quick && previous?.generatedAt && previous.generatedAt === next.generatedAt &&
-      previous.machine?.detailReady !== false && previous.clash?.detailReady !== false &&
-      next.machine?.available && next.clash?.available) {
+      completeOverview(previous) && completeOverview(next)) {
     // Cache hits and focus changes must not rebuild unchanged tables/canvases.
     data = { ...previous, refreshing: next.refreshing };
     document.querySelector('main').classList.remove('range-loading');
@@ -1139,7 +1169,7 @@ function acceptOverview(next, key, quick) {
   }
   const merged = { ...next };
   const retained = [];
-  for (const lane of ['machine','clash']) {
+  for (const lane of expectedHistoryLanes(next)) {
     if (!next[lane]?.available && previous?.[lane]?.available) {
       merged[lane] = previous[lane]; retained.push(lane === 'machine' ? '本机' : '梯子');
     } else if (quick && previous?.[lane]?.detailReady !== false && previous?.[lane]?.available) {
@@ -1149,7 +1179,7 @@ function acceptOverview(next, key, quick) {
   }
   data = merged; dataKey = key; apps = next.apps || apps;
   document.querySelector('main').classList.remove('range-loading');
-  const missing = ['machine','clash'].filter(lane=>!next[lane]?.available);
+  const missing = expectedHistoryLanes(next).filter(lane => !next[lane]?.available);
   $('globalNotice').hidden = !missing.length;
   if (missing.length) $('globalNotice').textContent = retained.length ? retained.join(' / ') + '暂时不可读，已保留该时间范围上次成功的记录。' : '部分历史暂时不可读，可点击刷新重试；采集状态单独更新。';
   renderCurrentView();
@@ -1157,12 +1187,11 @@ function acceptOverview(next, key, quick) {
 function refresh(force = false) {
   if (document.hidden) return Promise.resolve();
   const key = queryKey();
-  // Repeated refreshes join the current query. Aborting it on every import
-  // completion or click can permanently starve a large first attribution.
+  // Repeated refreshes join the current query. Aborting it on every click can permanently starve a large first attribution.
   if (refreshPromise && refreshKey === key) return refreshPromise;
   historyAbort?.abort(); historyAbort = new AbortController();
-  const signal = historyAbort.signal, current = ++refreshSequence;let preparing=false;
-  clearTimeout(refreshTimer);clearTimeout(progressTimer);historyProgress=null;historyStartedAt=Date.now();refreshAfterImport=false;
+  const signal = historyAbort.signal, current = ++refreshSequence;
+  clearTimeout(refreshTimer);clearTimeout(progressTimer);historyProgress=null;historyStartedAt=Date.now();
   refreshKey = key; historyState = 'loading'; historyError = '';
   if (dataKey !== key) {
     const snapshot = snapshotCache.get(key);
@@ -1186,36 +1215,34 @@ function refresh(force = false) {
   const run = async () => {
     let quickOk = false;
     try {
-      const hasCompleteRange = dataKey === key && data?.machine?.available && data?.clash?.available &&
-        data.machine.detailReady !== false && data.clash.detailReady !== false;
+      const hasCompleteRange = dataKey === key && completeOverview(data);
       if (!hasCompleteRange) {
         try {
           const quick = await api('/api/overview?' + params + '&quick=1' + (force ? '&fresh=1' : ''), { signal, timeoutMs:15000 });
           if (current !== refreshSequence || signal.aborted) return;
           acceptOverview(quick,key,true); quickOk = true;
-        } catch (error) { if(signal.aborted) return;if(error.code==='vault_migrating')throw error; }
+        } catch (error) { if(signal.aborted) return;if(error.code==='history_migration_required')throw error; }
       }
       // A visible, already loaded range needs one update, rather than replaying
       // cached quick/full responses and then rendering both a second time.
       const next = await api('/api/overview?' + params + ((force || hasCompleteRange) ? '&fresh=1' : ''), { signal });
       if (current !== refreshSequence || signal.aborted) return;
       historyState = 'ready'; acceptOverview(next,key,false);
-      if (next.machine?.available && next.clash?.available) saveSnapshot(key,data);
-      if (!next.machine?.available || !next.clash?.available) throw new Error('部分历史暂时不可读，保留已有记录');
+      if (completeOverview(next)) saveSnapshot(key, data);
+      else throw new Error('部分历史暂时不可读，保留已有记录');
       if ((preferences.monthlyMachineGb > 0 || preferences.monthlyProxyGb > 0) && Date.now()-monthLoadedAt > 300000) {
         try { monthData = await api('/api/overview?range=month&quick=1',{signal});monthLoadedAt=Date.now();if(view==='overview')renderBudgetStrip(); } catch { /* A budget refresh cannot block the selected range. */ }
       }
     } catch (error) {
       if (current !== refreshSequence || signal.aborted || isCancelled(error)) return;
-      preparing=error.code==='vault_migrating';historyState = preparing?'loading':'error'; historyError = error.message;
+      historyState = 'error'; historyError = error.message;
       $('globalNotice').hidden = false;
-      $('globalNotice').textContent = preparing?'正在打开加密历史，完成后自动显示；后台采集继续，不需要重复输入密码。':(quickOk ? '总量和趋势已加载，详细归因暂未完成。' : '历史更新暂未完成，已保留上次成功的记录。') + ' 点击右上角刷新可重试。';
+      $('globalNotice').textContent = error.code==='history_migration_required'?error.message:(quickOk ? '总量和趋势已加载，详细归因暂未完成。' : '历史更新暂未完成，已保留上次成功的记录。') + ' 点击右上角刷新可重试。';
     } finally {
       if (current === refreshSequence) {
         clearTimeout(progressTimer);historyStartedAt=0;historyProgress=null;
         refreshPromise = null; renderHeader();
-        const afterImport=refreshAfterImport;refreshAfterImport=false;
-        if (!document.hidden) refreshTimer = setTimeout(()=>refresh(afterImport),afterImport?0:preparing?1500:data?.refreshing?5000:range==='day'&&selectedDate<calendarDate()?300000:60000);
+        if (!document.hidden) refreshTimer = setTimeout(()=>refresh(),data?.refreshing?5000:range==='day'&&selectedDate<calendarDate()?300000:60000);
       }
     }
   };
@@ -1226,14 +1253,41 @@ async function refreshLive() {
   if (document.hidden || liveAbort) return;
   const controller = liveAbort = new AbortController();
   try { livePacket = (await api('/api/live', { signal:controller.signal, timeoutMs:3000 })).live; if(!controller.signal.aborted)renderLiveStatus(); }
-  catch { if(!controller.signal.aborted){setSourceStatus('machineStatus',null,'native');setSourceStatus('clashStatus',null,'mihomo');} }
+  catch(error) { if(!controller.signal.aborted){livePacket={machine:null,clash:null,error:error.message};renderLiveStatus();} }
   finally { if(liveAbort===controller)liveAbort=null;if(!document.hidden)liveTimer=setTimeout(refreshLive,5000); }
 }
+async function refreshControlStatus(){
+  clearTimeout(controlStatusTimer);
+  if(document.hidden||controlStatusAbort||!installedControls||view!=='overview'||!$('advancedControls').open)return;
+  const controller=controlStatusAbort=new AbortController();
+  try{
+    controlStatus=await api('/api/control/status',{signal:controller.signal,timeoutMs:8000});
+    controlStatusError='';
+  }catch(error){if(!controller.signal.aborted)controlStatusError=error.message;}
+  finally{
+    if(controlStatusAbort===controller)controlStatusAbort=null;
+    if(!controller.signal.aborted)renderCollectorControlStatus();
+    if(!document.hidden&&!controller.signal.aborted)controlStatusTimer=setTimeout(refreshControlStatus,30000);
+  }
+}
+async function performControlAction(action){
+  if(controlActionPending)return;
+  if (action === 'Stop' && !window.confirm('停止采集、诊断、托盘和流量中心？页面将断开。需要恢复时，从桌面快捷方式打开流量中心，再点「启动采集」。')) return;
+  const messages={Start:'正在启动本机与梯子采集…',PauseCapture:'正在暂停两路采集…',Stop:'正在停止 TrafficWatch…',ReopenTray:'正在重新打开托盘…',EnableStartup:'正在开启开机自启动…',DisableStartup:'正在关闭开机自启动…',StartDiagnostics:'正在启动持续诊断…',StopDiagnostics:'正在停止持续诊断…',EnableBypass:'正在启动中转物理绕行…',RollbackBypass:'正在恢复 Clash 路由…'};
+  const resultText={Start:'两路采集服务已启动。',PauseCapture:'两路流量采集已暂停，直到再次启动。',Stop:'TrafficWatch 已停止。重新使用时从桌面快捷方式打开。',ReopenTray:'托盘已重新打开。',EnableStartup:'开机自启动已开启。',DisableStartup:'开机自启动已关闭。',StartDiagnostics:'已请求启动持续诊断。',StopDiagnostics:'持续诊断已停止。',EnableBypass:'绕行任务已启动，验证结果见中转直连。',RollbackBypass:'已恢复受管中转的 Clash 路由。'};
+  const message=$('collectorControlMessage');message.hidden=false;message.textContent=messages[action];
+  controlActionPending=true;renderCollectorControlStatus();
+  try{
+    await api('/api/control/action',{method:'POST',body:JSON.stringify({action}),timeoutMs:80000});
+    message.textContent=resultText[action];
+    if (action !== 'Stop') await Promise.all([refreshLive(),refreshControlStatus()]);
+  }catch(error){message.textContent=`操作未完成：${controlProblem(error.message)}`;}
+  finally{controlActionPending=false;renderCollectorControlStatus();}
+}
 function clearDetails() {
-  detailAbort?.abort(); harnessAbort?.abort();ladderFilterAbort?.abort();airportInventoryAbort?.abort();
+  detailAbort?.abort(); harnessAbort?.abort();ladderFilterAbort?.abort();
   detailSequence++; harnessSequence++;ladderFilterSequence++;activeAppDetail = activeLadderDetail = appDetailData = ladderDetailData = harnessResult = null;
   ladderFilterData=null;ladderFilterDataKey=ladderFilterPendingKey=ladderFilterError='';
-  airportInventory=null;airportInventoryKey=airportInventoryPendingKey=airportInventoryError='';
   detailHistory = []; harnessLoadedKey = ''; appPage = 0; $('appDetail').hidden = $('ladderDetail').hidden = true;
   for(const canvas of document.querySelectorAll('canvas')) releaseChart(canvas);
   hideChartTooltip();
@@ -1244,7 +1298,7 @@ async function exportAllConnections(lane, selection, result, button) {
   try {
     const { title, ...filters } = selection;
     const query = { ...filters, from: result.range.from, to: result.range.to, export: 1, page: 0 };
-    if (lane === 'clash') query.route = $('routeFilter').value;
+    if (lane === 'clash') {const filter=selectedLadderFilter();query.route=$('routeFilter').value;query.client=filter.client;query.airport=filter.airport==='all'?'':filter.airport;}
     const first = await requestDetail(lane, query);
     const rows = [...first.connections];
     for (let page = 1; page < first.pagination.pages; page++) {
@@ -1270,25 +1324,19 @@ $('selectedDate').addEventListener('change', () => { selectedDate = $('selectedD
 $('refreshButton').addEventListener('click', () => refresh(true));
 $('proxyClientFilter').addEventListener('change',()=>{clearLadderDetail();loadLadderFilter();});
 $('proxyAirportFilter').addEventListener('change',()=>{clearLadderDetail();loadLadderFilter();});
-$('airportNodeSearch').addEventListener('input',()=>{airportNodeLimit=120;if(view==='ladder'&&data?.clash)renderAirportManager(data.clash);});
-$('airportGroupName').addEventListener('input',()=>{if(view==='ladder'&&data?.clash)renderAirportManager(data.clash);});
-$('clearAirportGroup').addEventListener('click',()=>{airportNodeSelection=new Set();for(const checkbox of $('airportNodeChoices').querySelectorAll('input[type="checkbox"]'))checkbox.checked=false;});
-document.querySelector('.airport-manager').addEventListener('toggle',()=>{if(document.querySelector('.airport-manager').open&&data?.clash)loadAirportInventory();});
-$('saveAirportGroup').addEventListener('click',()=>{
-  const name=$('airportGroupName').value.trim(),selected=[...(airportNodeSelection||new Set())].map(key=>{const [client,nodeName]=key.split('\0');return {client,node:nodeName};});
-  if(!name||!selected.length){$('airportGroupStatus').textContent='请填写机场名称，并至少选择一个出口节点。';return;}
-  const groups=data?.clash?.airportGroups||[],existing=groups.find(group=>group.name.toLocaleLowerCase()===name.toLocaleLowerCase());
-  const id=existing?.id||crypto.randomUUID().replaceAll('-',''),selectedKeys=new Set(selected.map(member=>`${member.client}\0${member.node}`));
-  const next=groups.filter(group=>group.id!==id).map(group=>({...group,members:group.members.filter(member=>!selectedKeys.has(`${member.client}\0${member.node}`))}));
-  next.push({id,name,members:selected});saveAirportGroups(next);
-});
+$('clearProxyFilters').addEventListener('click',()=>{$('proxyAirportFilter').value='all';$('proxyClientFilter').value='all';clearLadderDetail();loadLadderFilter();});
+$('controlStart').addEventListener('click',()=>performControlAction('Start'));
+$('controlStop').addEventListener('click',()=>performControlAction('PauseCapture'));
+$('advancedControls').addEventListener('toggle',()=>{if($('advancedControls').open)refreshControlStatus();else{clearTimeout(controlStatusTimer);controlStatusAbort?.abort();}});
+$('showAirportConnections').addEventListener('click',()=>loadLadderDetail({title:`${$('activeAirportTitle').textContent} · 连接明细`}));
+for(const button of document.querySelectorAll('[data-control-action]'))button.addEventListener('click',()=>performControlAction(button.dataset.controlAction));
 let searchTimer;
 $('appSearch').addEventListener('input',()=>{clearTimeout(searchTimer);searchTimer=setTimeout(()=>{appPage=0;renderApps();},120);});
 $('appSort').addEventListener('change',()=>{appPage=0;renderApps();});
 $('routeFilter').addEventListener('change', () => { renderLadder(); if (activeLadderDetail) loadLadderDetail({ ...activeLadderDetail, page: 0 }); });
 $('exportApps').addEventListener('click', () => exportAppsCsv(data?.machine?.allPrograms || [], '本机应用流量.csv'));
 $('exportAppDetail').addEventListener('click', () => exportAllConnections('windows', activeAppDetail, appDetailData, $('exportAppDetail')));
-$('exportLadder').addEventListener('click', () => exportAppsCsv(data?.clash?.programs || [], '梯子代理应用.csv'));
+$('exportLadder').addEventListener('click', () => {const result=currentLadderData(),route=$('routeFilter').value;if(!result?.available){showToast('当前筛选尚未加载完成。');return;}exportAppsCsv(route==='all'?result.allPrograms:result.routePrograms[route]||[],'梯子应用.csv');});
 $('exportLadderDetail').addEventListener('click', () => exportAllConnections('clash', activeLadderDetail, ladderDetailData, $('exportLadderDetail')));
 $('appDetailRetry').addEventListener('click',()=>{if(activeAppDetail)openAppSelection(activeAppDetail,false);});
 $('ladderDetailRetry').addEventListener('click',()=>{if(activeLadderDetail)loadLadderDetail(activeLadderDetail);});
@@ -1342,17 +1390,11 @@ $('notificationsEnabled').addEventListener('change', async (event) => {
   renderBudgetSettingsStatus();
 });
 document.addEventListener('visibilitychange', () => {
-  clearTimeout(refreshTimer); clearTimeout(liveTimer);clearTimeout(progressTimer); hideChartTooltip();
+  clearTimeout(refreshTimer); clearTimeout(liveTimer);clearTimeout(progressTimer);clearTimeout(controlStatusTimer); hideChartTooltip();
   if(document.hidden){historyAbort?.abort();liveAbort?.abort();detailAbort?.abort();harnessAbort?.abort();refreshSequence++;detailSequence++;harnessSequence++;harnessLoadedKey='';refreshPromise=null;for(const canvas of document.querySelectorAll('canvas'))releaseChart(canvas);}
-  else{renderCurrentView();refreshLive();refresh();if(view==='apps'&&activeAppDetail&&!appDetailData)loadAppDetail(activeAppDetail);if(view==='ladder'&&activeLadderDetail&&!ladderDetailData)loadLadderDetail(activeLadderDetail);}
+  else{renderCurrentView();refreshLive();refreshControlStatus();refresh();if(view==='apps'&&activeAppDetail&&!appDetailData)loadAppDetail(activeAppDetail);if(view==='ladder'&&activeLadderDetail&&!ladderDetailData)loadLadderDetail(activeLadderDetail);}
 });
 let resizeFrame;
-window.addEventListener('trafficwatch-vault-locked',()=>{
-  clearTimeout(refreshTimer);clearTimeout(liveTimer);clearTimeout(progressTimer);clearTimeout(searchTimer);cancelAnimationFrame(resizeFrame);
-  refreshSequence++;detailSequence++;harnessSequence++;refreshPromise=null;
-  historyAbort?.abort();liveAbort?.abort();detailAbort?.abort();harnessAbort?.abort();
-  for(const canvas of document.querySelectorAll('canvas'))releaseChart(canvas);
-});
 window.addEventListener('resize', () => {
   cancelAnimationFrame(resizeFrame);
   resizeFrame=requestAnimationFrame(()=>{
@@ -1372,4 +1414,5 @@ if(initialParams.get('range')==='day'&&/^\d{4}-\d{2}-\d{2}$/.test(initialParams.
 }
 if (Object.hasOwn(pageNames, initialView)) setView(initialView);
 refreshLive();
+refreshControlStatus();
 refresh(true);

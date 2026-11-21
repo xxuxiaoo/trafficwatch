@@ -6,7 +6,7 @@ import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { Store } from '../src/store.mjs';
 import { createServer } from '../src/server.mjs';
-test('calendar/report validate their periods; mini/update installation require desktop ownership', async (t) => {
+test('calendar/report validate periods, the mini view is retired, and update installation checks ownership', async (t) => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'netwatch-history-api-'));
   const store = new Store(dir), token = 'a'.repeat(64);
   const root = fileURLToPath(new URL('..', import.meta.url));
@@ -22,8 +22,7 @@ test('calendar/report validate their periods; mini/update installation require d
     '/api/report?kind=day&date=2026-02-30', '/api/report?kind=day&date=2099-01-01', '/api/report?kind=month&date=2026-01-01'])
     assert.equal((await get(query)).status, 400, query);
   assert.equal((await get('/api/report?kind=week&date=2026-01-01&scope=all')).status, 200);
-  assert.equal((await get('/api/mini')).status, 403);
-  assert.equal((await get('/api/mini', { headers: { ...headers, 'X-Codex-Desktop-Token': token } })).status, 200);
+  assert.equal((await get('/api/mini', { headers: { ...headers, 'X-Codex-Desktop-Token': token } })).status, 404);
   const update = await (await get('/api/update')).json();
   assert.equal(update.state, 'idle'); assert.equal(update.canInstall, false);
   assert.equal((await get('/api/update/install', { method: 'POST', body: '{}' })).status, 403);

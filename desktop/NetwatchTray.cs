@@ -77,16 +77,12 @@ internal sealed class NetwatchTray : ApplicationContext
 {
     private readonly TrayOptions options;
     private readonly NotifyIcon tray;
-    private readonly ToolStripMenuItem status, start, stop;
-    private ToolStripMenuItem clashStatus;
+    private ToolStripMenuItem status, start, stop;
     private readonly System.Windows.Forms.Timer timer;
     private readonly Control uiDispatcher;
     private readonly EventWaitHandle openEvent, startEvent, stopEvent, exitEvent;
     private readonly string token;
-    private Process child;
-    private DashboardWindow dashboard;
-    private MiniWindow mini;
-    private readonly StartupRegistration startup;
+    private Process child, viewer;
     private bool starting, openingAfterStart;
     private volatile bool exiting;
     private volatile bool suitePolling;
@@ -96,6 +92,7 @@ internal sealed class NetwatchTray : ApplicationContext
     private readonly object logLock = new object();
     private readonly bool chinese = CultureInfo.CurrentUICulture.TwoLetterISOLanguageName == "zh";
     private readonly bool silentTest = Environment.GetEnvironmentVariable("NETWATCH_TEST_SILENT") == "1";
+    private int ViewerPort { get { int port = new Uri(options.BaseUrl).Port; return options.Demo && port == 43129 ? 43139 : port == 65535 ? port - 1 : port + 1; } }
 
     private string Text(string en, string zh) { return chinese ? zh : en; }
     private void ShowBalloon(int timeout, string title, string message, ToolTipIcon icon)
@@ -107,7 +104,6 @@ internal sealed class NetwatchTray : ApplicationContext
         options = value;
         uiDispatcher = new Control();
         IntPtr dispatcherHandle = uiDispatcher.Handle;
-        startup = new StartupRegistration(Application.ExecutablePath);
         using (RandomNumberGenerator random = RandomNumberGenerator.Create())
         {
             byte[] bytes = new byte[32]; random.GetBytes(bytes);
@@ -117,75 +113,34 @@ internal sealed class NetwatchTray : ApplicationContext
         startEvent = new EventWaitHandle(false, EventResetMode.AutoReset, options.InstanceName + "-start");
         stopEvent = new EventWaitHandle(false, EventResetMode.AutoReset, options.InstanceName + "-stop");
         exitEvent = new EventWaitHandle(false, EventResetMode.AutoReset, options.InstanceName + "-exit");
-        ContextMenuStrip menu = new ContextMenuStrip();
-        status = new ToolStripMenuItem(Text("Starting...", "正在启动…")); status.Enabled = false;
-        menu.Items.Add(status);
-        if (options.AttachSuite) {
-            clashStatus = new ToolStripMenuItem("Clash：正在连接…"); clashStatus.Enabled = false;
-            menu.Items.Add(clashStatus);
-        }
-        menu.Items.Add(new ToolStripSeparator());
-        if (options.AttachSuite) {
-            menu.Items.Add("打开流量中心", null, delegate { OpenSuiteControl(true); });
-            menu.Items.Add("打开流量采集控制台", null, delegate { OpenSuiteControl(false); });
-            menu.Items.Add("AI 连接诊断", null, delegate { LaunchDiagnosticControl("--diagnostics"); });
-            ToolStripMenuItem diagnosis=new ToolStripMenuItem("诊断与物理绕行控制");
-            diagnosis.DropDownItems.Add("启动 AI 持续诊断",null,delegate {LaunchDiagnosticControl("--action StartDiagnostics");});
-            diagnosis.DropDownItems.Add("停止 AI 持续诊断",null,delegate {LaunchDiagnosticControl("--action StopDiagnostics");});
-            diagnosis.DropDownItems.Add("启用中转物理绕行",null,delegate {LaunchDiagnosticControl("--action EnableBypass");});
-            diagnosis.DropDownItems.Add("恢复原 Clash DIRECT 路径",null,delegate {LaunchDiagnosticControl("--action RollbackBypass");});
-            menu.Items.Add(diagnosis);
-            ToolStripMenuItem legacy = new ToolStripMenuItem("旧版详细界面（已备份）");
-            legacy.DropDownItems.Add("旧版全机详情", null, delegate {
-                Process.Start(new ProcessStartInfo("http://127.0.0.1:43128/?legacy=1") { UseShellExecute = true });
-            });
-            legacy.DropDownItems.Add("旧版 Clash 详情", null, delegate {
-                Process.Start(new ProcessStartInfo("http://127.0.0.1:43130/?legacy=1") { UseShellExecute = true });
-            });
-            menu.Items.Add(legacy);
-        }
-        else menu.Items.Add(Text("Open dashboard", "打开监控页面"), null, delegate { OpenDashboard(); });
-        ToolStripMenuItem miniItem = new ToolStripMenuItem(Text("Mini window", "迷你悬浮窗"));
-        miniItem.Click += delegate { MiniCommand(mini != null && mini.Visible ? "hide" : "show", null); };
-        menu.Items.Add(miniItem);
-        if (!options.AttachSuite) menu.Items.Add(Text("Open in browser", "在浏览器打开"), null, delegate { OpenBrowser(); });
-        ToolStripMenuItem autoStart = new ToolStripMenuItem(Text("Start with Windows", "开机自启"));
-        autoStart.Click += delegate {
-            try { startup.SetEnabled(!startup.Enabled); autoStart.Checked = startup.Enabled; }
-            catch (Exception error) { ShowFailure(error.Message); }
-        };
-        menu.Opening += delegate {
-            if (!options.AttachSuite) {
-                try { autoStart.Checked = startup.Enabled; }
-                catch { autoStart.Enabled = false; }
-            }
-            miniItem.Checked = mini != null && mini.Visible;
-        };
-        menu.Items.Add(autoStart);
-        if (options.AttachSuite) autoStart.Visible = false;
-        start = new ToolStripMenuItem(Text("Start collector", "启动采集"), null, delegate { StartCollector(false); });
-        stop = new ToolStripMenuItem(Text("Stop collector", "停止采集"), null, delegate { StopCollector(); });
-        menu.Items.Add(start); menu.Items.Add(stop);
-        if (options.AttachSuite) { start.Visible = false; stop.Visible = false; }
-        menu.Items.Add(Text("Open data folder", "打开数据目录"), null, delegate {
-            string folder = options.DataDir;
-            if (!options.AttachSuite) Directory.CreateDirectory(folder);
-            Process.Start(new ProcessStartInfo(folder) { UseShellExecute = true });
-        });
-        menu.Items.Add(Text("Project on GitHub", "GitHub 项目"), null, delegate {
-            Process.Start(new ProcessStartInfo("https://github.com/xxuxiaoo/trafficwatch") { UseShellExecute = true });
-        });
-        menu.Items.Add(new ToolStripSeparator());
-        menu.Items.Add(options.AttachSuite ? "退出托盘（后台继续记录）" : Text("Exit (stop own collector)", "退出并停止本次采集"), null, delegate { ExitThread(); });
         tray = new NotifyIcon();
         using (Stream icon = Assembly.GetExecutingAssembly().GetManifestResourceStream("Netwatch.ico")) tray.Icon = new Icon(icon);
-        tray.ContextMenuStrip = menu; tray.Text = "Codex Netwatch"; tray.Visible = true;
+        tray.ContextMenuStrip = BuildMenu(); tray.Text = "TrafficWatch"; tray.Visible = true;
         tray.DoubleClick += delegate { OpenDashboard(); };
         timer = new System.Windows.Forms.Timer(); timer.Interval = 200;
         timer.Tick += Tick; timer.Start();
         StartCollector(!options.NoBrowser);
-        if (!options.AttachSuite) { EnsureMini(); mini.RestoreVisibility(); }
-        else { miniItem.Visible = false; Log("suite", "Tray visible; attached to the independent system collectors."); }
+        if (options.AttachSuite && options.NoBrowser) LaunchSuiteControl("--ensure-overview");
+    }
+
+    private ContextMenuStrip BuildMenu()
+    {
+        ContextMenuStrip menu = new ContextMenuStrip();
+        status = new ToolStripMenuItem(Text("Starting...", "正在启动…")); status.Enabled = false;
+        menu.Items.Add(status);
+        menu.Items.Add(new ToolStripSeparator());
+        menu.Items.Add(Text("Open TrafficWatch", "打开流量中心"), null, delegate { OpenDashboard(); });
+        start = new ToolStripMenuItem(Text("Start collection", "启动采集"), null, delegate {
+            if (options.AttachSuite) RunSuiteAction("Start"); else StartCollector(false);
+        });
+        stop = new ToolStripMenuItem(Text("Pause collection", "暂停采集"), null, delegate {
+            if (options.AttachSuite) RunSuiteAction("PauseCapture"); else StopCollector();
+        });
+        menu.Items.Add(start); menu.Items.Add(stop);
+        start.Enabled = stop.Enabled = false;
+        menu.Items.Add(new ToolStripSeparator());
+        menu.Items.Add(options.AttachSuite ? "退出托盘（后台继续记录）" : Text("Exit (stop own collector)", "退出并停止本次采集"), null, delegate { ExitThread(); });
+        return menu;
     }
 
     private Dictionary<string, object> Health(string baseUrl = null)
@@ -251,55 +206,79 @@ internal sealed class NetwatchTray : ApplicationContext
     }
     private void OpenDashboard()
     {
-        if (options.AttachSuite) { OpenSuiteControl(true); return; }
+        if (options.AttachSuite) { LaunchSuiteControl("--overview"); return; }
         Dictionary<string, object> health = Health();
         if (!Compatible(health)) { StartCollector(true); return; }
         ShowDashboard();
     }
-    private void OpenBrowser()
-    {
-        Process.Start(new ProcessStartInfo(options.BaseUrl) { UseShellExecute = true });
-    }
-    private void LaunchDiagnosticControl(string arguments) {
-        try { using(Process process=Process.Start(new ProcessStartInfo(Path.Combine(options.Root,"TrafficWatch-Control.exe"),arguments){UseShellExecute=false,CreateNoWindow=true,WindowStyle=ProcessWindowStyle.Hidden})){} }
-        catch(Exception error){ShowFailure(error.Message);}
-    }
-    private void OpenSuiteControl(bool overview)
+    private void LaunchSuiteControl(string arguments)
     {
         try {
             string program = Path.Combine(options.Root, "TrafficWatch-Control.exe");
-            using (Process process = Process.Start(new ProcessStartInfo(program, overview ? "--overview" : "")
+            using (Process process = Process.Start(new ProcessStartInfo(program, arguments)
                 { UseShellExecute = false, CreateNoWindow = true, WindowStyle = ProcessWindowStyle.Hidden, WorkingDirectory = options.Root })) { }
         }
         catch (Exception error) { ShowFailure(error.Message); }
     }
     private void ShowDashboard()
     {
-        try
-        {
-            if (dashboard == null || dashboard.IsDisposed)
-            {
-                dashboard = new DashboardWindow(options.BaseUrl, Path.Combine(options.DataDir, "webview-profile"),
-                    delegate(string url) { Process.Start(new ProcessStartInfo(url) { UseShellExecute = true }); },
-                    delegate(string message) {
-                        Log("webview", message);
-                        ShowBalloon(8000, "Codex Netwatch", Text("Desktop view unavailable; the collector is still controlled from the tray.", "内置面板暂不可用，仍可通过托盘控制采集或打开浏览器。"), ToolTipIcon.Warning);
-                    }, delegate { return startup.Enabled; }, delegate(bool enabled) { startup.SetEnabled(enabled); }, MiniCommand);
-                dashboard.Icon = tray.Icon;
+        try {
+            int port = new Uri(options.BaseUrl).Port;
+            int viewerPort = ViewerPort;
+            string url = "http://127.0.0.1:" + viewerPort;
+            if (viewer == null || viewer.HasExited) {
+                if (viewer != null) viewer.Dispose();
+                string node = Path.Combine(options.Root, "runtime", "node.exe");
+                string script = Path.Combine(options.Root, "src", "overview-server.mjs");
+                var info = new ProcessStartInfo(node, "--disable-warning=ExperimentalWarning " + Quote(script)) {
+                    WorkingDirectory = options.Root, UseShellExecute = false, CreateNoWindow = true, WindowStyle = ProcessWindowStyle.Hidden
+                };
+                info.EnvironmentVariables["TRAFFICWATCH_SINGLE_COLLECTOR"] = "1";
+                info.EnvironmentVariables["TRAFFICWATCH_DEMO"] = options.Demo ? "1" : "0";
+                info.EnvironmentVariables["TRAFFICWATCH_DATA_ROOT"] = options.DataDir;
+                info.EnvironmentVariables["TRAFFICWATCH_CACHE_ROOT"] = Path.Combine(options.DataDir,"viewer-cache");
+                info.EnvironmentVariables["TRAFFICWATCH_MACHINE_PORT"] = port.ToString(CultureInfo.InvariantCulture);
+                info.EnvironmentVariables["TRAFFICWATCH_CLASH_PORT"] = viewerPort.ToString(CultureInfo.InvariantCulture);
+                info.EnvironmentVariables["TRAFFICWATCH_OVERVIEW_PORT"] = viewerPort.ToString(CultureInfo.InvariantCulture);
+                viewer = Process.Start(info);
             }
-            dashboard.ShowDashboard();
-        }
-        catch (Exception error) { ShowFailure(error.Message); OpenBrowser(); }
+            OpenPortableViewer(url,viewer);
+        } catch (Exception error) { ShowFailure(error.Message); }
     }
-    private void EnsureMini()
+    private async void OpenPortableViewer(string url,Process ownViewer)
     {
-        if (mini != null && !mini.IsDisposed) return;
-        mini = new MiniWindow(options.BaseUrl, options.DataDir, token, OpenDashboard);
-        mini.Icon = tray.Icon;
+        try {
+            await Task.Run(() => {
+                DateTime deadline = DateTime.UtcNow.AddSeconds(5);
+                do {
+                    object app,pid;
+                    var health = Health(url);
+                    if (health != null && health.TryGetValue("app", out app) && (string)app == "trafficwatch-overview" &&
+                        health.TryGetValue("collectorPid", out pid) && Convert.ToInt32(pid) == ownViewer.Id) return;
+                    if (ownViewer.HasExited) throw new InvalidOperationException("流量中心无法启动，请检查端口。");
+                    Thread.Sleep(150);
+                } while (DateTime.UtcNow < deadline);
+                throw new TimeoutException("流量中心没有响应。");
+            });
+            if (!exiting && !silentTest) Process.Start(new ProcessStartInfo(url) { UseShellExecute = true });
+        } catch (Exception error) { if (!exiting) ShowFailure(error.Message); }
     }
-    private object MiniCommand(string action, string language)
+    private bool suiteActionPending;
+    private async void RunSuiteAction(string action)
     {
-        EnsureMini(); return mini.Command(action, language);
+        if (suiteActionPending) return;
+        suiteActionPending = true; start.Enabled = stop.Enabled = false;
+        try {
+            int code = await Task.Run(() => {
+                using (Process helper = Process.Start(new ProcessStartInfo(Path.Combine(options.Root, "TrafficWatch-Control.exe"), "--action " + action)
+                    { UseShellExecute = false, CreateNoWindow = true, WindowStyle = ProcessWindowStyle.Hidden, WorkingDirectory = options.Root })) {
+                    if (!helper.WaitForExit(78000)) throw new TimeoutException("控制操作超时。");
+                    return helper.ExitCode;
+                }
+            });
+            if (!exiting && code != 0) ShowFailure(code == 3 ? "已取消管理员确认。" : "操作未完成（退出码 " + code + "）。");
+        } catch (Exception error) { if (!exiting) ShowFailure(error.Message); }
+        finally { suiteActionPending = false; if (!exiting) RequestSuiteStatus(); }
     }
     private void ShowFailure(string message)
     {
@@ -338,6 +317,7 @@ internal sealed class NetwatchTray : ApplicationContext
         info.UseShellExecute = false; info.CreateNoWindow = true; info.WindowStyle = ProcessWindowStyle.Hidden;
         info.RedirectStandardOutput = true; info.RedirectStandardError = true; info.RedirectStandardInput = true;
         info.EnvironmentVariables["CODEX_FLOW_PORT"] = new Uri(options.BaseUrl).Port.ToString(CultureInfo.InvariantCulture);
+        info.EnvironmentVariables["TRAFFICWATCH_OVERVIEW_PORT"] = ViewerPort.ToString(CultureInfo.InvariantCulture);
         info.EnvironmentVariables["CODEX_NETWATCH_DESKTOP_TOKEN"] = token;
         info.EnvironmentVariables["CODEX_NETWATCH_HOST_PID"] = Process.GetCurrentProcess().Id.ToString(CultureInfo.InvariantCulture);
         try
@@ -390,10 +370,10 @@ internal sealed class NetwatchTray : ApplicationContext
         object windowsState, proxyState;
         bool windowsOn = Compatible(windows) && windows.TryGetValue("state", out windowsState) && Object.Equals(windowsState, "connected");
         bool proxyOn = Compatible(proxy) && proxy.TryGetValue("state", out proxyState) && Object.Equals(proxyState, "connected");
-        status.Text = "全机：" + (windowsOn ? "正在记录" : "等待后台恢复");
-        clashStatus.Text = "Clash：" + (proxyOn ? "正在记录" : "等待 Clash 接口");
-        tray.Text = "流量记录 · 全机" + (windowsOn ? "正常" : "待恢复") + " / Clash" + (proxyOn ? "正常" : "未连接");
-        start.Enabled = stop.Enabled = false;
+        status.Text = "本机：" + (windowsOn ? "采集中" : "未连接") + "　梯子：" + (proxyOn ? "采集中" : "未连接");
+        tray.Text = "TrafficWatch · " + status.Text;
+        start.Enabled = !suiteActionPending && (!Compatible(windows) || !Compatible(proxy));
+        stop.Enabled = !suiteActionPending && (Compatible(windows) || Compatible(proxy));
     }
     private void Tick(object sender, EventArgs args)
     {
@@ -488,10 +468,9 @@ internal sealed class NetwatchTray : ApplicationContext
     {
         if (exiting) return;
         exiting = true; timer.Stop();
-        if (dashboard != null) { dashboard.Dispose(); dashboard = null; }
-        if (mini != null) { mini.Dispose(); mini = null; }
-        StopCollector();
-        tray.Visible = false; tray.Dispose(); timer.Dispose();
+        if (!options.AttachSuite) StopCollector();
+        if (viewer != null) { if (!viewer.HasExited) viewer.Kill(); viewer.Dispose(); }
+        tray.Visible = false; tray.ContextMenuStrip.Dispose(); tray.Dispose(); timer.Dispose();
         openEvent.Dispose(); startEvent.Dispose(); stopEvent.Dispose(); exitEvent.Dispose();
         uiDispatcher.Dispose();
         if (child != null) child.Dispose();

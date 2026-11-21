@@ -10,7 +10,8 @@ if(Test-Path -LiteralPath $stageRoot){Remove-Item -LiteralPath $stageRoot -Recur
 $stage=Join-Path $stageRoot 'trafficwatch'
 [IO.Directory]::CreateDirectory($stage)|Out-Null
 # git ls-files supplies exactly the reviewed tracked source tree, without local data.
-$files=@(& git.exe -C $projectRoot ls-files)
+$git=if($env:TRAFFICWATCH_GIT_EXECUTABLE){$env:TRAFFICWATCH_GIT_EXECUTABLE}else{'git.exe'}
+$files=@(& $git -c ('safe.directory='+$projectRoot.Replace('\','/')) -C $projectRoot ls-files)
 if($LASTEXITCODE -ne 0 -or $files.Count -eq 0){throw 'Create a Git checkout and stage the reviewed source before packaging.'}
 foreach($relative in $files){
   $source=[IO.Path]::GetFullPath((Join-Path $projectRoot $relative))

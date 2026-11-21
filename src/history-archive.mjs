@@ -12,7 +12,7 @@ const monthAt = at => new Date(at + 8 * 3600000).toISOString().slice(0,7);
 const digest = bytes => createHash('sha256').update(bytes).digest('hex');
 const hasArchives = db => Boolean(db.prepare("SELECT 1 FROM main.sqlite_master WHERE name='vault_archive_chunks'").get());
 
-// The compressed blocks live INSIDE the encrypted history file. Moving rows and
+// The compressed blocks live in the history database. Moving rows and
 // publishing their verified replacement is one SQLite transaction, including
 // under abrupt worker termination. No plaintext staging files or second copy of
 // the connection/rule dictionary is required.
@@ -33,14 +33,14 @@ export function initializeArchives(store) {
 
 function unpack(chunk) {
   const raw = inflateSync(chunk.payload, { maxOutputLength: MAX_RAW });
-  if (raw.length !== chunk.raw_bytes || digest(raw) !== chunk.sha256) throw new Error('vault_archive_corrupt');
+  if (raw.length !== chunk.raw_bytes || digest(raw) !== chunk.sha256) throw new Error('archive_corrupt');
   const rows = JSON.parse(raw.toString('utf8'));
-  if (!Array.isArray(rows) || rows.length !== chunk.row_count) throw new Error('vault_archive_corrupt');
+  if (!Array.isArray(rows) || rows.length !== chunk.row_count) throw new Error('archive_corrupt');
   return { rows, json: raw.toString('utf8') };
 }
 function encode(rows) {
   const raw = Buffer.from(JSON.stringify(rows));
-  if (raw.length > MAX_RAW) throw new Error('vault_archive_block_too_large');
+  if (raw.length > MAX_RAW) throw new Error('archive_block_too_large');
   const payload = deflateSync(raw, { level: 6 });
   const chunk = { payload, raw_bytes: raw.length, sha256: digest(raw), row_count: rows.length };
   // Verify the actual stored representation before deleting a single source row.

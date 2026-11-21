@@ -46,7 +46,7 @@ export function programRollup(source, cacheRoot, range, firstAt, now, defs, aggr
     const bounds=historyBounds(source),latest=bounds.lastAt||0,earliest=bounds.firstAt||0;
     const previous = db.prepare("SELECT value FROM state WHERE key='metadataAt'").get()?.value || 0;
     const previousFirst = db.prepare("SELECT value FROM state WHERE key='firstAt'").get()?.value;
-    const revision=source.prepare("SELECT value FROM settings WHERE key='vaultDataRevision'").get()?.value||'0';
+    const revision=source.prepare("SELECT value FROM settings WHERE key='historyDataRevision'").get()?.value||'0';
     const oldRevision=db.prepare("SELECT value FROM state WHERE key='revision'").get()?.value;
     const oldFormat=db.prepare("SELECT value FROM state WHERE key='format'").get()?.value;
     if (oldFormat!==CACHE_FORMAT||latest < previous || (previousFirst !== undefined && previousFirst !== earliest)||oldRevision!==undefined&&String(oldRevision)!==String(revision)) {

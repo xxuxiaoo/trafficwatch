@@ -11,7 +11,6 @@ import {IncrementalZstdTail} from '../src/ai-zstd-tail.mjs';
 import {collectionSnapshot,requestCoverage} from '../src/ai-diagnostic-quality.mjs';
 import {EvidenceRing} from '../src/ai-diagnostic-events.mjs';
 import {DiagnosticHistory} from '../src/ai-diagnostic-store.mjs';
-import {createVaultKeys} from '../src/vault-crypto.mjs';
 
 const at=Date.now()-60000,secret='private-secret-credential-content';
 function cleanup(dir){assert.equal(path.dirname(dir),path.resolve(os.tmpdir()));assert(path.basename(dir).startsWith('tw-log-adapters-'));fs.rmSync(dir,{recursive:true,force:true,maxRetries:5,retryDelay:100});}
@@ -75,10 +74,10 @@ test('collection checks distinguish source limitations and verify system heartbe
   const snapshot=collectionSnapshot({sources:[{id:'codex',state:'caught_up',lastPollAt:now},{id:'dsh',state:'limited',parseFailures:2}],traceState:'recording',lastTraceAt:now-30000,pktmonState:'recording',pktmonCheckedAt:now,metrics:{traceEventsLost:2},now});
   assert.equal(snapshot.issueCount,2);assert.equal(snapshot.sources.find(s=>s.id==='traceevent').state,'heartbeat_stale');assert.equal(snapshot.fault,false);
 });
-test('encrypted history checks missing retries and phase/TCP coverage without inventing gaps at visitor date boundaries',async()=>{
+test('SQLite history checks missing retries and phase/TCP coverage without inventing gaps at selected date boundaries',async()=>{
   const dir=fs.mkdtempSync(path.join(os.tmpdir(),'tw-log-adapters-'));let history;
   try{
-    const {metadata,secrets}=await createVaultKeys('synthetic-collection-password');history=new DiagnosticHistory(dir,metadata,secrets);
+    history=new DiagnosticHistory(dir);
     const start=Date.now()-60000,windows=[{from:start,to:start+30000}],base={kind:'request',schemaVersion:2,gateway:'magpie',requestId:'chain',requestAt:start+1000,requestEnd:start+10000,expectedAttempts:3,coverage:{phase:'missing',system:'collector_unavailable'}};
     history.put({...base,id:'try1',at:start+1000,end:start+2000,attempt:1});history.put({...base,id:'try3',at:start+6000,end:start+10000,attempt:3});
     history.put({...base,id:'boundary',requestId:'outside-chain',requestAt:start-10000,requestEnd:start+10000,at:start+5000,expectedAttempts:5,attempt:5});
@@ -87,6 +86,6 @@ test('encrypted history checks missing retries and phase/TCP coverage without in
     history.put({kind:'status',category:'collection_health',id:'check',at:start+20000,issueCount:0,sources:[{id:'dsh',lastEventAt:start-1000,modifiedAt:start-1000,lastPollAt:start+20000}]});
     const check=history.query({windows,from:start,to:start+30000,kind:'status',category:'collection_health',limit:1});assert.equal(check.rows[0].sources[0].lastEventAt,null);assert.equal(check.rows[0].sources[0].modifiedAt,null);assert.equal(check.rows[0].sources[0].lastPollAt,start+20000);assert.equal(check.requestSummary.length,0);
     const list=history.query({windows,from:start,to:start+30000,kind:'status',category:'collection_health',limit:50});assert.equal(list.requestSummary.reduce((sum,row)=>sum+row.count,0),4,'the full self-check history still reports requests for the selected period');
-    history.close();history=null;assert.doesNotMatch(fs.readFileSync(path.join(dir,'diagnostics','history.vault.sqlite')).toString(),/outside-chain|collection_health/);
+    assert.equal(history.db.prepare('PRAGMA journal_mode').get().journal_mode,'wal');
   }finally{history?.close();cleanup(dir);}
 });

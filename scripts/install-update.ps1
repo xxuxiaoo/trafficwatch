@@ -156,7 +156,7 @@ try {
       [IO.Compression.ZipFileExtensions]::ExtractToFile($entry, $destination, $false)
     }
   } finally { $zip.Dispose() }
-  foreach ($required in @('Codex-Netwatch.exe','runtime/node.exe','src/main.mjs','public/index.html','package.json','scripts/install-update.ps1')) {
+  foreach ($required in @('Codex-Netwatch.exe','runtime/node.exe','src/main.mjs','public/overview.html','package.json','scripts/install-update.ps1')) {
     if (!(Test-Path -LiteralPath (Join-Path $stage $required) -PathType Leaf)) { throw 'Incomplete package' }
   }
   $next = Get-Content -LiteralPath (Join-Path $stage 'package.json') -Raw | ConvertFrom-Json

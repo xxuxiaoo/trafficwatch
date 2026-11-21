@@ -14,7 +14,7 @@ export function requestCoverage(event,{ring,startedAt,traceState,lastTraceAt,tar
   result.system=matched?'same_target_window':'no_matching_tcp';return result;
 }
 
-export function collectionSnapshot({sources=[],traceState,lastTraceAt,pktmonState,pktmonCheckedAt,metrics={},queuePending=false,now=Date.now()}={}){
+export function collectionSnapshot({sources=[],traceState,lastTraceAt,pktmonState,pktmonCheckedAt,metrics={},writePending=false,now=Date.now()}={}){
   const checks=[];
   for(const source of sources){
     const issues=[];
@@ -29,7 +29,7 @@ export function collectionSnapshot({sources=[],traceState,lastTraceAt,pktmonStat
     issues:[...(!traceFresh?['system_trace_unavailable']:[]),...(metrics.traceEventsLost||metrics.boundedDrops?['dropped_events']:[])],
     eventsLost:metrics.traceEventsLost||0,boundedDrops:metrics.boundedDrops||0});
   checks.push({id:'pktmon',state:pktmonState,issues:[...(pktmonState!=='recording'?['pktmon_unavailable']:[]),...(!pktmonCheckedAt||now-pktmonCheckedAt>150000?['poll_overdue']:[])]});
-  if(queuePending)checks.push({id:'encrypted_queue',state:'write_pending',issues:['queue_write_pending']});
+  if(writePending)checks.push({id:'sqlite_write',state:'write_pending',issues:['sqlite_write_pending']});
   const issueCount=checks.filter(check=>check.issues.length).length;
   return {id:eventId('collection-health',now),kind:'status',at:now,category:'collection_health',schemaVersion:2,
     state:issueCount?'attention':'checked',issueCount,sources:checks,fault:false,

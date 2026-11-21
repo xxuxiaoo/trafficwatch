@@ -45,8 +45,24 @@ export function subscriptionFor(candidate) {
   } catch { return null; }
 }
 
+export function normalizeAirportName(name) {
+  return normalizeAirportLabel(name).toLocaleLowerCase('en-US');
+}
+
+export function normalizeAirportLabel(name) {
+  if (typeof name !== 'string' || /[\x00-\x1f\x7f]/.test(name)) return '';
+  return name.normalize('NFKC').trim()
+    .replace(/\s*\((?:clash\s*verge|verge|flclash|flclssh|mihomo)\)\s*$/i, '')
+    .trim();
+}
+
+export function airportGroupKey(name) {
+  const key = normalizeAirportName(name);
+  return key ? 'airport-' + createHash('sha256').update(key).digest('hex').slice(0, 24) : '';
+}
+
 function airport(client, id, name) {
-  return { id: 'auto-' + createHash('sha256').update(JSON.stringify([client, id])).digest('hex').slice(0, 24), name };
+  return { id: 'auto-' + createHash('sha256').update(JSON.stringify([client, id, name])).digest('hex').slice(0, 24), name };
 }
 
 export function airportIndex(client, response, subscription) {

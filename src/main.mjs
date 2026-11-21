@@ -1,7 +1,8 @@
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { loadConfig } from './config.mjs';
-import { createCaptureStore } from './switching-store.mjs';
+import { Store } from './store.mjs';
+import { historyDirectory } from './history-paths.mjs';
 import { Monitor } from './monitor.mjs';
 import { createServer } from './server.mjs';
 import { acquireInstance } from './instance.mjs';
@@ -18,7 +19,9 @@ try {
 let instance, store;
 try {
   instance = acquireInstance(config.dataDir);
-  store = createCaptureStore(config.dataDir);
+  const suiteRoot = process.env.TRAFFICWATCH_SUITE_DATA_ROOT;
+  const lane = config.captureMode === 'mihomo' ? 'clash' : 'windows';
+  store = new Store(suiteRoot ? historyDirectory(suiteRoot, lane) : config.dataDir);
 } catch (error) {
   instance?.release();
   console.error(`Startup failed: ${error.message}`);

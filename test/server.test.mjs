@@ -110,13 +110,11 @@ test('local server enforces Host, Origin and custom client header; settings pers
     ).status,
     400,
   );
-  const body = await (await fetch(`${url}/`)).text();
-  assert.match(body, /Codex Netwatch/);
-  assert.match(body, /type="module"/);
-  const translations = await fetch(`${url}/i18n.js`);
-  assert.equal(translations.status, 200);
-  assert.match(translations.headers.get('content-type'), /javascript/);
-  assert.match(await translations.text(), /captureStaticTranslations/);
+  const home = await fetch(`${url}/`, { redirect:'manual' });
+  assert.equal(home.status,302);
+  assert.equal(home.headers.get('location'),'http://127.0.0.1:43131/');
+  for(const oldPage of ['/index.html','/app.js','/history.js','/i18n.js'])
+    assert.equal((await fetch(url+oldPage,{redirect:'manual'})).status,404,oldPage);
   assert.equal((await fetch(`${url}/missing`)).status, 404);
   const status = await new Promise((resolve, reject) => {
     http

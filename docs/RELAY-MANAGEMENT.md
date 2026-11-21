@@ -8,4 +8,4 @@ After a change, the page requests a background reconciliation. The route worker 
 
 **恢复原 DIRECT** disables all managed targets and requests reconciliation. The current list is backed up first. This removes TrafficWatch-owned physical routes and Clash profile additions while preserving unrelated Clash configuration and each relay's original matching rules. It does not alter other applications' proxy configuration beyond removing TrafficWatch-owned entries.
 
-Relay configuration and backups are local control metadata so the boot-time route worker can use them while the traffic history is locked. The page and its read/write APIs still require the unlocked owner session; AI visitor credentials never authorize routing changes.
+The boot-time route worker and the local viewer use the same managed configuration. The loopback API uses the application request header and checks the browser origin.

@@ -2,14 +2,11 @@ import fs from 'node:fs';
 import path from 'node:path';
 import crypto from 'node:crypto';
 import {deflateRawSync,inflateRawSync} from 'node:zlib';
-import {DatabaseSync as PlainDatabase} from 'node:sqlite';
 import {DatabaseSync} from './database.mjs';
-import {dpapi} from './vault-platform.mjs';
-import {sealPacket,openPacket,packetFormat,purposeKey} from './vault-crypto.mjs';
-import {containsTime,containsInterval,intersectWindows} from './vault-grants.mjs';
+import {historyDirectory,historyFilename} from './history-paths.mjs';
+import {containsTime,containsInterval,intersectWindows} from './history-windows.mjs';
 import {diagnosticTriggers} from './ai-diagnostic-events.mjs';
 import {DiagnosticFilters} from './ai-diagnostic-filters.mjs';
-import {drainSealedQueue} from './sealed-queue.mjs';
 import {correctTcpCategory} from './ai-tcp-events.mjs';
 
 function correctProbeCompatibility(event){
@@ -24,33 +21,15 @@ function correctProbeCompatibility(event){
   return event;
 }
 
-export class DiagnosticSpool {
-  constructor(dataRoot,metadata,{signingKey}={}){
-    this.metadata=metadata;this.signingKey=signingKey??dpapi(fs.readFileSync(path.join(dataRoot,'vault','capture-signing.dpapi')),{scope:'machine',decrypt:true});
-    fs.mkdirSync(path.join(dataRoot,'diagnostics'),{recursive:true});
-    this.db=new PlainDatabase(path.join(dataRoot,'diagnostics','ingest.sqlite'));
-    this.db.exec('PRAGMA journal_mode=WAL;PRAGMA synchronous=FULL;PRAGMA busy_timeout=2000;CREATE TABLE IF NOT EXISTS envelopes(sequence INTEGER PRIMARY KEY,id TEXT UNIQUE NOT NULL,payload BLOB NOT NULL)');
-    this.insert=this.db.prepare('INSERT INTO envelopes(id,payload) VALUES (?,?)');
-  }
-  append(events){
-    if(!events.length)return;const id=crypto.randomUUID();
-    const packet=sealPacket(events,this.metadata.publicKey,{format:packetFormat,vault:this.metadata.id,lane:'diagnostics',id},this.signingKey);
-    this.insert.run(id,Buffer.from(JSON.stringify(packet)));
-  }
-  close(){this.db.close();if(Buffer.isBuffer(this.signingKey))this.signingKey.fill(0);}
-}
-
 export class DiagnosticHistory {
-  constructor(dataRoot,metadata,secrets){
-    this.dataRoot=dataRoot;this.metadata=metadata;this.secrets=secrets;
-    const dir=path.join(dataRoot,'diagnostics');fs.mkdirSync(dir,{recursive:true});
-    const master=Buffer.from(secrets.master,'base64'),key=purposeKey(master,'database/diagnostics');master.fill(0);
-    try{this.db=new DatabaseSync(path.join(dir,'history.vault.sqlite'),{encryptionKey:key});}finally{key.fill(0);}
-    this.db.exec(`PRAGMA journal_mode=WAL;PRAGMA synchronous=FULL;PRAGMA busy_timeout=2000;
+  constructor(dataRoot, { directory = historyDirectory(dataRoot, 'diagnostics') } = {}) {
+    fs.mkdirSync(directory,{recursive:true});
+    this.db = new DatabaseSync(path.join(directory,historyFilename('diagnostics')));
+    this.db.exec(`PRAGMA busy_timeout=3000;PRAGMA journal_mode=WAL;PRAGMA synchronous=NORMAL;
       CREATE TABLE IF NOT EXISTS events(id TEXT PRIMARY KEY,at INTEGER NOT NULL,kind TEXT NOT NULL,provider TEXT NOT NULL,harness TEXT NOT NULL,gateway TEXT NOT NULL,category TEXT NOT NULL,payload BLOB NOT NULL);
       CREATE INDEX IF NOT EXISTS events_time ON events(at DESC,id);
       CREATE INDEX IF NOT EXISTS events_kind_time ON events(kind,at DESC);
-      CREATE TABLE IF NOT EXISTS imports(id TEXT PRIMARY KEY,digest TEXT NOT NULL);
+      CREATE TABLE IF NOT EXISTS diagnostic_attachments(id TEXT PRIMARY KEY, from_at INTEGER NOT NULL, to_at INTEGER NOT NULL, trace BLOB NOT NULL);
       CREATE TABLE IF NOT EXISTS superseded_events(id TEXT PRIMARY KEY);
       CREATE TABLE IF NOT EXISTS request_quality(id TEXT PRIMARY KEY,request_id TEXT NOT NULL,request_at INTEGER,request_end INTEGER,expected INTEGER,attempt INTEGER,phase TEXT NOT NULL,system TEXT NOT NULL);
       CREATE TABLE IF NOT EXISTS diagnostic_notes(id TEXT PRIMARY KEY,at INTEGER NOT NULL,title TEXT NOT NULL,body TEXT NOT NULL);`);
@@ -62,22 +41,17 @@ export class DiagnosticHistory {
     }
     this.filters=new DiagnosticFilters(this.db);
   }
-  drainBatch({limit=32,...options}={}){
-    return drainSealedQueue(path.join(this.dataRoot,'diagnostics','ingest.sqlite'),this.db,row=>{
-        const digest=crypto.createHash('sha256').update(row.payload).digest('hex'),previous=this.db.prepare('SELECT digest FROM imports WHERE id=?').get(row.id);
-        if(previous&&previous.digest!==digest)throw new Error('ingest_id_conflict');
-        if(!previous){
-          const packet=JSON.parse(Buffer.from(row.payload).toString('utf8'));
-          if(packet.header?.id!==row.id||packet.header?.vault!==this.metadata.id||packet.header?.lane!=='diagnostics')throw new Error('ingest_header_mismatch');
-          const events=openPacket(packet,this.secrets.privateKey,this.metadata.capturePublicKey);
-          if(!Array.isArray(events)||events.length>1024)throw new Error('invalid_diagnostic_batch');
-          this.db.exec('SAVEPOINT diagnostic_import_envelope');
-          try{for(const event of events)this.put(event);this.db.prepare('INSERT INTO imports VALUES (?,?)').run(row.id,digest);this.db.exec('RELEASE diagnostic_import_envelope');}
-          catch(error){this.db.exec('ROLLBACK TO diagnostic_import_envelope;RELEASE diagnostic_import_envelope');throw error;}
-        }
-    },{limit,...options});
+  append(events) {
+    if (!events.length) return;
+    this.db.exec('BEGIN IMMEDIATE');
+    try {
+      for (const event of events) this.put(event);
+      this.db.exec('COMMIT');
+    } catch (error) {
+      this.db.exec('ROLLBACK');
+      throw error;
+    }
   }
-  drain(limit=32){return this.drainBatch({limit}).count;}
   put(event){
     event=correctProbeCompatibility(event);
     if(typeof event.id!=='string'||event.id.length>128||!Number.isSafeInteger(event.at)||!['request','incident','probe','gap','status','mark','route','resource','tcp','log'].includes(event.kind))throw new Error('invalid_diagnostic_event');
@@ -85,8 +59,8 @@ export class DiagnosticHistory {
     if(this.db.prepare('SELECT 1 FROM superseded_events WHERE id=?').get(event.id))return;
     if(event.kind==='log'&&event.timeSource==='unknown'&&this.db.prepare("SELECT 1 FROM events WHERE id=? AND kind='log' AND time_source!='unknown'").get(event.id))return;
     if(event.kind==='request'&&event.gateway==='magpie'&&event.schemaVersion===2&&/^[a-f0-9]{32}$/.test(event.legacyId)&&event.legacyId!==event.id){
-      // Signed, corrected source replay replaces the collided legacy entry.
-      // A tombstone prevents a delayed old queue from recreating a duplicate.
+      // Corrected source replay replaces the collided legacy entry.
+      // A tombstone prevents a delayed historical replay from recreating a duplicate.
       const legacy=this.db.prepare('SELECT payload FROM events WHERE id=? AND kind=\'request\' AND gateway=\'magpie\' AND schema_version<2').get(event.legacyId);
       if(legacy){
         const previous=JSON.parse(inflateRawSync(legacy.payload,{maxOutputLength:32*1024*1024}));
@@ -107,8 +81,6 @@ export class DiagnosticHistory {
     limit=Math.min(100,Math.max(1,Number(limit)||60));
     const periods=intersectWindows(windows,from,to);if(!periods.length)return {rows:[],summary:[],next:null};
     const clauses=['('+periods.map(()=>'(at>=? AND at<? AND (end_at IS NULL OR end_at<?))').join(' OR ')+')'],params=periods.flatMap(p=>[p.from,p.to,p.to]);
-    // An observation timestamp cannot prove that an old log belongs to a
-    // visitor's exact authorized dates. Owners may inspect it with a warning.
     if(!owner)clauses.push("NOT(kind='log' AND time_source='unknown')");
     const collectionOnly=kind==='status'&&category==='collection_health'&&limit===1;
     const filterIndexPending=collectionOnly?false:this.filters.backfill({correct:correctProbeCompatibility});
@@ -162,20 +134,24 @@ export class DiagnosticHistory {
     if(typeof note.title!=='string'||note.title.length>200||typeof note.body!=='string'||note.body.length>8000)throw new Error('invalid_note');
     const id=action==='create'?crypto.randomUUID():note.id;this.db.prepare('INSERT OR REPLACE INTO diagnostic_notes VALUES (?,?,?,?)').run(id,note.at,note.title,note.body);return {id};
   }
-  attachment(id,windows){
-    if(typeof id!=='string'||!/^[a-f0-9-]{36}$/.test(id))throw new Error('invalid_attachment');
-    const file=path.join(this.dataRoot,'diagnostics','attachments',id+'.sealed');
-    if(fs.statSync(file).size>48*1024*1024)throw new Error('invalid_attachment');
-    const packet=JSON.parse(fs.readFileSync(file,'utf8'));
-    if(packet.header?.vault!==this.metadata.id||packet.header?.lane!=='diagnostics'||packet.header?.id!==id)throw new Error('invalid_attachment');
-    const value=openPacket(packet,this.secrets.privateKey,this.metadata.capturePublicKey);
-    if(!Number.isSafeInteger(value.from)||!Number.isSafeInteger(value.to)||!containsInterval(windows,value.from,value.to))throw new Error('grant_date_forbidden');
-    return {...value,name:'trafficwatch-pktmon-'+id+'.etl',packetPayload:false};
+  putAttachment(id, from, to, bytes) {
+    if (!/^[a-f0-9-]{36}$/.test(id) || !Number.isSafeInteger(from) || !Number.isSafeInteger(to) ||
+        to <= from || !Buffer.isBuffer(bytes) || !bytes.length || bytes.length > 32 * 1024 * 1024) {
+      throw new Error('invalid_diagnostic_attachment');
+    }
+    this.db.prepare('INSERT INTO diagnostic_attachments VALUES (?,?,?,?)').run(id, from, to, bytes);
   }
-  deleteAttachment(id,windows){
-    this.attachment(id,windows); // Validates signature, ownership and the complete evidence interval.
-    fs.unlinkSync(path.join(this.dataRoot,'diagnostics','attachments',id+'.sealed'));
+  attachment(id) {
+    if (typeof id !== 'string' || !/^[a-f0-9-]{36}$/.test(id)) throw new Error('invalid_diagnostic_attachment');
+    const row = this.db.prepare('SELECT from_at, to_at, trace FROM diagnostic_attachments WHERE id=?').get(id);
+    if (!row) throw new Error('diagnostic_attachment_not_found');
+    return { from: row.from_at, to: row.to_at, bytes: Buffer.from(row.trace).toString('base64'),
+      name: 'trafficwatch-pktmon-' + id + '.etl', packetPayload: false };
+  }
+  deleteAttachment(id) {
+    if (typeof id !== 'string' || !/^[a-f0-9-]{36}$/.test(id)) throw new Error('invalid_diagnostic_attachment');
+    if (!this.db.prepare('DELETE FROM diagnostic_attachments WHERE id=?').run(id).changes) throw new Error('diagnostic_attachment_not_found');
     return {ok:true,id};
   }
-  close(){this.db.close();}
+  close(){if(this.db.isOpen)this.db.close();}
 }

@@ -3,7 +3,7 @@ import path from 'node:path';
 import dns from 'node:dns/promises';
 import crypto from 'node:crypto';
 import {fileURLToPath} from 'node:url';
-import {DiagnosticSpool} from './ai-diagnostic-store.mjs';
+import {DiagnosticHistory} from './ai-diagnostic-store.mjs';
 import {readSettings,discoverPhysical,physicalDns,probeRelay,runNetworkScript} from './ai-windows.mjs';
 import {applyClashOverlay,productionController,controllerCall} from './relay-clash-overlay.mjs';
 import {activeRelayHosts,relayHostRevision} from './relay-targets.mjs';
@@ -86,13 +86,13 @@ async function main(){
   const settings=readSettings();if(!settings.DataRoot||(!settings.RelayHosts?.length&&!fs.existsSync(path.join(settings.DataRoot,'relay-bypass','managed-targets.json'))))return;
   const dataRoot=settings.DataRoot,dir=path.join(dataRoot,'relay-bypass');fs.mkdirSync(dir,{recursive:true});
   if(!process.argv.includes('--rollback')&&(fs.existsSync(path.join(dir,'disabled'))||fs.existsSync(path.join(dataRoot,'stop.request'))))return;
-  const metadata=JSON.parse(fs.readFileSync(path.join(dataRoot,'vault','vault.json'),'utf8')),spool=new DiagnosticSpool(dataRoot,metadata);
+  const history=new DiagnosticHistory(dataRoot);
   const rollback=process.argv.includes('--rollback');let stopping=false,lastResult='',timer,running=false,rerun=false,forceVerify=true;
   let lastSettled=null;try{lastSettled=JSON.parse(fs.readFileSync(path.join(dir,'status.json'),'utf8'));}catch{}
   if(!lastSettled?.lastVerifiedAt)try{const previous=JSON.parse(fs.readFileSync(path.join(dir,'targets.json'),'utf8'));lastSettled={...lastSettled,lastVerifiedAt:previous.lastVerifiedAt||(previous.state==='verified'?previous.verifiedAt:null)};}catch{}
   const writeStatus=value=>{const file=path.join(dir,'status.json');fs.writeFileSync(file+'.pending',JSON.stringify({...value,app:'trafficwatch-relay-bypass',pid:process.pid,at:Date.now()}));fs.renameSync(file+'.pending',file);};
-  if(rollback){const result=await bypassCycle(settings,{rollback:true});spool.append([result]);writeStatus({state:'rolled_back'});spool.close();return;}
-  const finishStop=()=>{spool.close();writeStatus({state:'stopped'});};
+  if(rollback){const result=await bypassCycle(settings,{rollback:true});history.append([result]);writeStatus({state:'rolled_back'});history.close();return;}
+  const finishStop=()=>{history.close();writeStatus({state:'stopped'});};
   const stop=()=>{if(stopping)return;stopping=true;clearTimeout(timer);watcher.close();if(!running)finishStop();};process.once('SIGINT',stop);process.once('SIGTERM',stop);
   const watcher=fs.watch(dir,(_event,filename)=>{
     if(String(filename)!=='refresh.request'||!fs.existsSync(path.join(dir,'refresh.request')))return;
@@ -106,9 +106,9 @@ async function main(){
       const verify=forceVerify;forceVerify=false;
       const checking=stage=>writeStatus({...lastSettled,state:'checking',previousState:lastSettled?.state,stage});checking('adapter');
       const result=await bypassCycle(settings,{verify,onStage:checking}),signature=JSON.stringify([result.state,result.adapter,result.targets.map(target=>[target.host,target.ips,target.stale]),result.errors]);
-      if(signature!==lastResult||result.checks.length){spool.append([result]);lastResult=signature;}
+      if(signature!==lastResult||result.checks.length){history.append([result]);lastResult=signature;}
       lastSettled={...relayResultHealth(result),...(!result.revalidated&&lastSettled?{verified:lastSettled.verified,checkedAt:lastSettled.checkedAt,failures:lastSettled.failures||[]}:{} )};writeStatus(lastSettled);
-    }catch(error){lastSettled={state:'degraded',error:relayErrorCode(error),stage:error.stage,lastVerifiedAt:lastSettled?.lastVerifiedAt||null,checkedAt:Date.now(),failures:[]};writeStatus(lastSettled);spool.append([{kind:'gap',id:crypto.randomUUID(),at:Date.now(),category:'bypass_validation_failed',code:lastSettled.error,stage:error.stage,fault:true}]);}
+    }catch(error){lastSettled={state:'degraded',error:relayErrorCode(error),stage:error.stage,lastVerifiedAt:lastSettled?.lastVerifiedAt||null,checkedAt:Date.now(),failures:[]};writeStatus(lastSettled);history.append([{kind:'gap',id:crypto.randomUUID(),at:Date.now(),category:'bypass_validation_failed',code:lastSettled.error,stage:error.stage,fault:true}]);}
     running=false;
     if(stopping){finishStop();return;}
     if(!stopping){if(rerun){rerun=false;timer=setTimeout(tick,50);}else timer=setTimeout(tick,60000);}

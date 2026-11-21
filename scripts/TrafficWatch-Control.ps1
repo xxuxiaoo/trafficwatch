@@ -1,5 +1,5 @@
-﻿param(
-    [ValidateSet('Status','Start','Stop','EnableStartup','DisableStartup','StartDiagnostics','StopDiagnostics','EnableBypass','RollbackBypass')]
+param(
+    [ValidateSet('Status','Start','PauseCapture','Stop','StopFromOverview','EnableStartup','DisableStartup','StartDiagnostics','StopDiagnostics','EnableBypass','RollbackBypass')]
     [string]$Action='Status'
 )
 $ErrorActionPreference='Stop'
@@ -11,12 +11,12 @@ $controlBypassTask='TrafficWatch - Relay physical bypass'
 $controlSettings=Get-Content -LiteralPath (Join-Path $controlRoot 'suite-settings.json') -Raw | ConvertFrom-Json
 $controlData=[IO.Path]::GetFullPath([string]$controlSettings.DataRoot)
 $controlStopSignal=Join-Path $controlData 'stop.request'
+$capturePauseSignal=Join-Path $controlData 'capture-paused'
 $controlSupervisor=Join-Path $controlRoot 'TrafficWatch-Supervisor.ps1'
 $controlObserver=Join-Path $controlRoot 'scripts\windows-observer.ps1'
 $controlExpectedExecutables=@(
     (Join-Path $controlRoot 'runtime\node.exe'),
     (Join-Path $controlRoot 'native\Codex-Netwatch-Capture.exe'),
-    (Join-Path $controlRoot 'native\TrafficWatch-VaultGuard.exe'),
     (Join-Path $controlRoot 'native\TrafficWatch-AiTrace.exe'),
     (Join-Path $controlRoot 'native\TrafficWatch-RelayProbe.exe'),
     (Join-Path $controlRoot 'TrafficWatch-Tray.exe')
@@ -41,7 +41,7 @@ function Read-ControlHealth([int]$Port) {
 }
 
 function Get-ControlProcesses {
-    @(Get-CimInstance Win32_Process -Filter "Name='node.exe' OR Name='powershell.exe' OR Name='pwsh.exe' OR Name='TrafficWatch-Tray.exe' OR Name='Codex-Netwatch-Capture.exe' OR Name='TrafficWatch-VaultGuard.exe' OR Name='TrafficWatch-AiTrace.exe' OR Name='TrafficWatch-RelayProbe.exe'" | Where-Object {
+    @(Get-CimInstance Win32_Process -Filter "Name='node.exe' OR Name='powershell.exe' OR Name='pwsh.exe' OR Name='TrafficWatch-Tray.exe' OR Name='Codex-Netwatch-Capture.exe' OR Name='TrafficWatch-AiTrace.exe' OR Name='TrafficWatch-RelayProbe.exe'" | Where-Object {
         if ($controlExpectedExecutables -contains $_.ExecutablePath) { return $true }
         if ($_.Name -in @('powershell.exe','pwsh.exe')) {
             $line=[string]$_.CommandLine
@@ -98,11 +98,27 @@ function Request-ControlStop([int]$Port,$Owned) {
     }
 }
 
-function Stop-ControlSuite {
+function Get-ControlStopTargets($Viewer) {
+    @(Get-ControlProcesses | Where-Object {
+        if (-not $Viewer) { return $true }
+        return -not ($_.ProcessId -eq $Viewer.ProcessId -and $_.CreationDate -eq $Viewer.CreationDate)
+        return -not ($_.ExecutablePath -eq $guard -and $_.ParentProcessId -eq $Viewer.ProcessId -and $_.CreationDate -ge $Viewer.CreationDate)
+    })
+}
+
+function Stop-ControlSuite([switch]$ReplyInOverview) {
     if (-not (Test-Path -LiteralPath $controlData -PathType Container)) { throw 'The existing data folder is missing.' }
-    [IO.File]::WriteAllText($controlStopSignal,(Get-Date).ToString('o'))
     $owned=@(Get-ControlProcesses)
-    foreach ($port in @(43128,43130,43131)) { Request-ControlStop $port $owned }
+    $viewer=$null
+    $ports=@(43128,43130,43131)
+    if ($ReplyInOverview) {
+        $health=Read-ControlHealth 43131
+        $viewer=$owned | Where-Object { $_.ProcessId -eq $health.collectorPid -and $_.ExecutablePath -eq (Join-Path $controlRoot 'runtime\node.exe') } | Select-Object -First 1
+        if (-not $viewer) { throw 'The requesting overview process could not be verified.' }
+        $ports=@(43128,43130)
+    }
+    [IO.File]::WriteAllText($controlStopSignal,(Get-Date).ToString('o'))
+    foreach ($port in $ports) { Request-ControlStop $port $owned }
 
     # Signal the existing user-session tray before any forced fallback.
     $tray=Join-Path $controlRoot 'TrafficWatch-Tray.exe'
@@ -112,7 +128,7 @@ function Stop-ControlSuite {
     }
     $deadline=(Get-Date).AddSeconds(12)
     do {
-        $remaining=@(Get-ControlProcesses)
+        $remaining=@(Get-ControlStopTargets $viewer)
         $task=Get-ScheduledTask -TaskName $controlTask
         if ($remaining.Count -eq 0 -and $task.State -ne 'Running') { break }
         Start-Sleep -Milliseconds 500
@@ -121,7 +137,7 @@ function Stop-ControlSuite {
     if ($task.State -eq 'Running') { Stop-ScheduledTask -TaskName $controlTask }
     if ((Get-ScheduledTask -TaskName $controlTrayTask).State -eq 'Running') { Stop-ScheduledTask -TaskName $controlTrayTask }
     foreach($controlExtraTask in @($controlDiagnosticTask,$controlBypassTask)){if((Get-ScheduledTask -TaskName $controlExtraTask -ErrorAction SilentlyContinue).State -eq 'Running'){Stop-ScheduledTask -TaskName $controlExtraTask}}
-    foreach ($target in @(Get-ControlProcesses)) {
+    foreach ($target in @(Get-ControlStopTargets $viewer)) {
         $current=Get-CimInstance Win32_Process -Filter ('ProcessId='+$target.ProcessId) -ErrorAction SilentlyContinue
         if (-not $current -or $current.CreationDate -ne $target.CreationDate) { continue }
         $result=Invoke-CimMethod -InputObject $current -MethodName Terminate -Arguments @{Reason=[uint32]0}
@@ -140,8 +156,10 @@ function Stop-ControlSuite {
             }
         }
     }
-    if (@(Get-ControlProcesses).Count -ne 0) { throw 'A TrafficWatch process is still running.' }
-    if ((Read-ControlHealth 43128) -or (Read-ControlHealth 43130) -or (Read-ControlHealth 43131)) { throw 'A TrafficWatch service still responds on a monitoring port.' }
+    if (@(Get-ControlStopTargets $viewer).Count -ne 0) { throw 'A TrafficWatch background process is still running.' }
+    foreach ($port in $ports) {
+        if (Read-ControlHealth $port) { throw ('A TrafficWatch service still responds on port '+$port+'.') }
+    }
 }
 
 try {
@@ -187,12 +205,25 @@ try {
             if($LASTEXITCODE -ne 0){throw 'Bypass rollback did not complete. Original DIRECT rules remain.'}
         }
         'Stop' { Stop-ControlSuite }
+        'StopFromOverview' { Stop-ControlSuite -ReplyInOverview }
+        'PauseCapture' {
+            [IO.File]::WriteAllText($capturePauseSignal,(Get-Date).ToString('o'))
+            $owned=@(Get-ControlProcesses)
+            $deadline=(Get-Date).AddSeconds(22)
+            do {
+                foreach ($port in @(43128,43130)) { Request-ControlStop $port $owned }
+                if (-not (Read-ControlHealth 43128) -and -not (Read-ControlHealth 43130)) { break }
+                Start-Sleep -Milliseconds 400
+            } while ((Get-Date) -lt $deadline)
+            if ((Read-ControlHealth 43128) -or (Read-ControlHealth 43130)) { throw 'Traffic collectors still respond after the pause request.' }
+        }
         'Start' {
             $task=Get-ScheduledTask -TaskName $controlTask
             $wasEnabled=[bool]$task.Settings.Enabled
             try {
                 if (-not $wasEnabled) { Enable-ScheduledTask -TaskName $controlTask | Out-Null }
-                Start-ScheduledTask -TaskName $controlTask
+                if (Test-Path -LiteralPath $capturePauseSignal) { Remove-Item -LiteralPath $capturePauseSignal -Force }
+                if ($task.State -ne 'Running') { Start-ScheduledTask -TaskName $controlTask }
                 $deadline=(Get-Date).AddSeconds(30)
                 do {
                     Start-Sleep -Milliseconds 700
@@ -212,8 +243,6 @@ try {
             foreach($controlExtraTask in @($controlDiagnosticTask,$controlBypassTask)){Enable-ScheduledTask -TaskName $controlExtraTask|Out-Null}
         }
         'DisableStartup' {
-            # Disabling scheduled triggers alone does not stop an already-running task.
-            Stop-ControlSuite
             Disable-ScheduledTask -TaskName $controlTask | Out-Null
             Disable-ScheduledTask -TaskName $controlTrayTask | Out-Null
             foreach($controlExtraTask in @($controlDiagnosticTask,$controlBypassTask)){Disable-ScheduledTask -TaskName $controlExtraTask|Out-Null}

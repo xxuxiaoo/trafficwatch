@@ -3,14 +3,13 @@ import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
-import {createVaultKeys} from '../src/vault-crypto.mjs';
 import {DiagnosticHistory} from '../src/ai-diagnostic-store.mjs';
 
 const start=Date.parse('2026-11-13T00:00:00+08:00'),day=86400000;
 const window={from:start,to:start+3*day};
 async function withHistory(run){
   const dir=fs.mkdtempSync(path.join(os.tmpdir(),'tw-diagnostic-filters-'));let history;
-  try{const {metadata,secrets}=await createVaultKeys('synthetic-filter-password');history=new DiagnosticHistory(dir,metadata,secrets);await run(history);}
+  try{history=new DiagnosticHistory(dir);await run(history);}
   finally{history?.close();assert.equal(path.dirname(path.resolve(dir)),path.resolve(os.tmpdir()));assert(path.basename(dir).startsWith('tw-diagnostic-filters-'));fs.rmSync(dir,{recursive:true,force:true,maxRetries:5,retryDelay:100});}
 }
 const query=(history,options={})=>history.query({windows:[window],from:window.from,to:window.to,owner:true,...options});
@@ -49,7 +48,7 @@ test('filter choices cover the complete time range, independent of pagination an
   const older=query(history,{from:start,to:start+10});assert.deepEqual(older.facets.provider,['Relay B']);
 }));
 
-test('visitor date filters and choices cannot reveal excluded-day or unknown-time trigger identities',()=>withHistory(history=>{
+test('exact date filters and choices cannot reveal excluded-day or unknown-time trigger identities',()=>withHistory(history=>{
   const allowed=request('allowed','eof'),excluded=request('excluded','gateway_error',{at:start+day+1000,provider:'Excluded Relay',harness:'excluded-harness',gateway:'excluded-gateway'});
   history.put(incident('crossing',[allowed,excluded],{to:start+2*day+1000}));
   history.put({kind:'log',id:'unknown',at:start+30000,category:'reset',provider:'Unknown time relay',fault:true});

@@ -1,6 +1,6 @@
 {
   "name": "trafficwatch",
-  "version": "0.10.14",
+  "version": "0.10.16",
   "private": true,
   "description": "Windows traffic history for all observed applications, Clash/Mihomo proxy traffic and AI coding harnesses.",
   "type": "module",
@@ -19,7 +19,7 @@
   "scripts": {
     "start": "node --disable-warning=ExperimentalWarning src/overview-server.mjs",
     "collector": "node --disable-warning=ExperimentalWarning src/main.mjs",
-    "demo": "node --disable-warning=ExperimentalWarning src/main.mjs --demo",
+    "demo": "powershell.exe -NoProfile -ExecutionPolicy Bypass -File scripts/start.ps1 -Demo",
     "doctor": "node --disable-warning=ExperimentalWarning scripts/doctor.mjs",
     "check": "node scripts/check.mjs",
     "test": "node scripts/test.mjs",
@@ -29,7 +29,9 @@
     "audit:publication": "node scripts/audit-publication.mjs"
   },
   "dependencies": {
-    "better-sqlite3-multiple-ciphers": "13.1.1",
     "yaml": "2.8.2"
+  },
+  "devDependencies": {
+    "better-sqlite3-multiple-ciphers": "13.1.1"
   }
 }

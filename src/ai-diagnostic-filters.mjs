@@ -6,9 +6,8 @@ function timeClause(periods,prefix=''){
   return {sql:'('+periods.map(()=>`(${prefix}at>=? AND ${prefix}at<? AND (${prefix}end_at IS NULL OR ${prefix}end_at<?))`).join(' OR ')+')',params:periods.flatMap(p=>[p.from,p.to,p.to])};
 }
 
-// Derived indexes live inside the same encrypted database. An incident's tags
-// retain the time and identity of the triggering evidence, so a date-limited
-// visitor cannot infer a trigger from an excluded day through a filter.
+// Derived indexes live inside the history database. An incident's tags
+// retain the time and identity of the triggering evidence for date filtering.
 export class DiagnosticFilters {
   constructor(db){
     this.db=db;this.pending=true;db.exec(`CREATE TABLE IF NOT EXISTS diagnostic_filter_entries(event_id TEXT NOT NULL,item_id TEXT NOT NULL,at INTEGER NOT NULL,end_at INTEGER,provider TEXT NOT NULL,harness TEXT NOT NULL,gateway TEXT NOT NULL,category TEXT NOT NULL,unknown_time INTEGER NOT NULL,PRIMARY KEY(event_id,item_id,category));

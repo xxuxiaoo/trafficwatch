@@ -1,13 +1,12 @@
 import fs from 'node:fs';
 import path from 'node:path';
-import { DatabaseSync,configureDatabaseKeys } from './database.mjs';
-import { restrictReadConnection } from './vault-grants.mjs';
-import { readLegacy } from './vault-legacy.mjs';
+import { DatabaseSync } from './database.mjs';
+import { historyDirectory, historyFilename } from './history-paths.mjs';
 import { parentPort, workerData } from 'node:worker_threads';
 import { DEFAULT_CODEX_PROCESS_NAMES, normalizeHarnessApps } from './harness.mjs';
 import { programRollup } from './history-rollup.mjs';
 import { attachArchiveViews, setArchiveWindows, historyBounds } from './history-archive.mjs';
-import { normalizeAirportGroups } from './airport-groups.mjs';
+import { airportGroupKey, normalizeAirportLabel } from './proxy-airports.mjs';
 
 const MINUTE = 60000, DAY = 86400000;
 const timeZone = 'Asia/Shanghai';
@@ -63,11 +62,7 @@ function harnessApps(db, options = {}) {
   const saved = options.apps ?? settings(db, 'harnessApps', null);
   return normalizeHarnessApps(saved, saved?.codex || DEFAULT_CODEX_PROCESS_NAMES);
 }
-function savedAirportGroups(db){
-  try{return normalizeAirportGroups(settings(db,'airportGroups',[]));}catch{return [];}
-}
-
-function definitions(db, apps, airportGroups = []) {
+function definitions(db, apps) {
   const hasFamily = Boolean(db.prepare("SELECT 1 FROM sqlite_master WHERE name='connection_families' AND type='table'").get());
   const name = "CASE WHEN b.scope='unknown' THEN '' ELSE c.process END";
   const familyCases = ["WHEN b.scope='unknown' THEN 'unknown'", "WHEN b.scope='codex' THEN 'codex'"];
@@ -82,18 +77,18 @@ function definitions(db, apps, airportGroups = []) {
   }
   const family = `CASE ${familyCases.join(' ')} ELSE 'other' END`;
   const leaf = "CASE WHEN json_valid(c.rule) THEN COALESCE(json_extract(c.rule,'$.chains[0]'),'') ELSE '' END";
-  const client = "CASE WHEN json_valid(c.rule) THEN CASE lower(COALESCE(json_extract(c.rule,'$.client'),'')) WHEN 'verge' THEN 'verge' WHEN 'flclash' THEN 'flclash' WHEN 'mihomo' THEN 'mihomo' ELSE 'legacy' END ELSE 'legacy' END";
-  const autoAirport = "CASE WHEN json_valid(c.rule) THEN json_extract(c.rule,'$.airport.id') END";
-  const autoAirportName = "CASE WHEN json_valid(c.rule) THEN json_extract(c.rule,'$.airport.name') END";
-  const airportCases=airportGroups.flatMap(group=>group.members.map(member=>`WHEN ${client}=${literal(member.client)} AND ${leaf}=${literal(member.node)} THEN ${literal(group.id)}`));
-  const airport=`COALESCE(${autoAirport},${airportCases.length?`CASE ${airportCases.join(' ')} ELSE '' END`:"''"})`;
+  const client = "CASE WHEN json_valid(c.rule) THEN CASE lower(COALESCE(json_extract(c.rule,'$.client'),'')) WHEN 'verge' THEN 'verge' WHEN 'flclash' THEN 'flclash' WHEN 'flclssh' THEN 'flclash' WHEN 'mihomo' THEN 'mihomo' ELSE 'legacy' END ELSE 'legacy' END";
+  const autoAirportName = `CASE WHEN json_valid(c.rule) THEN CASE
+    WHEN json_extract(c.rule,'$.airport.id') GLOB 'auto-*' AND length(json_extract(c.rule,'$.airport.id'))=29
+    THEN COALESCE(json_extract(c.rule,'$.airport.name'),'') ELSE '' END ELSE '' END`;
+  const autoAirportKey = `trafficwatch_airport_key(${autoAirportName})`;
   const route = `CASE WHEN NOT json_valid(c.rule) THEN 'unknown'
     WHEN COALESCE(json_extract(c.rule,'$.source'),'')<>'mihomo' THEN 'unknown'
     WHEN upper(trim(${leaf}))='DIRECT' THEN 'direct'
     WHEN upper(trim(${leaf})) IN ('','REJECT','REJECT-DROP','PASS','COMPATIBLE') THEN 'unknown'
     ELSE 'proxy' END`;
   return {
-    name, family, route, leaf, client, airport, autoAirportName, apps, hasFamily,
+    name, family, route, leaf, client, airportKey: autoAirportKey, autoAirportName, apps, hasFamily,
     evidence: "CASE WHEN b.scope='unknown' THEN 'none' ELSE c.evidence END",
     pid: "CASE WHEN b.scope='unknown' THEN NULL ELSE c.pid END",
     join: `FROM buckets b JOIN connections c ON c.id=b.connection_id ${hasFamily ? 'LEFT JOIN connection_families f ON f.connection_id=c.id' : ''}`,
@@ -111,8 +106,8 @@ function filtered(defs, range, options = {}) {
   if (options.host) { clauses.push('c.host=?'); params.push(options.host); }
   if (options.node) { clauses.push(`${defs.leaf}=?`); params.push(options.node); }
   if (options.client && options.client !== 'all') { clauses.push(`${defs.client}=?`); params.push(options.client); }
-  if (options.airport === '__unassigned__') clauses.push(`${defs.route}='proxy' AND ${defs.airport}=''`);
-  else if (options.airport) { clauses.push(`${defs.route}='proxy' AND ${defs.airport}=?`); params.push(options.airport); }
+  if (options.airport === '__unassigned__') clauses.push(`${defs.route}='proxy' AND ${defs.airportKey}=''`);
+  else if (options.airport) { clauses.push(`${defs.route}='proxy' AND ${defs.airportKey}=?`); params.push(options.airport); }
   if (options.route && options.route !== 'all') { clauses.push(`${defs.route}=?`); params.push(options.route); }
   return { sql: `${defs.join} WHERE ${clauses.join(' AND ')}`, params };
 }
@@ -133,8 +128,8 @@ function sourcePrograms(db,defs,range,options){
     MIN(minute) minute,MAX(last_at) last_at FROM buckets WHERE minute>=? AND minute<? GROUP BY connection_id,scope`).run(range.from,range.to);
   const count=db.prepare('SELECT COUNT(*) count FROM temp.program_usage').get().count;
   // Range first is essential: the planner may otherwise scan the lifetime
-  // dictionary. A visitor's scoped TEMP views must always retain their filters.
-  const covering=!options.authorizedWindows&&db.prepare("SELECT 1 FROM main.sqlite_master WHERE type='index' AND name='connections_programs'").get();
+  // dictionary.
+  const covering=db.prepare("SELECT 1 FROM main.sqlite_master WHERE type='index' AND name='connections_programs'").get();
   const rows=db.prepare(`SELECT ${defs.name} process,b.scope,${defs.family} family,${defs.evidence} evidence,
     b.up,b.down,b.minute firstAt,b.last_at lastAt FROM temp.program_usage b
     CROSS JOIN connections c ${covering?'INDEXED BY connections_programs ':''}ON c.id=b.connection_id
@@ -160,16 +155,23 @@ function selectUsage(db,defs,range,options={},detail=false,compact=false){
   const clauses=['minute>=?','minute<?'],params=[range.from,range.to];
   if(options.scope){clauses.push('scope=?');params.push(options.scope);}
   if(options.process==='__unknown__')clauses.push("scope='unknown'");
+  else if (options.process && /^[\x20-\x7e]+$/.test(options.process)) {
+    // Process-filtered details need only the selected identities. This is
+    // particularly important when a whole day spans millions of ETW buckets.
+    clauses.push("scope<>'unknown' AND connection_id IN (SELECT id FROM main.connections WHERE process=? COLLATE NOCASE)");
+    params.push(options.process);
+  }
   db.exec('PRAGMA query_only=OFF;DROP TABLE IF EXISTS temp.selected_usage;DROP TABLE IF EXISTS temp.range_usage');
   db.prepare(`CREATE TEMP TABLE range_usage AS SELECT connection_id,scope,SUM(up) up,SUM(down) down,MIN(minute) minute,MAX(last_at) last_at,COUNT(*) minutes
     FROM buckets WHERE ${clauses.join(' AND ')} GROUP BY connection_id,scope`).run(...params);
   const filter=filtered(defs,range,options);
-  const covering=compact&&options.lane==='windows'&&!options.authorizedWindows&&db.prepare("SELECT 1 FROM main.sqlite_master WHERE type='index' AND name='connections_programs'").get();
+  const covering=compact&&options.lane==='windows'&&db.prepare("SELECT 1 FROM main.sqlite_master WHERE type='index' AND name='connections_programs'").get();
   let source=filter.sql.replace('FROM buckets b','FROM range_usage b');
   if(compact)source=source.replace('JOIN connections c ON',`CROSS JOIN connections c ${covering?'INDEXED BY connections_programs ':''}ON`);
-  const airportColumns=options.lane==='windows'?"'' airport,NULL airport_name":`${defs.airport} airport,${defs.autoAirportName} airport_name`;
+  const airportColumns=options.lane==='windows'?"'' airport,NULL airport_name":`${defs.airportKey} airport,${defs.autoAirportName} airport_name`;
+  const clientColumn=options.lane==='windows'?"'legacy'":defs.client;
   db.prepare(`CREATE TEMP TABLE selected_usage AS SELECT c.id,${defs.name} process,${compact?'':`${defs.pid} pid,c.host,c.network,`}b.scope,${defs.evidence} evidence,${defs.family} family,
-    ${compact&&options.lane==='windows'?"'unknown'":defs.route} route,${defs.client} client,${airportColumns},${compact?'':`${defs.leaf} node,`}b.up,b.down,b.up+b.down amount,b.minute firstAt,b.last_at lastAt,b.minutes,
+    ${compact&&options.lane==='windows'?"'unknown'":defs.route} route,${clientColumn} client,${airportColumns},${compact?'':`${defs.leaf} node,`}b.up,b.down,b.up+b.down amount,b.minute firstAt,b.last_at lastAt,b.minutes,
     ${detail?`(c.first_seen>=${range.from} AND c.last_seen<${range.to})`:'0'} _lifetime_inside
     ${source}`).run(...filter.params);
   const selected=detail?db.prepare('SELECT COUNT(*) count,COALESCE(SUM(minutes),0) minutes,MIN(_lifetime_inside) inside FROM selected_usage').get():{},all=detail?db.prepare('SELECT COALESCE(SUM(minutes),0) minutes FROM range_usage').get():{};
@@ -180,13 +182,20 @@ function selectedGroups(db,expression,route='',limit=100){
   return db.prepare(`SELECT ${expression} name,SUM(up) up,SUM(down) down,COUNT(DISTINCT id) connections FROM selected_usage${route?' WHERE route=?':''} GROUP BY 1 ORDER BY SUM(up+down) DESC LIMIT ?`).all(...(route?[route]:[]),limit);
 }
 function airportRows(db){
-  return db.prepare(`SELECT client,airport,MAX(airport_name) airportName,SUM(up) up,SUM(down) down,COUNT(DISTINCT id) connections,MIN(firstAt) firstAt,MAX(lastAt) lastAt
-    FROM selected_usage WHERE route='proxy' GROUP BY client,airport ORDER BY SUM(up+down) DESC,client,airport`).all();
-}
-function clientNodes(db,range,defs){
-  return db.prepare(`SELECT ${defs.client} client,${defs.leaf} name,SUM(b.up) up,SUM(b.down) down,COUNT(DISTINCT c.id) connections
-    ${defs.join} WHERE b.minute>=? AND b.minute<? AND ${defs.route}='proxy' AND ${defs.client} IN ('verge','flclash','mihomo')
-    GROUP BY 1,2 ORDER BY SUM(b.up+b.down) DESC LIMIT 2000`).all(range.from,range.to);
+  const rows=db.prepare(`SELECT client,airport,MAX(airport_name) airportName,SUM(up) up,SUM(down) down,
+    COUNT(DISTINCT id) connections,MIN(firstAt) firstAt,MAX(lastAt) lastAt
+    FROM selected_usage WHERE route='proxy' GROUP BY airport,client ORDER BY SUM(up+down) DESC,client`).all();
+  const groups=new Map();
+  for(const row of rows){
+    const label=normalizeAirportLabel(row.airportName);
+    const key=row.airport||'__unassigned__';
+    let group=groups.get(key);
+    if(!group){group={airport:key,airportName:label,up:0,down:0,connections:0,firstAt:row.firstAt,lastAt:row.lastAt,clients:[]};groups.set(key,group);}
+    group.up+=row.up;group.down+=row.down;group.connections+=row.connections;
+    group.firstAt=Math.min(group.firstAt,row.firstAt);group.lastAt=Math.max(group.lastAt,row.lastAt);
+    group.clients.push({client:row.client,up:row.up,down:row.down,connections:row.connections});
+  }
+  return [...groups.values()].sort((a,b)=>(b.up+b.down)-(a.up+a.down)||a.airport.localeCompare(b.airport,'en'));
 }
 function selectedPrograms(db,route='',limit=null){
   return db.prepare(`SELECT process,process name,scope,family,evidence,SUM(up) up,SUM(down) down,COUNT(DISTINCT id) connections,MIN(firstAt) firstAt,MAX(lastAt) lastAt
@@ -227,14 +236,13 @@ function selectedCharts(db,range,width){
 
 function openLane(dataRoot, lane, options = {}) {
   if (!['windows', 'clash'].includes(lane)) throw new RangeError('Invalid lane');
-  if(options.allowedLanes&&!options.allowedLanes.includes(lane))return null;
-  const encrypted=options.vault===true||fs.existsSync(path.join(dataRoot,'vault','vault.json'));
-  const file = path.join(dataRoot, lane, encrypted?'history.vault.sqlite':'monitor.sqlite');
+  if(options.singleCollector&&(options.singleCollector==='mihomo'?lane==='windows':lane==='clash'))return null;
+  const file = path.join(historyDirectory(dataRoot, lane, options), historyFilename(lane));
   if (!fs.existsSync(file)) return null;
   const db = new DatabaseSync(file, { readOnly: true });
+  if (lane === 'clash') db.function('trafficwatch_airport_key', { deterministic: true }, airportGroupKey);
   db.exec('PRAGMA temp_store=MEMORY');
-  attachArchiveViews(db,{windows:options.authorizedWindows});
-  if(options.authorizedWindows)restrictReadConnection(db,options.authorizedWindows);
+  attachArchiveViews(db);
   // These settings affect this read-only connection only. Keep grouping work in
   // memory and avoid thrashing SQLite's default 2 MiB cache on metadata joins.
   db.exec('PRAGMA query_only=ON; PRAGMA busy_timeout=600; PRAGMA temp_store=MEMORY; PRAGMA cache_size=-32768; BEGIN');
@@ -250,8 +258,8 @@ export function readLane(dataRoot, lane, rangeName, now = Date.now(), options = 
     const { firstAt, range } = resolveRange(db, rangeName, now, options);
     const lastAt = historyBounds(db).lastAt;
     setArchiveWindows(db,[{from:Math.max(0,range.from-(['today','day'].includes(range.name)?DAY:0)),to:range.to}]);
-    const width = widthFor(range),airportGroups=lane==='clash'?savedAirportGroups(db):[];
-    const defs = definitions(db, apps,airportGroups);
+    const width = widthFor(range);
+    const defs = definitions(db, apps);
     report('totals');
     const totals = db.prepare(`SELECT COUNT(*) samples,MIN(at) firstAt,MAX(at) lastAt,
       COALESCE(SUM(all_up),0) up,COALESCE(SUM(all_down),0) down,
@@ -264,11 +272,15 @@ export function readLane(dataRoot, lane, rangeName, now = Date.now(), options = 
       ended_at IS NULL ongoing FROM collection_gaps WHERE started_at<? AND COALESCE(ended_at,?)>?
       ORDER BY started_at DESC LIMIT 100`).all(range.from, range.to, range.to, range.to, range.to, range.from)
       .map((row) => ({ ...row, durationMs: Math.max(0, row.gapTo - row.gapFrom) }));
+    const anomalies = db.prepare(`SELECT kind, started_at AS startedAt, ended_at AS endedAt,
+      json_extract(detail,'$.bytes') AS bytes, json_extract(detail,'$.process') AS process
+      FROM anomalies WHERE ended_at>=? AND ended_at<? AND json_valid(detail)
+      ORDER BY ended_at DESC LIMIT 3`).all(range.from,range.to);
     let rolled, cacheWarning;
     report('programs');
     const quick = options.quick === true;
     if(lane==='clash')selectUsage(db,defs,range,{...options,lane});
-    if (!quick && lane === 'windows' && options.cacheRoot && !options.skipRollup) {
+    if (!quick && lane === 'windows' && options.cacheRoot ) {
       try { rolled = programRollup(db, options.cacheRoot, range, totals.firstAt, now, defs, (cache,filter)=>programs(cache,defs,filter,null)); }
       catch { cacheWarning = 'summary_cache_unavailable'; }
     }
@@ -301,7 +313,7 @@ export function readLane(dataRoot, lane, rangeName, now = Date.now(), options = 
       : charts.peaks;
     const domains = lane === 'clash' && !quick ? selectedGroups(db,'host','proxy') : [];
     const nodes = lane === 'clash' && !quick ? selectedGroups(db,'node','proxy',50) : [];
-    const airportUsage=lane==='clash'?airportRows(db):[],availableClientNodes=[];
+    const airportUsage=lane==='clash'?airportRows(db):[];
     const routeDomains = { proxy: domains }, routeNodes = { proxy: nodes };
     if (lane === 'clash' && !quick) for (const route of ['direct','unknown','all']) {
       routeDomains[route]=selectedGroups(db,'host',route==='all'?'':route);routeNodes[route]=selectedGroups(db,'node',route==='all'?'':route,50);
@@ -314,8 +326,8 @@ export function readLane(dataRoot, lane, rangeName, now = Date.now(), options = 
       available: true, lane, detailReady: !quick, range: { ...range, intervalMs: width }, firstAt, lastAt, totals,
       retentionDays: settings(db, 'retentionDays', 0), captureMode: settings(db, 'captureMode', lane === 'windows' ? 'native' : 'mihomo'),
       groups, familyTotals, allPrograms, routePrograms, programs: lane === 'windows' ? allPrograms : routePrograms.proxy,
-      domains, nodes, routeDomains, routeNodes,airportGroups,airportUsage,clientNodes:availableClientNodes,
-      timeline, routeTimeline, peaks, comparison, gaps: gapCount, gapDetails,
+      domains, nodes, routeDomains, routeNodes,airportUsage,
+      timeline, routeTimeline, peaks, comparison, gaps: gapCount, gapDetails, anomalies,
       coverage: { observedMs: totals.observedMs, expectedMs: range.to - range.from,
         percent: range.to > range.from ? Math.min(100, totals.observedMs / (range.to - range.from) * 100) : null },
       unassigned: { up: Math.max(0, totals.up - connected.up), down: Math.max(0, totals.down - connected.down) },
@@ -330,10 +342,10 @@ export function readDetail(dataRoot, lane, rangeName, now = Date.now(), options 
   const began = performance.now(), db = openLane(dataRoot, lane,options);
   if (!db) return { available: false, error: 'missing_database' };
   try {
-    const apps = harnessApps(db, options),airportGroups=lane==='clash'?savedAirportGroups(db):[];
+    const apps = harnessApps(db, options);
     const { range } = resolveRange(db, rangeName, now, options);
     setArchiveWindows(db,[{from:range.from,to:range.to}]);
-    report('selection');const defs = definitions(db, apps,airportGroups),width=widthFor(range),plan=selectUsage(db,defs,range,{...options,lane},true);
+    report('selection');const defs = definitions(db, apps),width=widthFor(range),plan=selectUsage(db,defs,range,{...options,lane},true);
     report('summary');
     const summary = db.prepare('SELECT COALESCE(SUM(up),0) up,COALESCE(SUM(down),0) down,COUNT(DISTINCT id) connections,MIN(firstAt) firstAt,MAX(lastAt) lastAt FROM selected_usage').get();
     const processes=selectedPrograms(db),destinations=selectedGroups(db,'host'),nodes=lane==='clash'?selectedGroups(db,'node','',50):[];
@@ -345,10 +357,10 @@ export function readDetail(dataRoot, lane, rangeName, now = Date.now(), options 
     // Keep long rule JSON out of the all-result TEMP tables. Resolve it only
     // after pagination, so 100 visible rows never copy every selected payload.
     report('connections');const connections = db.prepare(`WITH page AS MATERIALIZED (SELECT * FROM selected_usage ORDER BY amount DESC,id LIMIT ? OFFSET ?)
-      SELECT page.*,c.rule FROM page CROSS JOIN connections c ON c.id=page.id ORDER BY page.amount DESC,page.id`).all(pageSize,page*pageSize).map(row=>{
-      let metadata = {};try {metadata=JSON.parse(row.rule);} catch {}
-      const {rule,_lifetime_inside,airport_name:airportName,...connection} = row;
-      return {...connection,...(airportName?{airportName}:{}),destinationIP:metadata.destinationIP || '',destinationPort:metadata.destinationPort || 0,localIP:metadata.localIP || '',localPort:metadata.localPort || 0,observedPID:metadata.observedPID || null,client:metadata.client||'legacy',chain:metadata.chains || []};
+      SELECT page.*,CASE WHEN json_valid(c.rule) THEN c.rule END metadata FROM page CROSS JOIN connections c ON c.id=page.id ORDER BY page.amount DESC,page.id`).all(pageSize,page*pageSize).map(row=>{
+      const {metadata:raw,_lifetime_inside,airport_name:airportName,...connection} = row;
+      const metadata = raw ? JSON.parse(raw) ?? {} : {};
+      return {...connection,...(airportName?{airportName:normalizeAirportLabel(airportName)}:{}),destinationIP:metadata.destinationIP || '',destinationPort:metadata.destinationPort || 0,localIP:metadata.localIP || '',localPort:metadata.localPort || 0,observedPID:metadata.observedPID || null,chain:metadata.chains || []};
     });
     const timeline = db.prepare('SELECT CAST(at / ? AS INTEGER)*? at,COUNT(*) samples FROM samples WHERE at>=? AND at<? GROUP BY 1 ORDER BY 1').all(width,width,range.from,range.to);
     const gapDetails = db.prepare('SELECT reason,MAX(started_at,?) gapFrom,MIN(COALESCE(ended_at,?),?) gapTo,ended_at IS NULL ongoing FROM collection_gaps WHERE started_at<? AND COALESCE(ended_at,?)>? ORDER BY started_at DESC LIMIT 100').all(range.from,range.to,range.to,range.to,range.to,range.from);
@@ -361,7 +373,7 @@ export function readDetail(dataRoot, lane, rangeName, now = Date.now(), options 
 }
 
 // Harness needs a chart and a process list, not destinations, rule payloads or
-// connection pages. Keep the Windows join inside the small encrypted covering
+// connection pages. Keep the Windows join inside the covering
 // index, even when the lifetime dictionary contains multi-kilobyte rules.
 export function readHarness(dataRoot,lane,rangeName,now=Date.now(),options={}){
   if(!['codex','claude','dsh'].includes(options.family))throw new RangeError('Invalid family');
@@ -369,7 +381,7 @@ export function readHarness(dataRoot,lane,rangeName,now=Date.now(),options={}){
   if(!db)return {available:false,error:'missing_database'};
   const report=value=>options.report?.({lane,...value});
   try{
-    const apps=harnessApps(db,options),airportGroups=lane==='clash'?savedAirportGroups(db):[],{range}=resolveRange(db,rangeName,now,options),width=widthFor(range),defs=definitions(db,apps,airportGroups);
+    const apps=harnessApps(db,options),{range}=resolveRange(db,rangeName,now,options),width=widthFor(range),defs=definitions(db,apps);
     setArchiveWindows(db,[{from:range.from,to:range.to}]);report({stage:'program_buckets'});
     selectUsage(db,defs,range,{...options,lane,route:lane==='clash'?'proxy':'all'},false,true);
     // SQL counts identities rather than retaining a JS Set per connection and
@@ -393,7 +405,7 @@ export function readLadder(dataRoot,rangeName,now=Date.now(),options={}){
   if(!db)return {available:false,error:'missing_database'};
   const report=stage=>options.report?.({stage,lane});
   try{
-    const {range}=resolveRange(db,rangeName,now,options),groups=savedAirportGroups(db),defs=definitions(db,harnessApps(db,options),groups),width=widthFor(range);
+    const {range}=resolveRange(db,rangeName,now,options),defs=definitions(db,harnessApps(db,options)),width=widthFor(range);
     setArchiveWindows(db,[{from:range.from,to:range.to}]);report('selection');selectUsage(db,defs,range,{...options,lane});
     report('summary');const summary=db.prepare('SELECT COALESCE(SUM(up),0) up,COALESCE(SUM(down),0) down,COUNT(DISTINCT id) connections,MIN(firstAt) firstAt,MAX(lastAt) lastAt FROM selected_usage').get();
     const routeTotals=selectedRoutes(db),allPrograms=selectedPrograms(db,'',1000),routePrograms={},routeDomains={},routeNodes={};
@@ -406,47 +418,24 @@ export function readLadder(dataRoot,rangeName,now=Date.now(),options={}){
     const bounds=historyBounds(db);
     db.exec('COMMIT');
     return {available:true,lane,detailReady:true,range:{...range,intervalMs:width},firstAt:bounds.firstAt,lastAt:bounds.lastAt,summary,timeline,gapDetails,groups:routeTotals,allPrograms,routePrograms,programs:routePrograms.proxy,
-      routeTotals,routeTimeline:charts.routeTimeline,peaks:charts.peaks,domains,nodes,routeDomains,routeNodes,airportGroups:groups,airportUsage,
+      routeTotals,routeTimeline:charts.routeTimeline,peaks:charts.peaks,domains,nodes,routeDomains,routeNodes,airportUsage,
       unassigned:null,connectionCountersExceedGlobal:false,queryMs:Math.round(performance.now()-began)};
   }finally{db.close();}
 }
 
-export function readLadderNodes(dataRoot,rangeName,now=Date.now(),options={}){
-  const lane='clash',db=openLane(dataRoot,lane,options);
-  if(!db)return {available:false,error:'missing_database'};
-  try{
-    const {range}=resolveRange(db,rangeName,now,options),defs=definitions(db,harnessApps(db,options));
-    setArchiveWindows(db,[{from:range.from,to:range.to}]);options.report?.({stage:'nodes',lane});
-    const nodes=clientNodes(db,range,defs);db.exec('COMMIT');
-    return {available:true,lane,range,clientNodes:nodes};
-  }finally{db.close();}
-}
-
-export function readSavedApps(dataRoot) {
-  const db = openLane(dataRoot, 'windows');
+export function readSavedApps(dataRoot, options) {
+  const db = openLane(dataRoot, options?.singleCollector==='mihomo'?'clash':'windows', options);
   if (!db) return normalizeHarnessApps(null);
   try { return harnessApps(db); } finally { db.close(); }
 }
-export function readSavedAirportGroups(dataRoot,options={}){
-  const db=openLane(dataRoot,'clash',options);if(!db)return [];
-  try{return savedAirportGroups(db);}finally{db.close();}
-}
-
-if(workerData?.keyEntries)configureDatabaseKeys(workerData.keyEntries);
 if (parentPort) parentPort.on('message', ({ id, type = 'overview', range, date, now, options = {},client,airport }) => {
+  if(workerData.singleCollector)options={...options,singleCollector:workerData.singleCollector};
   if(client!==undefined||airport!==undefined)options={...options,...(client!==undefined?{client}:{}),...(airport!==undefined?{airport}:{})};
-  if(options.authorizedWindows)options={...options,cacheRoot:undefined};
-  const queryCache=options.authorizedWindows||options.skipRollup?undefined:workerData.cacheRoot;
+  const queryCache=workerData.cacheRoot;
   try {
-    if (type === 'apps') { parentPort.postMessage({ id, data: { apps: readSavedApps(workerData.dataRoot) } }); return; }
-    if (type === 'airport-groups') { parentPort.postMessage({ id, data: { groups: readSavedAirportGroups(workerData.dataRoot,options) } }); return; }
-    if(type==='legacy'){
-      const db=openLane(workerData.dataRoot,options.lane);
-      if(!db)throw new Error('database_unavailable');
-      try{parentPort.postMessage({id,data:readLegacy(db,options.route,options.params,options.live,now)});}finally{db.close();}return;
-    }
+    if (type === 'apps') { parentPort.postMessage({ id, data: { apps: readSavedApps(workerData.dataRoot,options) } }); return; }
     const data = {};
-    if (type === 'detail' || type === 'harness' || type === 'ladder' || type === 'ladder-nodes') data.detail = type==='ladder'?readLadder(workerData.dataRoot,range,now,{...options,report:progress=>parentPort.postMessage({id,event:'progress',...progress})}):type==='ladder-nodes'?readLadderNodes(workerData.dataRoot,range,now,{...options,report:progress=>parentPort.postMessage({id,event:'progress',...progress})}):(type==='harness'?readHarness:readDetail)(workerData.dataRoot, options.lane, range, now, { ...options, cacheRoot: options.lane === 'windows' ? queryCache : undefined,report:progress=>parentPort.postMessage({id,event:'progress',...progress}) });
+    if (type === 'detail' || type === 'harness' || type === 'ladder') data.detail = type==='ladder'?readLadder(workerData.dataRoot,range,now,{...options,report:progress=>parentPort.postMessage({id,event:'progress',...progress})}):(type==='harness'?readHarness:readDetail)(workerData.dataRoot, options.lane, range, now, { ...options, cacheRoot: options.lane === 'windows' ? queryCache : undefined,report:progress=>parentPort.postMessage({id,event:'progress',...progress}) });
     else for (const [role, lane] of [['machine', 'windows'], ['clash', 'clash']]) {
       try { data[role] = readLane(workerData.dataRoot, lane, range, now, { ...options, cacheRoot:queryCache, date,report:progress=>parentPort.postMessage({id,event:'progress',...progress}) }); }
       catch (error) { if (error instanceof RangeError) throw error; data[role] = { available: false, error: error.code || 'database_unavailable' }; }

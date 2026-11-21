@@ -8,16 +8,16 @@ Based on **[GloryPkqa/codex-netwatch v0.5.1](https://github.com/GloryPkqa/codex-
 
 ## Current features
 
-- Separate Windows application, Clash/Mihomo and Harness views with selected-period details, route evidence, searchable rankings and preserved legacy dashboards.
-- Optional password-encrypted histories and AI visitor cards scoped by source, dates, operation, expiry and permission to continue after screen lock. Closing/reopening the browser within the same profile preserves a validated owner session for up to 12 hours; screen lock, logout, explicit lock, expiry or viewer restart requires a fresh password. See [the vault guide](docs/VAULT.md).
-- Unlimited history with lossless monthly compression of old samples/minute buckets, transparent archive queries, bounded disposable caches, storage accounting and verified encrypted space reclamation. See [storage details](docs/STORAGE.md).
+- Windows application, Clash/Mihomo and Harness views with selected-period details, route evidence and searchable rankings. Airport totals combine automatically identified subscriptions across clients and drill down by client, node and connection.
+- Open the local dashboard directly. Traffic and diagnostics are written to SQLite WAL as they are collected. An encrypted installation can move its history as part of the [one-time in-place upgrade](docs/BUILD_WINDOWS.md#in-place-upgrade).
+- Unlimited history with lossless monthly compression of old samples/minute buckets, transparent archive queries, bounded disposable caches, storage accounting and incremental space reclamation. See [storage details](docs/STORAGE.md).
 - [AI connection diagnostics](docs/connection-diagnostics.md) combining allowlisted Magpie, CC Switch, Codex, Claude Code and dsh log metadata with TraceEvent/PktMon evidence, failure/slow-request incidents, period filters and automatic collection checks.
 - Explicitly configured physical IPv4 relay bypass with managed routes, hosts/Clash exclusions, verification and rollback. Ordinary collection does not enable this feature automatically.
 - Independent quick, full-attribution and interactive-detail query workers, cancellation, bounded caches and background pause/resume. Clicked intervals appear immediately while their records load.
 
 ## Build
 
-Requires Node.js 24+, Windows 10/11 x64 and .NET Framework 4.8. The tray also needs the installed Edge WebView2 Runtime. Run `npm ci --ignore-scripts` for the pinned encrypted SQLite dependency. Optional password encryption and scoped AI visitor cards require local owner setup; installation alone does not encrypt records. See [the vault guide](docs/VAULT.md).
+Requires Windows 10/11 x64, .NET Framework 4.8 and a web browser. Source development uses Node.js 24+ and `npm ci --ignore-scripts`.
 
 ```powershell
 git clone https://github.com/xxuxiaoo/trafficwatch.git
@@ -28,9 +28,9 @@ npm test
 npm run build:windows
 ```
 
-Run `.build/windows/TrafficWatch/scripts/install-windows.ps1` from an administrator PowerShell for a fresh installation. It installs to `%ProgramFiles%\TrafficWatch`, stores records in `%ProgramData%\TrafficWatch` by default, creates a SYSTEM boot task for the two collectors and a separate login task for the user tray. It refuses to overwrite an existing installation. Use `-DataRoot` or `-ClashConfigPath` for local configuration; those files are never tracked.
+Run `.build/windows/TrafficWatch/scripts/install-windows.ps1` from an administrator PowerShell for a fresh installation. It installs to `%ProgramFiles%\TrafficWatch`, stores records in `%ProgramData%\TrafficWatch` by default, creates a SYSTEM boot task for the two collectors and a separate login task for the user tray. Use `scripts/upgrade-windows.ps1` from the new package to upgrade an existing installation. Use `-DataRoot` or `-ClashConfigPath` for local configuration; those files are never tracked.
 
-The desktop shortcut opens a controller for starting/stopping the suite, reopening the tray and changing startup preferences. The overview is at http://127.0.0.1:43131/ . Legacy views remain available at ports 43128 and 43130 with `?legacy=1`.
+The desktop shortcut and tray both open http://127.0.0.1:43131/ . Start or pause collection, reopen the tray or change startup preferences from the same page. Collector root URLs redirect to the overview.
 
 ## Measurement boundaries
 

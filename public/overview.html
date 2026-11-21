@@ -12,7 +12,7 @@
   <body class="overview-page">
     <div class="app-shell">
       <aside class="sidebar">
-        <a class="brand" href="#overview" aria-label="流量总览">
+        <a class="brand" href="#overview" data-view-button="overview" aria-label="流量总览">
           <img src="/icon.svg" width="32" height="32" alt="" />
           <span>TrafficWatch<small>本机流量观察</small></span>
         </a>
@@ -27,9 +27,8 @@
         </nav>
         <div class="sidebar-bottom">
           <a class="settings-link" href="/storage"><span aria-hidden="true">▤</span> 存储管理</a>
-          <a class="settings-link" href="/security"><span aria-hidden="true">♧</span> 隐私与 AI 访客卡</a>
           <div class="collector-mark"><i id="sidebarCollectorDot"></i><span id="sidebarCollectorText">正在检查采集状态</span></div>
-          <button type="button" class="settings-link" data-view-button="settings"><span>⚙</span> 设置与旧版备份</button>
+          <button type="button" class="settings-link" data-view-button="settings"><span>⚙</span> 设置</button>
           <small>数据保存在本机</small>
         </div>
       </aside>
@@ -59,28 +58,54 @@
         </header>
 
         <main id="mainContent">
-          <div class="history-status-bar"><span id="historyStatus" role="status">正在读取本机历史…</span><span>实时采集状态显示在右上角</span></div>
+          <div class="history-status-bar"><span id="historyStatus" role="status">正在读取本机历史…</span></div>
           <div id="historyProgressPanel" class="history-query-progress" hidden><progress id="historyProgressBar" aria-label="当前统计阶段进度" aria-describedby="historyStatus"></progress></div>
-          <p id="backgroundImportNotice" class="measurement-note" role="status" hidden></p>
+
           <p id="globalNotice" class="warning-list has-warning" role="status" hidden></p>
           <section class="page-view" data-view="overview">
-            <div class="view-heading">
-              <div><p class="eyebrow">快速掌握用量与变化</p><h2>流量总览</h2><p id="rangeSummary" class="muted">正在读取本机记录…</p></div>
-              <button type="button" class="text-button" data-view-button="investigate">查看高峰与采集缺口 <span aria-hidden="true">›</span></button>
-            </div>
+            <p id="portableNotice" class="measurement-note" role="status" hidden></p>
+            <section id="collectorControls" class="collection-controls" aria-labelledby="collectorControlsTitle" hidden>
+              <div class="collection-control-heading">
+                <div><h2 id="collectorControlsTitle">采集</h2><p id="collectorControlStatus" class="muted">正在读取状态…</p></div>
+                <div class="collection-core-actions">
+                  <button id="controlStart" type="button" class="command-button">启动采集</button>
+                  <button id="controlStop" type="button" class="quiet-button">暂停采集</button>
+                  <button id="controlRestartTray" type="button" class="quiet-button" data-control-action="ReopenTray">重新打开托盘</button>
+                </div>
+              </div>
+              <p id="collectorControlMessage" class="control-message" role="status" hidden></p>
+              <details id="advancedControls" class="advanced-controls">
+                <summary>更多控制</summary>
+                <p id="collectorControlAdvancedStatus" class="muted" role="status"></p>
+                <div class="advanced-control-actions">
+                  <button data-control-action="EnableStartup" type="button" class="quiet-button">开启开机自启</button>
+                  <button data-control-action="DisableStartup" type="button" class="quiet-button">关闭开机自启</button>
+                  <button data-control-action="StartDiagnostics" type="button" class="quiet-button">启动持续诊断</button>
+                  <button data-control-action="StopDiagnostics" type="button" class="quiet-button">停止持续诊断</button>
+                  <button data-control-action="EnableBypass" type="button" class="quiet-button">启用物理绕行</button>
+                  <button data-control-action="RollbackBypass" type="button" class="quiet-button">恢复 Clash 路由</button>
+                  <button data-control-action="Stop" type="button" class="quiet-button">完全停止 TrafficWatch</button>
+                </div>
+              </details>
+            </section>
+            <p id="rangeSummary" class="range-caption muted">正在读取本机记录…</p>
             <div class="metric-strip" aria-label="选定时段流量">
-              <section class="metric-cell machine-metric"><span>本机已观测</span><strong id="overviewMachine">—</strong><small id="overviewMachineDirections">↑ —　↓ —</small></section>
+              <section class="metric-cell machine-metric"><span id="overviewMachineLabel">本机已观测</span><strong id="overviewMachine">—</strong><small id="overviewMachineDirections">↑ —　↓ —</small></section>
               <section class="metric-cell proxy-metric"><span>梯子代理出口</span><strong id="overviewProxy">—</strong><small id="overviewProxyDirections">↑ —　↓ —</small></section>
               <section class="metric-cell harness-metric"><span>Harness 应用</span><strong id="overviewHarness">—</strong><small id="overviewHarnessBreakdown">Codex / Claude Code / dsh</small></section>
               <section class="metric-cell unknown-metric"><span>待识别或未归因</span><strong id="overviewUnknown">—</strong><small id="overviewUnknownNote">不会算进 Harness</small></section>
             </div>
             <p id="measurementNote" class="measurement-note"></p>
+            <div id="overviewWarnings" class="warning-list" role="status"></div>
             <section id="budgetStrip" class="budget-strip" hidden></section>
+            <div class="overview-primary">
             <section class="chart-section" aria-labelledby="overviewChartTitle">
-              <div class="section-heading"><div><h3 id="overviewChartTitle">各时段流量</h3><p>橙色上传、蓝色下载，柱高为合计；点击柱子定位应用与连接</p></div></div>
+              <div class="section-heading"><div><h3 id="overviewChartTitle">用量趋势</h3></div></div>
               <div class="chart-wrap"><canvas id="overviewChart" aria-label="本机与代理流量柱状图；左右方向键选择时段，回车查看明细"></canvas></div>
               <div id="chartTicks" class="chart-ticks"></div>
             </section>
+            <section class="data-section overview-airports" aria-labelledby="overviewAirportsTitle"><div class="section-heading"><div><h3 id="overviewAirportsTitle">机场用量</h3></div><button type="button" class="quiet-button" data-view-button="ladder">全部机场</button></div><div id="overviewAirportRows" class="airport-usage-list"><p class="empty-state">正在读取…</p></div></section>
+            </div>
             <div class="overview-columns">
               <section class="data-section" aria-labelledby="peakTitle">
                 <div class="section-heading"><div><h3 id="peakTitle">用量最高的时段</h3><p>按 5 分钟窗口排序，选中后直接定位连接</p></div><button type="button" class="quiet-button" data-view-button="investigate">全部高峰</button></div>
@@ -92,7 +117,6 @@
               </section>
             </div>
             <section id="integritySummary" class="integrity-band" aria-label="采集完整性"></section>
-            <div id="overviewWarnings" class="warning-list" role="status"></div>
           </section>
 
           <section class="page-view" data-view="apps" hidden>
@@ -128,16 +152,15 @@
           <section class="page-view" data-view="ladder" hidden>
             <div class="view-heading">
               <div><p class="eyebrow">Clash / Mihomo 出口归因</p><h2>梯子流量</h2><p>只看有代理节点证据的连接；与本机应用统计分开，不要相加当账单。</p></div>
-              <button id="exportLadder" type="button" class="command-button">↓ 导出 CSV</button>
+              <button id="exportLadder" type="button" class="command-button" title="导出当前筛选的应用汇总">↓ 导出应用</button>
             </div>
             <div id="routeSummary" class="route-summary"></div>
             <div class="filter-bar proxy-filters"><label>代理客户端 <select id="proxyClientFilter" class="control-select"><option value="all">全部客户端</option><option value="verge">Clash Verge</option><option value="flclash">FlClash</option><option value="mihomo">Mihomo / 其他</option><option value="legacy">旧记录（客户端未标记）</option></select></label><label>机场 <select id="proxyAirportFilter" class="control-select"><option value="all">全部机场</option><option value="__unassigned__">未归类机场</option></select></label><span>统计范围使用右上角时间选择</span></div>
-            <section class="data-section airport-usage-section"><div class="section-heading"><div><h3>机场用量</h3><p>按客户端和订阅统计，点击一行查看图表和连接</p></div></div><div id="airportUsageRows" class="airport-usage-list"><p class="empty-state">正在读取…</p></div><p class="fine-print">新记录按订阅节点自动归类。旧记录和无法确认归属的节点可手动归类。短连接的用量可能低估。</p></section>
-            <details class="airport-manager"><summary>管理机场归类</summary><div class="airport-manager-body"><div class="airport-manager-form"><label>机场名称<input id="airportGroupName" class="control-select" maxlength="64" placeholder="例如：TAG 机场" autocomplete="off" /></label><label>筛选节点<input id="airportNodeSearch" class="control-select" maxlength="128" placeholder="搜索出口节点" autocomplete="off" /></label><button id="saveAirportGroup" class="command-button" type="button">保存已选节点</button><button id="clearAirportGroup" class="quiet-button" type="button">清空选择</button></div><p id="airportNodeCount" class="muted" role="status"></p><div id="airportNodeChoices" class="airport-node-choices"></div><div id="airportGroupRows" class="airport-group-rows"></div><p id="airportGroupStatus" class="muted" role="status"></p></div></details>
+            <section class="data-section airport-usage-section"><div class="section-heading"><div><h3 id="activeAirportTitle">机场用量</h3><p id="activeAirportMeta" class="muted"></p></div><div class="detail-actions"><button id="showAirportConnections" type="button" class="command-button" hidden>查看连接</button><button id="clearProxyFilters" type="button" class="quiet-button" hidden>清除筛选</button></div></div><div id="airportUsageRows" class="airport-usage-list"><p class="empty-state">正在读取…</p></div></section>
               <section class="chart-section"><div class="section-heading"><div><h3>各时段出口流量</h3><p>橙色上传、蓝色下载，柱高为合计；悬停看数值，点击查看连接</p></div><label>连接类型 <select id="routeFilter" class="control-select"><option value="proxy" selected>代理出口</option><option value="all">全部</option><option value="direct">DIRECT</option><option value="unknown">未知</option></select></label></div><div class="chart-wrap"><canvas id="ladderChart" aria-label="Clash 出口流量柱状图；左右方向键选择时段，回车查看明细"></canvas></div><div id="ladderTicks" class="chart-ticks"></div></section>
             <div class="overview-columns">
               <section class="data-section"><div class="section-heading"><div><h3>经由节点的应用</h3><p>按代理出口连接归因</p></div></div><div id="ladderProcessRows" class="compact-list"></div></section>
-              <section class="data-section"><div class="section-heading"><div><h3>代理目标</h3><p>节点流量可展开到域名或目标 IP</p></div></div><div id="ladderDomainRows" class="compact-list"></div><h4 class="subsection-title">出口节点</h4><div id="ladderNodeRows" class="compact-list"></div></section>
+              <section class="data-section"><div class="section-heading"><div><h3>出口节点</h3></div></div><div id="ladderNodeRows" class="compact-list"></div><h4 class="subsection-title">访问目标</h4><div id="ladderDomainRows" class="compact-list"></div></section>
             </div>
             <section id="ladderDetail" class="detail-region" hidden><div class="section-heading detail-heading"><div><h3 id="ladderDetailTitle">连接明细</h3><p id="ladderDetailMeta" class="muted" role="status"></p></div><div class="detail-actions"><button id="ladderDetailRetry" class="quiet-button" type="button" hidden>重新加载</button><button id="exportLadderDetail" type="button" class="quiet-button">导出全部明细 CSV</button></div></div><div class="chart-wrap short-chart"><canvas id="ladderDetailChart" aria-label="代理连接流量分钟变化"></canvas></div><div class="table-scroll"><table><thead><tr><th>客户端</th><th>机场</th><th>最后活动</th><th>应用</th><th>目标</th><th>出口节点</th><th>上传</th><th>下载</th><th>合计</th></tr></thead><tbody id="ladderConnectionRows"></tbody></table></div><div id="ladderPager" class="connection-pager"></div></section>
             <p id="ladderAccountingNote" class="measurement-note"></p>
@@ -163,10 +186,10 @@
           </section>
 
           <section class="page-view" data-view="settings" hidden>
-            <div class="view-heading"><div><p class="eyebrow">本机偏好与恢复入口</p><h2>设置与旧版备份</h2><p>采集服务状态和历史保存由桌面控制台管理。</p></div></div>
+            <div class="view-heading"><div><p class="eyebrow">本机偏好</p><h2>设置</h2><p>流量中心、诊断和数据保留。</p></div></div>
+
             <div class="settings-columns">
               <section class="data-section"><div class="section-heading"><div><h3>Harness 进程识别</h3><p>按实际进程名精确匹配；已记录的直接进程会同步回填分组。</p></div></div><div class="alias-add"><label>已发现或手动输入<input id="aliasProcess" class="control-select" list="detectedProcesses" maxlength="128" placeholder="例如 dsh.exe" autocomplete="off" /><datalist id="detectedProcesses"></datalist></label><label>加入分组 <select id="aliasFamily" class="control-select"><option value="claude">Claude Code</option><option value="dsh">dsh</option></select></label><button id="addAlias" class="command-button" type="button">添加进程名</button></div><div id="aliasGroups" class="alias-groups"></div><p id="aliasStatus" class="muted" role="status"></p></section>
-              <section class="data-section"><div class="section-heading"><div><h3>旧版详细页面备份</h3><p>原有两个界面保留，可按原样打开；部署时会另存一份静态文件备份。</p></div></div><div class="legacy-links"><a href="http://127.0.0.1:43128/?legacy=1" target="_blank" rel="noopener">旧版全机流量详情 <span>↗</span></a><a href="http://127.0.0.1:43130/?legacy=1" target="_blank" rel="noopener">旧版 Clash 流量详情 <span>↗</span></a></div><p class="fine-print">常规入口统一跳转到本页。备份文件位于 TrafficWatch 安装目录的 backups 文件夹。</p></section>
             </div>
             <section class="data-section settings-limits"><div class="section-heading"><div><h3>用量参考线</h3><p>只比较本机记录的参考用量，不代表运营商或机场账单。</p></div></div><div class="limit-controls"><label>本月本机参考上限（GB）<input id="monthlyMachineLimit" type="number" min="0" step="0.1" inputmode="decimal" /></label><label>本月梯子参考上限（GB）<input id="monthlyProxyLimit" type="number" min="0" step="0.1" inputmode="decimal" /></label><button id="saveLimits" type="button" class="command-button">保存参考线</button><label class="notification-setting"><input id="notificationsEnabled" type="checkbox" /> 页面打开时达到参考线，发送本机提醒</label></div><p id="limitsStatus" class="muted" role="status"></p></section>
             <details class="coverage-details"><summary>采集口径</summary><p>本机应用来自 Windows ETW 进程网络事件；Harness 在有进程树证据时会归入对应父进程。梯子流量来自 Mihomo / Clash 连接快照，并拆分代理、DIRECT 和未知出口。代理会造成应用本地连接与代理进程出站重复出现在本机视图，所以这些合计不相加，也不等于网卡或账单。</p><p>所有时间按北京时间显示。数据只包含采集期间实际保存的记录；覆盖率、采集缺口、未知进程和未归因差额会在页面内注明。</p></details>

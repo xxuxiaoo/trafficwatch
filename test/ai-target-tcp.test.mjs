@@ -3,14 +3,12 @@ import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
-import crypto from 'node:crypto';
 import {buildProviderTargets,mappedProviderHost} from '../src/ai-provider-targets.mjs';
 import {normalizeMagpieRequest,EvidenceRing,IncidentEngine,diagnosticTriggers} from '../src/ai-diagnostic-events.mjs';
 import {requestCoverage} from '../src/ai-diagnostic-quality.mjs';
 import {normalizeTcpEvent,correctTcpCategory} from '../src/ai-tcp-events.mjs';
 import {summarizeTcpRetries,tcpOperationCategory} from '../public/tcp-evidence.mjs';
-import {DiagnosticHistory,DiagnosticSpool} from '../src/ai-diagnostic-store.mjs';
-import {createVaultKeys} from '../src/vault-crypto.mjs';
+import {DiagnosticHistory} from '../src/ai-diagnostic-store.mjs';
 
 const hosts=['relay-a.example.test','relay-b.example.test'];
 const config={providers:[
@@ -76,19 +74,19 @@ test('retry summary counts aggregated events by actual socket, preserves time an
   const summary=summarizeTcpRetries(events);assert.equal(summary.retries,6);assert.equal(summary.connections,2);assert.equal(summary.flows[0].count,5);assert.equal(summary.flows[0].firstAt,now-8000);assert.equal(summary.flows[0].lastAt,now-2000);
   const legacy=correctTcpCategory({id:'legacy',kind:'tcp',...tcp(),category:'socket',fault:false});assert.equal(legacy.category,'tcp_connect_retry');assert.equal(legacy.operation,'Reconnect');assert.deepEqual(diagnosticTriggers(legacy),[],'relabeling old evidence must not invent a past trigger');
 });
-test('encrypted import keeps new retry filters and old incident metadata correct within exact visitor dates',async()=>{
-  const dir=fs.mkdtempSync(path.join(os.tmpdir(),'tw-target-tcp-'));let history,spool;
+test('direct writes preserve retry filters and old incident metadata for exact dates',async()=>{
+  const dir=fs.mkdtempSync(path.join(os.tmpdir(),'tw-target-tcp-'));let history;
   try{
-    const {metadata,secrets}=await createVaultKeys('synthetic-target-password');const signing=crypto.generateKeyPairSync('ed25519');metadata.capturePublicKey=signing.publicKey.export({format:'pem',type:'spki'});
-    history=new DiagnosticHistory(dir,metadata,secrets);spool=new DiagnosticSpool(dir,metadata,{signingKey:signing.privateKey});
+
+    history=new DiagnosticHistory(dir);
     const live=normalizeTcpEvent(tcp(),{targets:targetState,id:'live'}),old={id:'old',kind:'tcp',...tcp({at:now-2000}),category:'socket',fault:false};
     const excluded=normalizeTcpEvent(tcp({at:now+86400000,destination:'203.0.113.2'}),{targets:targetState,id:'excluded'});
-    spool.append([{id:'incident',kind:'incident',schemaVersion:2,at:now,from:now-600000,to:now+86460000,state:'complete',evidence:[old,live,excluded]}]);assert.equal(history.drain(),1);
+    history.append([{id:'incident',kind:'incident',schemaVersion:2,at:now,from:now-600000,to:now+86460000,state:'complete',evidence:[old,live,excluded]}]);
     const options={windows:[{from:now-60000,to:now+60000}],from:now-60000,to:now+60000};
     const found=history.query({...options,kind:'incident',category:'tcp_connect_retry',gateway:'magpie'});assert.equal(found.rows.length,1);assert.equal(found.requestSummary.length,0,'system retries never inflate HTTP request counts');
     const detail=history.query({...options,eventId:'incident'}).rows[0];assert.equal(detail.evidence.length,2);assert(detail.evidence.every(row=>row.category==='tcp_connect_retry'));
     assert.equal(summarizeTcpRetries(detail.evidence).retries,2);assert.doesNotMatch(JSON.stringify(detail),/203\.0\.113\.2|relay-b/);
   }finally{
-    spool?.close();history?.close();assert.equal(path.dirname(path.resolve(dir)),path.resolve(os.tmpdir()));assert(path.basename(dir).startsWith('tw-target-tcp-'));fs.rmSync(dir,{recursive:true,force:true,maxRetries:5,retryDelay:100});
+    history?.close();assert.equal(path.dirname(path.resolve(dir)),path.resolve(os.tmpdir()));assert(path.basename(dir).startsWith('tw-target-tcp-'));fs.rmSync(dir,{recursive:true,force:true,maxRetries:5,retryDelay:100});
   }
 });

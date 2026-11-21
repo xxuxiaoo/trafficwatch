@@ -1,4 +1,3 @@
-import {initializeVault,vaultHeaders,checkVaultResponse,importProgressText} from './vault-browser.mjs';
 import {tcpOperationCategory,summarizeTcpRetries} from './tcp-evidence.mjs';
 import {diagnosticHealth} from './diagnostic-health.mjs';
 const $=id=>document.getElementById(id),node=(tag,text='',className='')=>{const element=document.createElement(tag);element.textContent=text;if(className)element.className=className;return element;};
@@ -10,8 +9,8 @@ Object.assign(labels,{slow_connect:'建连较慢',slow_tls:'TLS 较慢',slow_sen
 Object.assign(labels,{log:'客户端 / 网关日志',retry_scheduled:'已安排重试',retry_started:'开始重试',collection_health:'采集自检',checked:'检查通过',attention:'部分来源需留意',cc_switch:'CC Switch',adapter_log_read_failed:'客户端日志读取失败',source_database_reset:'日志数据库已重建'});
 Object.assign(labels,{unknown_error:'未分类错误',tcp_fail:'TCP 连接失败',collector_load:'采集器负载',pktmon_attachment:'PktMon 现场附件',magpie_feed_summary:'Magpie 请求摘要',clash_path:'Clash 路径检查',relay_connections_still_in_clash:'中转仍经过 Clash',bypass_validation_failed:'物理路径验证失败'});
 labels.tcp_connect_retry='TCP 建连重试';
-const sourceNames={magpie:'Magpie','cc-switch':'CC Switch',codex:'Codex',claude:'Claude Code',dsh:'DSH',traceevent:'Microsoft TraceEvent',pktmon:'Windows PktMon',encrypted_queue:'加密写入队列'};
-const sourceStates={caught_up:'已跟上日志',quiet:'本期无新文件',missing:'未找到可用日志',read_error:'读取失败',unsupported_schema:'日志结构有变化',limited:'部分文件超出读取上限',busy:'数据库正忙，自动重试',backlog:'正在补读',starting:'正在检查',heartbeat_stale:'系统取证心跳中断',recording:'正常记录',write_pending:'等待加密写入'};
+const sourceNames={magpie:'Magpie','cc-switch':'CC Switch',codex:'Codex',claude:'Claude Code',dsh:'DSH',traceevent:'Microsoft TraceEvent',pktmon:'Windows PktMon',sqlite_write:'本机数据库写入',encrypted_queue:'旧版写入队列'};
+const sourceStates={caught_up:'已跟上日志',quiet:'本期无新文件',missing:'未找到可用日志',read_error:'读取失败',unsupported_schema:'日志结构有变化',limited:'部分文件超出读取上限',busy:'数据库正忙，自动重试',backlog:'正在补读',starting:'正在检查',heartbeat_stale:'系统取证心跳中断',recording:'正常记录',write_pending:'等待写入'};
 const sourceHints={missing:'使用该客户端时仍显示此状态，可检查其日志是否启用、存储位置是否更改。',read_error:'后台会重试；持续失败时检查文件访问权限与来源程序状态。',unsupported_schema:'来源格式与当前适配不符，需要更新适配器。',limited:'已优先读取最近文件；其他文件未全部覆盖。',busy:'只读访问暂时受阻，下一轮继续。',backlog:'已有日志正在增量补齐，完成后更新状态。',quiet:'发现旧文件；当前时段尚未写入新文件。',heartbeat_stale:'系统事件未按时到达，相关请求的 TCP 证据需要检查。'};
 const recordTime=row=>row.timeSource==='unknown'?'发生时间未知 · 读取于 '+date.format(row.observedAt||row.at):date.format(row.at);
 const controlIds=['range','from','to','kind','category','provider','harness','gateway'];
@@ -20,14 +19,13 @@ const slowCategories=['slow_connect','slow_tls','slow_send','slow_response','slo
 const categoryGroups={incident:[...networkCategories,...slowCategories,'tcp_connect_retry','tcp_fail','manual','evidence_uncertain'],request:[...networkCategories,...slowCategories,'success','upstream_busy','rate_limit','cancelled','http_rejected','pending'],log:[...networkCategories,'retry_scheduled','retry_started','upstream_busy','rate_limit','cancelled','http_rejected'],probe:[...networkCategories,'reachable','probe_error'],status:['collection_health','pktmon_attachment','magpie_feed_summary','clash_path','relay_connections_still_in_clash'],gap:['diagnostics_started','trace_dropped_events','trace_stopped','adapter_log_read_failed','source_database_reset','bypass_validation_failed'],resource:['collector_load'],route:[]};
 const harnessName=value=>({codex:'Codex',claude:'Claude Code',dsh:'DSH',unknown:'未识别客户端'}[value]||value);
 const gatewayName=value=>({magpie:'Magpie','cc-switch':'CC Switch',direct:'直连',unknown:'未识别网关'}[value]||value);
-let packet=null,busy=false,controller,refreshTimer,indexTimer,detailController,cursors=[null],page=0,renderedPage=0,selection=null,filters=new URLSearchParams(),vaultState,generation=0,detailGeneration=0;
-window.addEventListener('trafficwatch-vault-locked',()=>{generation++;detailGeneration++;clearInterval(refreshTimer);clearTimeout(indexTimer);controller?.abort();detailController?.abort();});
+let packet=null,busy=false,controller,refreshTimer,indexTimer,detailController,cursors=[null],page=0,renderedPage=0,selection=null,filters=new URLSearchParams(),generation=0,detailGeneration=0;
 const readControls=()=>Object.fromEntries(controlIds.map(id=>[id,$(id).value]));
 let applied=readControls();
 function message(text){$('message').textContent=text;$('message').hidden=!text;}
 async function api(route,{body,signal}={}){
-  const response=await fetch(route,{method:body===undefined?'GET':'POST',headers:{'x-codex-flow':'1',...vaultHeaders(),...(body===undefined?{}:{'content-type':'application/json'})},...(body===undefined?{}:{body:JSON.stringify(body)}),cache:'no-store',signal:signal||AbortSignal.timeout(15000)});await checkVaultResponse(response);
-  const value=await response.json();if(!response.ok)throw new Error(value.error==='vault_migrating'?'加密记录正在打开，完成后会自动加载，不需要重复解锁。':value.error==='diagnostics_unavailable'?'诊断后台未响应，请从桌面控制台检查状态。':'操作未完成：'+value.error);return value;
+  const response=await fetch(route,{method:body===undefined?'GET':'POST',headers:{'x-codex-flow':'1',...(body===undefined?{}:{'content-type':'application/json'})},...(body===undefined?{}:{body:JSON.stringify(body)}),cache:'no-store',signal:signal||AbortSignal.timeout(15000)});
+  const value=await response.json();if(!response.ok)throw new Error(value.error==='diagnostics_unavailable'?'诊断后台未响应，请从流量中心检查状态。':'操作未完成：'+value.error);return value;
 }
 function filterParams(values=applied){
   const now=Date.now(),range=values.range;let from,to=now+1;
@@ -221,9 +219,6 @@ $('export').addEventListener('click',async()=>{
   if(!packet||busy)return;try{const params=new URLSearchParams(filters);if(cursors[page])params.set('cursor',JSON.stringify(cursors[page]));params.set('export','1');const report=await api('/api/diagnostics?'+params),blob=new Blob([JSON.stringify({format:'trafficwatch-ai-diagnostics',generatedAt:Date.now(),scope:'当前筛选与当前页',...report},null,2)],{type:'application/json'}),url=URL.createObjectURL(blob),anchor=node('a');anchor.href=url;anchor.download='trafficwatch-ai-diagnostics.json';anchor.click();setTimeout(()=>URL.revokeObjectURL(url),1000);}catch(error){message(error.message);}
 });
 updateCategories();
-try{const status=await initializeVault({overview:true,onStatus:value=>{
-  const previous=vaultState;vaultState=value;const state=value.backgroundImport?.state;
-  const text=importProgressText(value.backgroundImport);$('importNotice').hidden=!text;if($('importNotice').textContent!==text)$('importNotice').textContent=text;
-  if(previous&&(!previous.ready&&value.ready||previous.backgroundImport?.state==='running'&&state==='complete'))refresh();
-}});if(!status.configured)location.replace('/security');else{await refresh({apply:true});refreshTimer=setInterval(()=>{if(!document.hidden&&page===0)refresh();},30000);}}catch{message('无法连接本机服务，请从桌面流量控制台检查运行状态。');}
+await refresh({apply:true});
+refreshTimer=setInterval(()=>{if(!document.hidden&&page===0)refresh();},30000);
 document.addEventListener('visibilitychange',()=>{if(document.hidden){controller?.abort();clearTimeout(indexTimer);}else refresh({force:true});});window.addEventListener('pagehide',()=>{clearInterval(refreshTimer);clearTimeout(indexTimer);controller?.abort();detailController?.abort();});

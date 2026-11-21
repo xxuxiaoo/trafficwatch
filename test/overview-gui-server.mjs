@@ -9,6 +9,6 @@ startOverviewServer({
   historyRoot:dataRoot,
   listenPort:Number(portValue),
   sourcePorts:[Number(machinePortValue),Number(clashPortValue)],
-  suiteSettings:{},
+  suiteSettings:process.env.TRAFFICWATCH_SINGLE_COLLECTOR === '1' ? {} : {DataRoot:dataRoot},
   guardFactory:callback=>({start(){callback({state:'unlocked'});},close(){}}),
 });

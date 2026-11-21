@@ -3,7 +3,9 @@ import assert from 'node:assert/strict';
 import { EventEmitter } from 'node:events';
 import path from 'node:path';
 import fs from 'node:fs';
-import { readLane, readDetail,readHarness,readLadder,readLadderNodes } from '../src/overview-data.mjs';
+import { readLane, readDetail,readHarness,readLadder } from '../src/overview-data.mjs';
+import { airportGroupKey } from '../src/proxy-airports.mjs';
+import { Store, RETIRED_AIRPORT_SETTING } from '../src/store.mjs';
 import { HistoryReader } from '../src/history-reader.mjs';
 import { initializeArchives,attachArchiveViews,setArchiveWindows } from '../src/history-archive.mjs';
 import { fixture, BASE, MINUTE, record, connection,rule } from './history-synthetic-fixtures.mjs';
@@ -69,45 +71,53 @@ test('quick overview includes real totals and marks pending attribution instead 
   assert.equal(quick.detailReady,false);assert.equal(quick.totals.up,12);assert.equal(quick.totals.down,34);assert.equal(quick.timeline.length,1);
 });
 
-test('proxy history separates clients and explicitly grouped airports without reclassifying legacy rows',t=>{
+test('automatic airport totals reconcile exactly with clients, shared nodes, connections and direct traffic',t=>{
   const f=fixture(t),store=f.open('clash');initializeArchives(store);
-  store.set('airportGroups',[{id:'tag',name:'TAG机场',members:[{client:'verge',node:'TAG-HK-1'},{client:'flclash',node:'TAG-HK-1'}]}]);
+  const tag=airportGroupKey('TAG'),verge={id:'auto-'+'a'.repeat(24),name:'TAG (verge)'},fl={id:'auto-'+'b'.repeat(24),name:'ＴＡＧ (flclssh)'};
   record(store,BASE+MINUTE,[
-    connection('verge-tag',10,20,{rule:rule(['TAG-HK-1'],{client:'verge'})}),
-    connection('fl-tag',30,40,{rule:rule(['TAG-HK-1'],{client:'flclash'})}),
-    connection('verge-other',50,60,{rule:rule(['Other-HK'],{client:'verge'})}),
-    connection('legacy-node',70,80,{rule:rule(['Old-HK'])}),
+    connection('verge-tag',10,20,{rule:rule(['Shared HK'],{client:'verge',airport:verge})}),
+    connection('fl-tag',30,40,{rule:rule(['Shared HK'],{client:'flclssh',airport:fl})}),
+    connection('fl-tag-jp',8,9,{rule:rule(['JP'],{client:'flclash',airport:fl})}),
+    connection('verge-other',50,60,{rule:rule(['Other HK'],{client:'verge',airport:{...verge,name:'Different airport'}})}),
+    connection('legacy-node',70,80,{rule:rule(['Shared HK'],{airport:{id:'manual',name:'TAG'}})}),
+    connection('direct',100,200,{rule:rule(['DIRECT'],{client:'verge',airport:verge})}),
   ]);
   const now=BASE+3*HOUR,all=readLane(f.root,'clash','all',now);
-  assert.deepEqual(all.airportUsage.map(row=>JSON.stringify([row.client,row.airport,row.up,row.down])).sort(),[
-    ['legacy','',70,80],['flclash','tag',30,40],['verge','',50,60],['verge','tag',10,20],
-  ].map(row=>JSON.stringify(row)).sort());
-  const inventory=readLadderNodes(f.root,'all',now);
-  assert.equal(Object.hasOwn(readLadder(f.root,'all',now),'clientNodes'),false,'normal ladder queries leave the node inventory scan for the manager');
-  assert.deepEqual(inventory.clientNodes.map(row=>[row.client,row.name]).sort((a,b)=>a[0].localeCompare(b[0])||a[1].localeCompare(b[1])),[
-    ['flclash','TAG-HK-1'],['verge','Other-HK'],['verge','TAG-HK-1'],
-  ].sort((a,b)=>a[0].localeCompare(b[0])||a[1].localeCompare(b[1])));
-  const tagged=readLane(f.root,'clash','all',now,{client:'verge',airport:'tag'});
-  assert.deepEqual({up:tagged.groups.proxy.up,down:tagged.groups.proxy.down},{up:10,down:20});
-  const ladder=readLadder(f.root,'all',now,{client:'flclash',airport:'tag'});
-  assert.equal(ladder.detailReady,true,'a completed filtered ladder query must not leave the airport list in its loading state');
-  assert.equal(ladder.groups.proxy.up,30);assert.equal(ladder.airportUsage[0].client,'flclash');assert.equal(ladder.airportUsage[0].airport,'tag');
-  const detail=readDetail(f.root,'clash','all',now,{client:'flclash',airport:'tag',route:'proxy'});
-  assert.equal(detail.summary.up,30);assert.equal(detail.connections[0].client,'flclash');assert.equal(detail.connections[0].airport,'tag');
+  assert.equal(all.airportUsage.length,3);
+  const grouped=all.airportUsage.find(row=>row.airport===tag);
+  assert.deepEqual([grouped.airportName,grouped.up,grouped.down,grouped.connections],['TAG',48,69,3]);
+  assert.deepEqual(grouped.clients.map(row=>[row.client,row.up,row.down]),[['flclash',38,49],['verge',10,20]]);
+  assert.deepEqual(all.groups.proxy,{up:168,down:209});
+  assert.deepEqual(all.groups.direct,{up:100,down:200});
+  assert.equal(all.airportUsage.reduce((n,row)=>n+row.up,0),all.groups.proxy.up);
+  assert.equal(all.airportUsage.reduce((n,row)=>n+row.down,0),all.groups.proxy.down);
+  assert.equal(all.airportUsage.find(row=>row.airport==='__unassigned__').up,70);
+  const ladder=readLadder(f.root,'all',now,{client:'flclash',airport:tag});
+  assert.equal(ladder.detailReady,true);
+  assert.deepEqual(ladder.groups.proxy,{up:38,down:49});
+  assert.deepEqual(ladder.nodes.map(row=>row.name),['Shared HK','JP']);
+  const detail=readDetail(f.root,'clash','all',now,{client:'flclash',airport:tag,node:'Shared HK',route:'proxy'});
+  const row=detail.connections[0];
+  assert.equal(detail.summary.up,30);assert.equal(detail.summary.down,40);assert.equal(detail.connections.length,1);
+  assert.deepEqual([row.client,row.airport,row.destinationIP,row.destinationPort],['flclash',tag,'192.0.2.10',443]);
 });
-test('a recorded automatic airport label stays distinct from legacy manual grouping of the same node',t=>{
+test('obsolete group settings disappear during legacy migration and reopening without changing history',async t=>{
   const f=fixture(t),store=f.open('clash');
-  const airport={id:'auto-1234567890abcdef12345678',name:'Synthetic subscription'};
-  store.set('airportGroups',[{id:'manual',name:'Manual fallback',members:[{client:'verge',node:'Shared node'}]}]);
-  record(store,BASE+MINUTE,[
-    connection('automatic',10,20,{rule:rule(['Shared node'],{client:'verge',airport})}),
-    connection('older',30,40,{rule:rule(['Shared node'],{client:'verge'})}),
-  ]);
-  const now=BASE+3*HOUR,summary=readLadder(f.root,'all',now);
-  assert.deepEqual(summary.airportUsage.map(row=>[row.airport,row.airportName,row.up]),[['manual',null,30],[airport.id,airport.name,10]]);
-  const detail=readDetail(f.root,'clash','all',now,{client:'verge',airport:airport.id,route:'proxy'});
-  assert.equal(detail.summary.up,10);
-  assert.equal(detail.connections[0].airportName,airport.name);
+  store.db.prepare('INSERT INTO settings VALUES (?,?)').run(RETIRED_AIRPORT_SETTING,'[{"id":"manual"}]');
+  store.set('retentionDays',0);
+  record(store,BASE+MINUTE,[connection('older',30,40,{rule:rule(['Shared node'],{client:'verge'})})]);
+  f.close(store);
+  const target=f.open('clash');
+  try {
+    assert.equal(target.get(RETIRED_AIRPORT_SETTING),undefined);
+    target.set(RETIRED_AIRPORT_SETTING,[{id:'old-queue'}]);
+    assert.equal(target.get(RETIRED_AIRPORT_SETTING),undefined);
+    assert.equal(target.get('retentionDays'),0);
+    assert.equal(target.totals(0,BASE+3*HOUR).all_up,30);
+  } finally { f.close(target); }
+  const reopened=f.open('clash');
+  assert.equal(reopened.get(RETIRED_AIRPORT_SETTING),undefined);
+  assert.equal(readLadder(f.root,'all',BASE+3*HOUR).airportUsage[0].airport,'__unassigned__');
 });
 test('a broken disposable cache falls back to source records without hiding history',t=>{
   const f=fixture(t),store=f.open('windows');
@@ -132,18 +142,18 @@ test('large connection dictionaries return exact attribution without building an
   assert(attribution.every((value,index)=>value.total===count&&(!index||value.done>=attribution[index-1].done)));
 });
 
-test('an existing encrypted history gains and reuses the compact program index without changing records',async t=>{
+test('an existing SQLite history gains and reuses the compact program index without changing records',async t=>{
   const {randomBytes}=await import('node:crypto'),{Store}=await import('../src/store.mjs');
-  const f=fixture(t),dir=path.join(f.root,'windows'),key=randomBytes(32);let store=new Store(dir,{encryptionKey:key});
+  const f=fixture(t),dir=path.join(f.root,'windows'),key=randomBytes(32);let store=new Store(dir);
   t.after(()=>{try{store.close();}catch{}key.fill(0);});
-  record(store,BASE+MINUTE,[connection('encrypted-identity',12,34,{process:'private-program-canary.exe'})]);
+  record(store,BASE+MINUTE,[connection('sqlite-identity',12,34,{process:'private-program-canary.exe'})]);
   const before=store.db.prepare('SELECT * FROM connections').all();store.db.exec('DROP INDEX connections_programs');store.close();
-  const progress=[];store=new Store(dir,{encryptionKey:key,onProgress:value=>progress.push(value)});
+  const progress=[];store=new Store(dir,{onProgress:value=>progress.push(value)});
   assert.deepEqual(store.db.prepare('SELECT * FROM connections').all(),before);assert.equal(progress[0].stage,'program_index');
-  const plan=store.db.prepare('EXPLAIN QUERY PLAN SELECT id,process,evidence FROM connections INDEXED BY connections_programs WHERE id=?').all('encrypted-identity').map(row=>row.detail).join('\n');
+  const plan=store.db.prepare('EXPLAIN QUERY PLAN SELECT id,process,evidence FROM connections INDEXED BY connections_programs WHERE id=?').all('sqlite-identity').map(row=>row.detail).join('\n');
   assert.match(plan,/COVERING INDEX connections_programs/);store.close();
-  store=new Store(dir,{encryptionKey:key,onProgress:()=>assert.fail('a later opening must reuse the existing index')});store.close();
-  for(const name of fs.readdirSync(dir))assert.equal(fs.readFileSync(path.join(dir,name)).includes(Buffer.from('private-program-canary.exe')),false,'index contents stay encrypted');
+  store=new Store(dir,{onProgress:()=>assert.fail('a later opening must reuse the existing index')});store.close();
+  assert.equal(fs.readFileSync(path.join(dir,'monitor.sqlite')).subarray(0,15).toString(),'SQLite format 3');
 });
 
 test('an empty archive uses the real bucket index for detail lookups',t=>{

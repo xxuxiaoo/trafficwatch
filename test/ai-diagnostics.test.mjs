@@ -3,12 +3,9 @@ import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import path from 'node:path';
 import os from 'node:os';
-import crypto from 'node:crypto';
 import {normalizeMagpieRequest,EvidenceRing,IncidentEngine,errorCategory} from '../src/ai-diagnostic-events.mjs';
 import {IncrementalTail} from '../src/ai-log-tail.mjs';
-import {DiagnosticHistory,DiagnosticSpool} from '../src/ai-diagnostic-store.mjs';
-import {createVaultKeys} from '../src/vault-crypto.mjs';
-import {GrantRegistry} from '../src/vault-grants.mjs';
+import {DiagnosticHistory} from '../src/ai-diagnostic-store.mjs';
 import {patchProfileScript} from '../src/relay-clash-overlay.mjs';
 
 test('failed attempt remains distinct when retry succeeds; no credentials, content, paths or raw errors copied',()=>{
@@ -37,23 +34,17 @@ test('incremental log reading survives partial UTF-8, restart cursor, truncation
   }finally{fs.rmSync(dir,{recursive:true,force:true});}
 });
 
-test('signed diagnostic queue and indexed history remain encrypted; exact date scopes redact incident evidence',{timeout:20000},async()=>{
-  const dir=fs.mkdtempSync(path.join(os.tmpdir(),'tw-diag-vault-'));let spool,history;
+test('diagnostics write immediately to SQLite WAL and exact date ranges retain incident evidence',{timeout:20000},async()=>{
+  const dir=fs.mkdtempSync(path.join(os.tmpdir(),'tw-diag-vault-'));let history;
   try{
-    const {metadata,secrets}=await createVaultKeys('synthetic-test-password');const signing=crypto.generateKeyPairSync('ed25519');metadata.capturePublicKey=signing.publicKey.export({format:'pem',type:'spki'});
-    spool=new DiagnosticSpool(dir,metadata,{signingKey:signing.privateKey});history=new DiagnosticHistory(dir,metadata,secrets);
-    const minute=60000,a=Date.parse('2026-11-10T01:00:00Z'),b=a+86400000;
-    spool.append([{id:'inside',kind:'request',at:a,provider:'private-provider.test',category:'eof'},{id:'outside',kind:'request',at:b,provider:'outside-provider.test',category:'success'},{id:'incident',kind:'incident',at:a,from:a-minute,to:b+minute,evidence:[{id:'a',at:a,private:'inside'},{id:'b',at:b,private:'excluded'}]}]);
-    assert.doesNotMatch(fs.readFileSync(path.join(dir,'diagnostics','ingest.sqlite-wal')).toString('utf8'),/private-provider|outside-provider/);
-    assert.equal(history.drain(),1);const result=history.query({windows:[{from:a-minute,to:a+minute}],from:0,to:b+minute});assert.equal(result.rows.length,2);assert.equal(result.rows.find(row=>row.kind==='incident').evidence,undefined);const incident=history.query({windows:[{from:a-minute,to:a+minute}],from:0,to:b+minute,eventId:'incident'}).rows[0];assert.equal(incident.evidence.length,1);assert.doesNotMatch(JSON.stringify(result),/outside-provider|excluded/);assert.equal(result.requestSummary[0].count,1);
-    assert.equal(history.drain(),0);history.close();history=null;assert.doesNotMatch(fs.readFileSync(path.join(dir,'diagnostics','history.vault.sqlite')).toString('utf8'),/private-provider|outside-provider/);
-  }finally{spool?.close();history?.close();fs.rmSync(dir,{recursive:true,force:true,maxRetries:5,retryDelay:100});}
-});
 
-test('traffic-only AI visitor cannot read diagnostics; lock, date and operation policies apply',()=>{
-  let now=100000000;const registry=new GrantRegistry({now:()=>now});const base={scope:{kind:'windows',windows:[{from:99960000,to:100020000}]},minutes:60,permissions:['read']};
-  const traffic=registry.issue({...base,lanes:['clash']});assert.throws(()=>registry.authenticate(traffic.token,{lane:'diagnostics'}),/grant_forbidden/);
-  const diagnostic=registry.issue({...base,lanes:['diagnostics'],continueWhenLocked:true});registry.lock();assert(registry.authenticate(diagnostic.token,{lane:'diagnostics',locked:true}));assert.throws(()=>registry.authenticate(diagnostic.token,{lane:'diagnostics',operation:'export'}),/grant_forbidden/);assert.throws(()=>registry.authenticate(diagnostic.token,{lane:'diagnostics',from:100080000,to:100140000}),/grant_date_forbidden/);registry.lock({force:true});assert.throws(()=>registry.authenticate(diagnostic.token,{lane:'diagnostics'}),/grant_expired/);
+    history=new DiagnosticHistory(dir);
+    const minute=60000,a=Date.parse('2026-11-10T01:00:00Z'),b=a+86400000;
+    history.append([{id:'inside',kind:'request',at:a,provider:'private-provider.test',category:'eof'},{id:'outside',kind:'request',at:b,provider:'outside-provider.test',category:'success'},{id:'incident',kind:'incident',at:a,from:a-minute,to:b+minute,evidence:[{id:'a',at:a,private:'inside'},{id:'b',at:b,private:'excluded'}]}]);
+    assert.equal(history.db.prepare('PRAGMA journal_mode').get().journal_mode,'wal');
+    const result=history.query({windows:[{from:a-minute,to:a+minute}],from:0,to:b+minute});assert.equal(result.rows.length,2);assert.equal(result.rows.find(row=>row.kind==='incident').evidence,undefined);const incident=history.query({windows:[{from:a-minute,to:a+minute}],from:0,to:b+minute,eventId:'incident'}).rows[0];assert.equal(incident.evidence.length,1);assert.doesNotMatch(JSON.stringify(result),/outside-provider|excluded/);assert.equal(result.requestSummary[0].count,1);
+    assert.equal(fs.existsSync(path.join(dir,'diagnostics','ingest.sqlite')),false);
+  }finally{history?.close();fs.rmSync(dir,{recursive:true,force:true,maxRetries:5,retryDelay:100});}
 });
 
 test('Clash profile overlay is repeatable, preserves original settings, rollback removes only marked code',()=>{

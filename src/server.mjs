@@ -1,15 +1,11 @@
 import http from 'node:http';
 import fs from 'node:fs';
 import path from 'node:path';
-import { spawn } from 'node:child_process';
 import { VERSION } from './version.mjs';
 import { createDiagnostics } from './diagnostics.mjs';
 import { validateBudget } from './budgets.mjs';
 import { UpdateManager } from './update.mjs';
 import { trafficRates } from './traffic-route.mjs';
-import { sealPacket,packetFormat } from './vault-crypto.mjs';
-import { commandVerifier } from './vault-commands.mjs';
-import crypto from 'node:crypto';
 
 export function parseRange(url, now, firstAt) {
   const ranges = {
@@ -76,7 +72,6 @@ function readBody(req, limit = 4096) {
   });
 }
 export function createServer(config, store, monitor, shutdown) {
-  let verifyCommand;
   const updater = new UpdateManager(config);
   let insightCache = null;
   let budgetCache = null;
@@ -93,11 +88,7 @@ export function createServer(config, store, monitor, shutdown) {
     return insightCache.value;
   };
   const assets = new Map(
-    [
-      ['/', 'index.html'],
-      ...['/app.js', '/i18n.js', '/desktop.js', '/setup.js', '/history.js', '/style.css', '/icon.svg']
-        .map((route) => [route, route.slice(1)]),
-    ].map(([route, file]) => [route, path.join(config.root, 'public', file)]),
+    ['/icon.svg'].map((route) => [route, path.join(config.root, 'public', route.slice(1))]),
   );
   const server = http.createServer(async (req, res) => {
     const port = server.address()?.port || config.port;
@@ -119,30 +110,10 @@ export function createServer(config, store, monitor, shutdown) {
       return json(403, { error: 'Cross-origin requests are not allowed' });
     try {
       const url = new URL(req.url, `http://${expectedHost}`);
-      if(store.sealed&&req.method==='GET'&&url.pathname==='/'){
-        res.writeHead(302,{Location:`http://127.0.0.1:43131/legacy?lane=${store.lane}`});res.end();return;
-      }
-      if (req.method === 'GET' && (url.pathname === '/overview' ||
-          url.pathname === '/' && config.unifiedDashboard && url.searchParams.get('legacy') !== '1')) {
-        const overviewUrl = 'http://127.0.0.1:43131';
-        let ready = false;
-        const check = async () => {
-          try {
-            const response = await fetch(`${overviewUrl}/api/health`, { signal: AbortSignal.timeout(500) });
-            return response.ok && (await response.json()).app === 'trafficwatch-overview';
-          } catch { return false; }
-        };
-        ready = await check();
-        if (!ready) {
-          const child = spawn(process.execPath, ['--disable-warning=ExperimentalWarning', path.join(config.root, 'src', 'overview-server.mjs')],
-            { cwd: config.root, stdio: 'ignore', detached: true, windowsHide: true });
-          child.on('error', () => {}); child.unref();
-          for (let attempt = 0; attempt < 30 && !ready; attempt++) {
-            await new Promise((resolve) => setTimeout(resolve, 100)); ready = await check();
-          }
-        }
-        if (!ready) return json(503, { error: '简洁总览暂未启动，请从桌面控制台打开。' });
-        res.writeHead(302, { Location: `${overviewUrl}/` }); res.end(); return;
+      if (req.method === 'GET' && (url.pathname === '/' || url.pathname === '/overview')) {
+        const overviewPort = Number(process.env.TRAFFICWATCH_OVERVIEW_PORT || 43131);
+        if (!Number.isInteger(overviewPort) || overviewPort < 1024 || overviewPort > 65535) return json(503, { error: 'invalid_overview_port' });
+        res.writeHead(302, { Location: `http://127.0.0.1:${overviewPort}/` }); res.end(); return;
       }
       if (url.pathname === '/api/health' && req.method === 'GET')
         return json(200, {
@@ -153,17 +124,12 @@ export function createServer(config, store, monitor, shutdown) {
           systemLocale: config.systemLocale || Intl.DateTimeFormat().resolvedOptions().locale,
           state: monitor.state,
           demo: config.demo,
-          sealedStorage: store.sealed===true,
         });
       if (url.pathname.startsWith('/api/')) {
         if (req.headers['x-codex-flow'] !== '1')
           return json(403, { error: 'Missing local client header' });
         if (req.method === 'POST') {
-          const body = await readBody(req,url.pathname==='/api/airport-groups'?65536:4096);
-          if(store.sealed&&!['/api/stop','/api/capture'].includes(url.pathname)){
-            verifyCommand??=commandVerifier(store.metadata.commandPublicKey);
-            if(!verifyCommand(req.headers['x-trafficwatch-command'],url.pathname,JSON.parse(body||'{}')))return json(403,{error:'vault_command_required'});
-          }
+          const body = await readBody(req);
           if (url.pathname === '/api/update/install') {
             if (!config.desktopToken || req.headers['x-codex-desktop-token'] !== config.desktopToken)
               return json(403, { error: 'Desktop instance marker required' });
@@ -189,10 +155,6 @@ export function createServer(config, store, monitor, shutdown) {
             } catch {
               return json(400, { error: 'Invalid Harness process names' });
             }
-          }
-          if (url.pathname === '/api/airport-groups') {
-            try { return json(200, { groups: monitor.setAirportGroups(JSON.parse(body || '{}').groups) }); }
-            catch { return json(400, { error: '机场分组或节点配置无效' }); }
           }
           if (url.pathname === '/api/settings') {
             const request = JSON.parse(body || '{}');
@@ -233,15 +195,9 @@ export function createServer(config, store, monitor, shutdown) {
             allUpRate: status.allUpRate, allDownRate: status.allDownRate,
             routeRates: trafficRates(monitor.latest, Number.isFinite(status.allUpRate)),
           };
-          return json(200,store.sealed?{app:'trafficwatch-sealed-live',packet:sealPacket(live,store.metadata.publicKey,{format:packetFormat,vault:store.metadata.id,lane:store.lane,id:crypto.randomUUID()})}:live);
+          return json(200,live);
         }
-        if(store.sealed)return json(423,{error:'vault_history_protected',url:'http://127.0.0.1:43131/'});
         if (url.pathname === '/api/harness-apps') return json(200, { apps: monitor.harnessApps });
-        if (url.pathname === '/api/mini') {
-          if (!config.desktopToken || req.headers['x-codex-desktop-token'] !== config.desktopToken)
-            return json(403, { error: 'Desktop instance marker required' });
-          return json(200, { status: monitor.status(), budget: store.budgetSummary(Date.now(), undefined, false) });
-        }
         if (url.pathname === '/api/calendar' || url.pathname === '/api/report') {
           const scope = url.searchParams.get('scope') || 'codex';
           if (!['codex', 'all'].includes(scope)) return json(400, { error: 'Invalid scope' });

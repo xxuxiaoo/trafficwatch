@@ -44,3 +44,11 @@ release-manifest.json
 Thumbs.db
 .vscode/
 .idea/
+
+# Local investigation and temporary migration work
+work/
+handoff.md
+*.sealed
+*.dpapi
+.migration-*/
+history-v2/

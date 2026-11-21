@@ -23,7 +23,7 @@ export function limitCacheConnection(db) {
   db.exec(`PRAGMA max_page_count=${Math.floor(CACHE_DATABASE_LIMIT/size)};PRAGMA wal_autocheckpoint=128;PRAGMA journal_size_limit=4194304`);
 }
 export function cacheFailed(file,error) {
-  if(/full|disk|space/i.test(error.message)) { cooldowns.set(file,Date.now()+3600000);try{removeSummaryCache(file);}catch{} }
+  if(/full|disk|space/i.test(error.message)) { cooldowns.set(file,Date.now()+3600000);try{removeSummaryCache(file);}catch(error){console.error('TrafficWatch summary cache:',error.code||error.message);} }
 }
 export function directoryUsage(root,{maxFiles=20000}={}) {
   let bytes=0,files=0,incomplete=false;
@@ -41,16 +41,4 @@ export function directoryUsage(root,{maxFiles=20000}={}) {
 }
 export function availableDisk(root) {
   try{const stat=fs.statfsSync(root);return {availableBytes:Number(stat.bavail)*Number(stat.bsize),capacityBytes:Number(stat.blocks)*Number(stat.bsize)};}catch{return {availableBytes:null,capacityBytes:null};}
-}
-
-// Fixed managed names overwrite on retry, so they cannot grow with every click.
-// Recovery copies are retained; only abandoned staging files (which always have
-// an intact committed counterpart) are eligible for automatic housekeeping.
-export function tidyBackupStaging(dataRoot) {
-  const dir=path.join(dataRoot,'vault','backups');let removedBytes=0;
-  for(const lane of ['windows','clash']) {
-    const file=path.join(dir,lane+'-before-plaintext-cleanup.sqlite'),pending=file+'.pending';
-    if(fs.existsSync(file)&&fs.existsSync(pending)){removedBytes+=fileBytes(pending);fs.unlinkSync(pending);}
-  }
-  return {removedBytes};
 }

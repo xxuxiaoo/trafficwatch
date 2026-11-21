@@ -13,6 +13,7 @@ $suiteData=if ($suiteOwnerSettings -and $suiteOwnerSettings.DataRoot) { [IO.Path
 $suiteNode=Join-Path $suiteApp 'runtime\node.exe'
 $suiteHeader=@{'x-codex-flow'='1'}
 $suiteStopSignal=Join-Path $suiteData 'stop.request'
+$suiteCapturePause=Join-Path $suiteData 'capture-paused'
 $suiteProfiles=@(
     @{Name='windows';Port=43128;Mode='native'},
     @{Name='clash';Port=43130;Mode='mihomo'}
@@ -59,6 +60,7 @@ function Start-SuiteProfile($profile) {
     $profileData=Join-Path $suiteData $profile.Name
     New-Item -ItemType Directory -Path $profileData -Force | Out-Null
     $env:CODEX_FLOW_DATA_DIR=$profileData
+    $env:TRAFFICWATCH_SUITE_DATA_ROOT=$suiteData
     $env:CODEX_FLOW_PORT=[string]$profile.Port
     $env:CODEX_NETWATCH_CAPTURE_MODE=$profile.Mode
     # Deliberately unreachable in native mode: ETW must work without a proxy API.
@@ -87,17 +89,7 @@ function Start-SuiteProfile($profile) {
     $env:MIHOMO_SECRET=''
     Write-SuiteLog ('Started '+$profile.Name+' collector PID '+$suiteProcess.Id)
 }
-function Ensure-SuiteViewer {
-    try{$viewerHealth=Invoke-RestMethod -Uri 'http://127.0.0.1:43131/api/health' -TimeoutSec 2;if($viewerHealth.app -eq 'trafficwatch-overview'){return}}catch{}
-    $old=$suiteChildren['viewer'];if($old -and -not $old.HasExited){return}
-    $env:TRAFFICWATCH_DATA_ROOT=$suiteData
-    $env:TRAFFICWATCH_CACHE_ROOT=Join-Path $suiteData 'viewer-cache'
-    New-Item -ItemType Directory -Path $env:TRAFFICWATCH_CACHE_ROOT -Force|Out-Null
-    $suiteChildren['viewer']=Start-Process -FilePath $suiteNode -ArgumentList '--disable-warning=ExperimentalWarning','src/overview-server.mjs' -WorkingDirectory $suiteApp -WindowStyle Hidden -RedirectStandardOutput (Join-Path $env:TRAFFICWATCH_CACHE_ROOT 'viewer.log') -RedirectStandardError (Join-Path $env:TRAFFICWATCH_CACHE_ROOT 'viewer-error.log') -PassThru
-    Write-SuiteLog ('Started protected viewer PID '+$suiteChildren['viewer'].Id)
-}
 function Ensure-SuiteDiagnostics {
-    if(-not(Test-Path -LiteralPath (Join-Path $suiteData 'vault\vault.json'))){return}
     foreach($suiteComponent in @('diagnostics','relay-bypass')){
         if($suiteComponent -eq 'relay-bypass' -and -not $suiteOwnerSettings.RelayHosts -and -not(Test-Path -LiteralPath (Join-Path $suiteData 'relay-bypass\managed-targets.json'))){continue}
         $suiteDisabled=Join-Path $suiteData ($suiteComponent+'\disabled')
@@ -124,10 +116,20 @@ function Ensure-SuiteDiagnostics {
 Write-SuiteLog 'Supervisor started; Windows native and Mihomo databases are independent.'
 Repair-SuiteNativeSessions
 while (-not (Test-Path -LiteralPath $suiteStopSignal)) {
-    try{Ensure-SuiteViewer}catch{Write-SuiteLog ('Viewer start failed: '+$_.Exception.Message)}
     try{Ensure-SuiteDiagnostics}catch{Write-SuiteLog 'Diagnostics background start failed.'}
     foreach ($suiteProfile in $suiteProfiles) {
         if (Test-Path -LiteralPath $suiteStopSignal) { break }
+        if (Test-Path -LiteralPath $suiteCapturePause) {
+            $owned=$suiteChildren[$suiteProfile.Name]
+            if ($owned -and -not $owned.HasExited) {
+                $suiteHealth=Read-SuiteHealth $suiteProfile
+                if ($suiteHealth.app -eq 'codex-flow' -and $suiteHealth.collectorPid -eq $owned.Id) {
+                    try { Invoke-RestMethod -Uri ('http://127.0.0.1:'+$suiteProfile.Port+'/api/stop') -Method Post -Headers $suiteHeader -Body '{}' -ContentType 'application/json' -TimeoutSec 3 | Out-Null }
+                    catch { Write-SuiteLog ('Pause '+$suiteProfile.Name+' failed: '+$_.Exception.Message) }
+                }
+            }
+            continue
+        }
         $suiteHealth=Read-SuiteHealth $suiteProfile
         if (-not $suiteHealth) {
             $suiteOld=$suiteChildren[$suiteProfile.Name]
@@ -146,7 +148,6 @@ while (-not (Test-Path -LiteralPath $suiteStopSignal)) {
 foreach ($suiteProfile in $suiteProfiles) {
     try { Invoke-RestMethod -Uri ('http://127.0.0.1:'+ $suiteProfile.Port +'/api/stop') -Method Post -Headers $suiteHeader -Body '{}' -ContentType 'application/json' -TimeoutSec 3 | Out-Null } catch {}
 }
-try{Invoke-RestMethod -Uri 'http://127.0.0.1:43131/api/stop' -Method Post -Headers $suiteHeader -TimeoutSec 3|Out-Null}catch{}
 $suiteStopDeadline=(Get-Date).AddSeconds(15)
 do {
     $suiteLiveHelpers=@(Get-Process -Name 'Codex-Netwatch-Capture' -ErrorAction SilentlyContinue)
