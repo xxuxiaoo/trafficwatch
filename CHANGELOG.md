@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.10.17
+
+- Accept the legacy Clash controller gap reason. Report damaged queue packets or operations and continue applying valid capture records in order.
+- Reuse verified history lanes after an interrupted Windows upgrade. If an unchanged verified traffic database had no pending packets at its checkpoint, replay its current queue without redoing the encrypted conversion.
+
 ## 0.10.16
 
 - Write traffic and diagnostic history directly to local SQLite WAL and open a single dashboard without a password or visitor card.

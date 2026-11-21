@@ -6,6 +6,12 @@ import { calendarSummary, reportSummary } from './reports.mjs';
 import { archivedSampleExists, historyBounds, initializeArchives } from './history-archive.mjs';
 
 export const RETIRED_AIRPORT_SETTING = 'airportGroups';
+export const COLLECTION_GAP_REASONS = Object.freeze([
+  'initial_baseline', 'collector_restart', 'source_unavailable', 'collector_error',
+  'source_changed', 'sampling_delay', 'observer_unavailable', 'clock_changed',
+  'native_events_lost', 'proxy_controller_unavailable',
+]);
+export const validGapTime = value => Number.isSafeInteger(value) && value >= 0;
 
 export class Store {
   constructor(dir, { filename = 'monitor.sqlite', onProgress = () => {} } = {}) {
@@ -322,22 +328,7 @@ export class Store {
     return historyBounds(this.db).lastAt;
   }
   openGap(reason, from) {
-    if (
-      ![
-        'initial_baseline',
-        'collector_restart',
-        'source_unavailable',
-        'collector_error',
-        'source_changed',
-        'sampling_delay',
-        'observer_unavailable',
-        'clock_changed',
-        'native_events_lost',
-      ].includes(reason) ||
-      !Number.isSafeInteger(from) ||
-      from < 0
-    )
-      throw new Error('Invalid collection gap');
+    if (!COLLECTION_GAP_REASONS.includes(reason) || !validGapTime(from)) throw new Error('Invalid collection gap');
     return Number(
       this.db
         .prepare('INSERT INTO collection_gaps(reason,started_at) VALUES (?,?)')
@@ -345,7 +336,7 @@ export class Store {
     );
   }
   closeGap(id, to) {
-    if (!Number.isSafeInteger(to) || to < 0) throw new Error('Invalid gap end');
+    if (!validGapTime(to)) throw new Error('Invalid gap end');
     this.db
       .prepare(
         'UPDATE collection_gaps SET ended_at=MAX(started_at,?) WHERE id=? AND ended_at IS NULL',

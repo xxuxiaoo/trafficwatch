@@ -7,20 +7,22 @@ import { DatabaseSync } from 'node:sqlite';
 import { Store } from '../src/store.mjs';
 import { DiagnosticHistory } from '../src/ai-diagnostic-store.mjs';
 import { HISTORY_LANES, HISTORY_MANIFEST, MIGRATED_HISTORY, historyFilename } from '../src/history-paths.mjs';
-import { purposeKey, openPacket, unlockVaultKeys } from './legacy-keys.mjs';
-import { initializeImport, importEnvelope } from './legacy-traffic.mjs';
+import { purposeKey, unlockVaultKeys } from './legacy-keys.mjs';
+import { decodeEnvelope, InvalidLegacyPacket, packetDigest, initializeImport, importEnvelope } from './legacy-traffic.mjs';
 
 const legacyRequire = createRequire(import.meta.url);
 const legacyDatabase = 'history.vault.sqlite';
-const signatures = ['','-wal'];
+const signatures = ['', '-wal'];
+const sidecars = ['', '-wal', '-shm', '-journal'];
+const capturePreferences = ['harnessApps', 'captureMode', 'retentionDays', 'alertMBPerMinute', 'budget'];
 const ident = name => '"' + name.replaceAll('"', '""') + '"';
 const sha = file => new Promise((resolve, reject) => {
   const hash = crypto.createHash('sha256');
   fs.createReadStream(file).on('error', reject).on('data', value => hash.update(value)).on('end', () => resolve(hash.digest('hex')));
 });
-async function copyVerified(source, target, label) {
-  fs.copyFileSync(source, target, fs.constants.COPYFILE_EXCL);
-  const digest = await sha(source);
+async function copyVerified(source, target, label, expected) {
+  await fs.promises.copyFile(source, target, fs.constants.COPYFILE_EXCL);
+  const digest = expected ?? await sha(source);
   if (await sha(target) !== digest) throw new Error(`migration_copy_mismatch:${label}`);
   return digest;
 }
@@ -35,6 +37,74 @@ function writeJson(file, value) {
   fs.writeFileSync(file + '.pending', JSON.stringify(value, null, 2) + '\n');
   fs.renameSync(file + '.pending', file);
 }
+function isLocalPath(filename, kind) {
+  const stat = fs.lstatSync(filename, { throwIfNoEntry: false });
+  return Boolean(stat?.[kind]() && fs.realpathSync(filename).toLowerCase() === filename.toLowerCase());
+}
+function laneInputs(inputs, lane, filter = () => true) {
+  const prefix = `${lane}/`;
+  return JSON.stringify(Object.entries(inputs).filter(([name]) => name.startsWith(prefix) && filter(name.slice(prefix.length))));
+}
+
+function earlierStages(root, stage, vaultId, notify) {
+  const candidates = [];
+  for (const name of fs.readdirSync(root)) {
+    if (!/^\.migration-[a-f0-9]{16}$/.test(name)) continue;
+    const directory = path.join(root, name), filename = path.join(directory, HISTORY_MANIFEST);
+    if (directory === stage || !isLocalPath(directory, 'isDirectory') || !isLocalPath(filename, 'isFile')) continue;
+    let manifest;
+    try { manifest = JSON.parse(fs.readFileSync(filename, 'utf8')); }
+    catch (error) {
+      if (!(error instanceof SyntaxError)) throw error;
+      notify({ phase: 'checkpoint_ignored', checkpoint: name, reason: 'invalid_manifest_json' });
+      continue;
+    }
+    if (manifest?.version === 1 && manifest.vaultId === vaultId && manifest.inputs && manifest.lanes) candidates.push({ directory, manifest });
+  }
+  return candidates;
+}
+
+async function matchesOriginals(root, lane, name, currentInputs, recordedInputs, digests, { allowEmptyWal = false } = {}) {
+  const required = [];
+  for (const suffix of signatures) {
+    const relative = `${lane}/${name}${suffix}`;
+    const current = currentInputs[relative], prior = recordedInputs[relative];
+    const recorded = digests?.[suffix || 'main'];
+    if (allowEmptyWal && suffix && !current?.size && !prior?.size) continue;
+    if (!current && !prior && !recorded) continue;
+    if (!current || !prior || current.size !== prior.size || !recorded) return false;
+    required.push([relative, recorded]);
+  }
+  for (const [relative, recorded] of required) {
+    if (await sha(path.join(root, relative)) !== recorded) return false;
+  }
+  return true;
+}
+
+async function reusableLane(root, lane, inputs, candidates, notify) {
+  const plainInputs = name => name === 'monitor.sqlite' || name === 'monitor.sqlite-wal';
+  const options = candidates.flatMap(({ directory, manifest }) => {
+    const previous = manifest.lanes[lane];
+    if (!previous?.outputSHA256) return [];
+    const exact = laneInputs(inputs, lane) === laneInputs(manifest.inputs, lane);
+    const base = directory !== candidates[0].directory && lane !== 'diagnostics' && previous.queue?.total === 0 &&
+      laneInputs(inputs, lane, plainInputs) === laneInputs(manifest.inputs, lane, plainInputs);
+    return exact || base ? [{ directory, manifest, previous, exact, base }] : [];
+  }).sort((a, b) => Number(b.exact) - Number(a.exact));
+  for (const { directory, manifest, previous, exact, base } of options) {
+    const checkpoint = path.basename(directory);
+    const target = path.join(directory, lane, historyFilename(lane));
+    let reason;
+    if (!await matchesVerifiedOutput(target, previous.outputSHA256)) reason = 'output_checksum_changed';
+    else if (!await matchesOriginals(root, lane, legacyDatabase, inputs, manifest.inputs, previous.originals, { allowEmptyWal: true })) reason = 'encrypted_history_changed';
+    else if (exact && await matchesOriginals(root, lane, 'ingest.sqlite', inputs, manifest.inputs, previous.queueSHA256)) return { ...previous, target, checkpoint, replay: false };
+    else if (base) return { ...previous, target, checkpoint, replay: true };
+    else reason = 'queue_checksum_changed';
+    notify({ lane, phase: 'checkpoint_ignored', checkpoint, reason });
+  }
+  return null;
+}
+
 function legacyInputs(root) {
   const files = ['vault/vault.json'];
   for (const lane of HISTORY_LANES) {
@@ -61,10 +131,10 @@ function legacyInputs(root) {
     return [relative, { size: stat.size, mtimeMs: stat.mtimeMs }];
   }));
 }
-function integrity(db, label, foreignKeys = true) {
-  const results = db.prepare('PRAGMA integrity_check').all();
-  if (results.some(row => Object.values(row)[0] !== 'ok')) throw new Error(`migration_integrity_failed:${label}:${Object.values(results[0])[0]}`);
-  if (foreignKeys && db.prepare('PRAGMA foreign_key_check').get()) throw new Error(`migration_foreign_key_failed:${label}`);
+function integrity(db, label, { quick = false } = {}) {
+  const failed = db.prepare(quick ? 'PRAGMA quick_check' : 'PRAGMA integrity_check').all().find(row => Object.values(row)[0] !== 'ok');
+  if (failed) throw new Error(`migration_integrity_failed:${label}:${Object.values(failed)[0]}`);
+  if (db.prepare('PRAGMA foreign_key_check').get()) throw new Error(`migration_foreign_key_failed:${label}`);
 }
 function metrics(db, lane) {
   const tables = db.prepare("SELECT name FROM sqlite_schema WHERE type='table' AND name NOT LIKE 'sqlite_%' ORDER BY name").all();
@@ -76,7 +146,7 @@ function metrics(db, lane) {
 }
 async function convertDatabase(root, lane, dir, master, inputs, notify) {
   const source = path.join(root, lane, legacyDatabase), target = path.join(dir, historyFilename(lane));
-  for (const suffix of ['', '-wal', '-shm', '-journal']) fs.rmSync(target + suffix, { force: true });
+  for (const suffix of sidecars) fs.rmSync(target + suffix, { force: true });
   notify({ lane, phase: 'copy' });
   const originals = {};
   for (const suffix of signatures) {
@@ -109,34 +179,147 @@ async function convertDatabase(root, lane, dir, master, inputs, notify) {
   return { before, originals };
 }
 
-function decodeDiagnostic(row, metadata, key) {
-  const packet = JSON.parse(Buffer.from(row.payload).toString('utf8'));
-  if (packet.header?.id !== row.id || packet.header?.vault !== metadata.id || packet.header?.lane !== 'diagnostics') throw new Error('ingest_header_mismatch');
-  return openPacket(packet, key, metadata.capturePublicKey);
-}
-
-function importDiagnostic(history, row, metadata, key) {
-  const db = history.db, digest = crypto.createHash('sha256').update(row.payload).digest('hex');
+function importDiagnostic(history, row, digest, decode) {
+  const db = history.db;
   const previous = db.prepare('SELECT digest FROM imports WHERE id=?').get(row.id);
   if (previous) {
-    if (previous.digest !== digest) throw new Error('ingest_id_conflict');
-    return false;
+    if (previous.digest !== digest) throw new InvalidLegacyPacket('ingest_id_conflict');
+    return { status: 'alreadyImported', issues: [] };
   }
-  const events = decodeDiagnostic(row, metadata, key);
-  if (!Array.isArray(events) || events.length > 1024) throw new Error('invalid_diagnostic_batch');
-  for (const event of events) history.put(event);
-  db.prepare('INSERT INTO imports VALUES (?,?)').run(row.id, digest);
-  return true;
+  const events = decode(row);
+  if (!Array.isArray(events) || events.length > 1024) throw new InvalidLegacyPacket('invalid_diagnostic_batch');
+  const issues = [];
+  for (const [index, event] of events.entries()) {
+    if (!event || (event.kind === 'incident' && !Array.isArray(event.evidence))) {
+      issues.push({ operation: index + 1, reason: 'invalid_diagnostic_event' });
+      continue;
+    }
+    try { history.put(event); }
+    catch (error) {
+      if (!['invalid_diagnostic_event', 'diagnostic_event_too_large', 'invalid_diagnostic_replacement'].includes(error.message)) throw error;
+      issues.push({ operation: index + 1, reason: error.message });
+    }
+  }
+  const applied = !issues.length || issues.length < events.length;
+  if (applied) db.prepare('INSERT INTO imports VALUES (?,?)').run(row.id, digest);
+  return { status: applied ? 'added' : 'quarantined', issues };
 }
 
-async function replayLane(root, lane, dir, metadata, secrets, inputs, notify) {
+async function restoreReplayState(root, lane, dir, master, inputs, originals, db, queue) {
+  // The 0.10.16 checkpoint dropped its import receipts, deletion ranges and
+  // gap IDs. Read these from a private copy: even a read-only SQLite handle
+  // may create or write WAL sidecars beside the original encrypted database.
+  const directory = fs.mkdtempSync(path.join(dir, '.legacy-replay-'));
+  const source = path.join(root, lane, legacyDatabase), target = path.join(directory, legacyDatabase);
+  let original;
+  try {
+    for (const suffix of signatures) {
+      if (suffix && !inputs[`${lane}/${legacyDatabase}${suffix}`]?.size) continue;
+      await copyVerified(source + suffix, target + suffix, `${lane}/replay_state${suffix}`, originals[suffix || 'main']);
+    }
+    const Cipher = legacyRequire('better-sqlite3-multiple-ciphers');
+    const key = purposeKey(master, `database/${lane}`);
+    try {
+      original = new Cipher(target, { readonly: true, fileMustExist: true, timeout: 5000 });
+      original.key(key);
+    } finally { key.fill(0); }
+    const table = original.prepare("SELECT 1 FROM sqlite_schema WHERE type='table' AND name=?");
+    db.exec('BEGIN IMMEDIATE');
+    for (const [name, columns] of [['vault_gap_ids', ['id', 'gap_id']], ['vault_deletions', ['start_at', 'end_at']]]) {
+      if (!table.get(name)) continue;
+      const insert = db.prepare(`INSERT INTO ${name} VALUES (?,?)`);
+      for (const row of original.prepare(`SELECT ${columns.join(',')} FROM ${name}`).iterate()) insert.run(...columns.map(column => row[column]));
+    }
+    if (queue && table.get('vault_imports')) {
+      const insert = db.prepare('INSERT INTO vault_imports VALUES (?,?)');
+      const receipt = original.prepare('SELECT digest FROM vault_imports WHERE id=?');
+      for (const { id } of queue.prepare('SELECT id FROM envelopes').iterate()) {
+        const previous = receipt.get(id);
+        if (previous) insert.run(id, previous.digest);
+      }
+    }
+    const pref = original.prepare('SELECT value FROM settings WHERE key=?');
+    const set = db.prepare('INSERT OR REPLACE INTO settings VALUES (?,?)');
+    const remove = db.prepare('DELETE FROM settings WHERE key=?');
+    for (const name of capturePreferences) {
+      const previous = pref.get(name);
+      if (previous) set.run(name, previous.value);
+      else remove.run(name);
+    }
+    db.exec('COMMIT');
+  } catch (error) {
+    if (db.isTransaction) db.exec('ROLLBACK');
+    throw error;
+  } finally {
+    original?.close();
+    for (const suffix of sidecars) fs.rmSync(target + suffix, { force: true });
+    fs.rmdirSync(directory);
+  }
+}
+
+function replayQueue(queue, lane, db, receipts, apply, notify) {
+  const total = queue.prepare('SELECT COUNT(*) n FROM envelopes').get().n;
+  const counts = { total, scanned: 0, added: 0, alreadyImported: 0, quarantined: 0, partial: 0 };
+  const quarantine = [];
+  let firstProxyControllerGapSequence = null;
+  const packets = queue.prepare('SELECT sequence,id,payload FROM envelopes ORDER BY sequence');
+  db.exec('BEGIN IMMEDIATE');
+  try {
+    for (const row of packets.iterate()) {
+      const digest = packetDigest(row.payload);
+      let result;
+      try { result = apply(row, digest); }
+      catch (error) {
+        if (!(error instanceof InvalidLegacyPacket)) throw new Error(`migration_packet_failed:${lane}:${row.sequence}:${error.message}`, { cause: error });
+        result = { status: 'quarantined', issues: [{ reason: error.message }] };
+      }
+      counts[result.status]++;
+      counts.scanned++;
+      if (result.proxyControllerGap && firstProxyControllerGapSequence === null) {
+        firstProxyControllerGapSequence = row.sequence;
+        notify({ lane, phase: 'legacy_gap_accepted', sequence: row.sequence, reason: 'proxy_controller_unavailable' });
+      }
+      if (result.issues.length) {
+        const partial = result.status === 'added';
+        if (partial) counts.partial++;
+        const entry = { sequence: row.sequence, sha256: digest, partial, issues: result.issues };
+        quarantine.push(entry);
+        notify({ lane, phase: 'packet_quarantined', ...entry });
+      }
+      if (counts.scanned % 128 === 0) {
+        db.exec('COMMIT');
+        notify({ lane, phase: 'queue', ...counts });
+        db.exec('BEGIN IMMEDIATE');
+      }
+    }
+    db.exec('COMMIT');
+    if (counts.scanned !== total || counts.added + counts.alreadyImported + counts.quarantined !== total) {
+      throw new Error(`migration_queue_count_mismatch:${lane}`);
+    }
+    const read = db.prepare(`SELECT digest FROM ${receipts} WHERE id=?`);
+    const unreadable = new Map(quarantine.filter(row => !row.partial).map(row => [row.sequence, row.sha256]));
+    for (const row of packets.iterate()) {
+      const digest = unreadable.get(row.sequence) ?? read.get(row.id)?.digest;
+      if (digest !== packetDigest(row.payload)) throw new Error(`migration_receipt_missing:${lane}:${row.sequence}`);
+    }
+    return { counts, quarantine, firstProxyControllerGapSequence };
+  } catch (error) {
+    if (db.isTransaction) db.exec('ROLLBACK');
+    throw error;
+  }
+}
+
+async function replayLane(root, lane, dir, metadata, secrets, inputs, notify, resume) {
   const diag = lane === 'diagnostics';
   const store = diag ? new DiagnosticHistory(root, { directory: dir }) : new Store(dir);
   const db = store.db;
-  const key = diag ? crypto.createPrivateKey(secrets.privateKey) : null;
+  const key = diag ? crypto.createPrivateKey(secrets.privateKey) : undefined;
+  const signing = diag && metadata.capturePublicKey ? crypto.createPublicKey(metadata.capturePublicKey) : undefined;
+  const decode = row => decodeEnvelope(row, metadata.id, lane, key, signing);
   const receipts = diag ? 'imports' : 'vault_imports';
   const queueSHA256 = {};
-  let total = 0, scanned = 0, added = 0;
+  let counts = { total: 0, scanned: 0, added: 0, alreadyImported: 0, quarantined: 0, partial: 0 }, quarantine = [];
+  let firstProxyControllerGapSequence = null;
   try {
     if (diag) db.exec('CREATE TABLE IF NOT EXISTS imports(id TEXT PRIMARY KEY, digest TEXT NOT NULL)');
     else { store.vaultLane = lane; initializeImport(store); }
@@ -144,7 +327,7 @@ async function replayLane(root, lane, dir, metadata, secrets, inputs, notify) {
     if (inputs[`${lane}/ingest.sqlite`]) {
       // Use a private snapshot so even journal recovery cannot modify a legacy file.
       const localQueue = path.join(dir, 'migration-input.sqlite');
-      for (const suffix of ['', '-wal', '-shm', '-journal']) fs.rmSync(localQueue + suffix, { force: true });
+      for (const suffix of sidecars) fs.rmSync(localQueue + suffix, { force: true });
       for (const suffix of signatures) {
         if (!inputs[`${lane}/ingest.sqlite${suffix}`]) continue;
         queueSHA256[suffix || 'main'] = await copyVerified(queueFile + suffix, localQueue + suffix, lane + '/ingest.sqlite' + suffix);
@@ -152,33 +335,20 @@ async function replayLane(root, lane, dir, metadata, secrets, inputs, notify) {
       const queue = new DatabaseSync(localQueue);
       try {
         integrity(queue, lane + '/queue');
-        total = queue.prepare('SELECT COUNT(*) n FROM envelopes').get().n;
-        let batch = 0;
-        db.exec('BEGIN IMMEDIATE');
-        for (const row of queue.prepare('SELECT sequence,id,payload FROM envelopes ORDER BY sequence').iterate()) {
-          try { added += Number(diag ? importDiagnostic(store, row, metadata, key) : importEnvelope(store, row, metadata, secrets)); }
-          catch (error) { throw new Error(`migration_packet_failed:${lane}:${row.sequence}:${error.message}`, { cause: error }); }
-          scanned++;
-          if (++batch === 128) {
-            db.exec('COMMIT'); batch = 0;
-            notify({ lane, phase: 'queue', scanned, total, added });
-            db.exec('BEGIN IMMEDIATE');
-          }
-        }
-        db.exec('COMMIT');
-        const read = db.prepare(`SELECT digest FROM ${receipts} WHERE id=?`);
-        for (const row of queue.prepare('SELECT sequence,id,payload FROM envelopes').iterate()) {
-          if (read.get(row.id)?.digest !== crypto.createHash('sha256').update(row.payload).digest('hex')) throw new Error(`migration_receipt_missing:${lane}:${row.sequence}`);
-        }
-      } catch (error) { if (db.isTransaction) db.exec('ROLLBACK'); throw error; }
-      finally { queue.close(); }
-      for (const suffix of ['', '-wal', '-shm']) fs.rmSync(localQueue + suffix, { force: true });
+        if (resume) await restoreReplayState(root, lane, dir, resume.master, inputs, resume.originals, db, queue);
+        const apply = diag ? (row, digest) => importDiagnostic(store, row, digest, decode) :
+          (row, digest) => importEnvelope(store, row, digest, metadata, secrets);
+        ({ counts, quarantine, firstProxyControllerGapSequence } = replayQueue(queue, lane, db, receipts, apply, notify));
+      } finally { queue.close(); }
+      for (const suffix of sidecars) fs.rmSync(localQueue + suffix, { force: true });
+    } else if (resume) {
+      await restoreReplayState(root, lane, dir, resume.master, inputs, resume.originals, db);
     }
     let attachments = 0;
     if (diag) {
       for (const relative of Object.keys(inputs).filter(relative => relative.startsWith('diagnostics/attachments/'))) {
         const id = path.basename(relative, '.sealed');
-        const value = decodeDiagnostic({ id, payload: fs.readFileSync(path.join(root, relative)) }, metadata, key);
+        const value = decode({ id, payload: fs.readFileSync(path.join(root, relative)) });
         const bytes = Buffer.from(value.bytes, 'base64');
         if (bytes.toString('base64') !== value.bytes) throw new Error('migration_attachment_encoding_failed');
         store.putAttachment(id, value.from, value.to, bytes);
@@ -190,12 +360,11 @@ async function replayLane(root, lane, dir, metadata, secrets, inputs, notify) {
       const preferencesPath = `${lane}/capture-preferences.json`;
       if (inputs[preferencesPath]) {
         const current = JSON.parse(fs.readFileSync(path.join(root, preferencesPath), 'utf8'));
-        for (const pref of ['harnessApps', 'captureMode', 'retentionDays', 'alertMBPerMinute', 'budget']) {
+        for (const pref of capturePreferences) {
           if (Object.hasOwn(current, pref)) store.set(pref, current[pref]);
         }
       }
     }
-    if (scanned !== total) throw new Error(`migration_queue_count_mismatch:${lane}`);
     // Receipts, workflow cursors, and deleted date ranges only serve the old importer.
     // The unchanged original files still contain them for audit and rollback.
     for (const name of [receipts, 'vault_gap_ids', 'vault_deletions', 'vault_migration']) db.exec(`DROP TABLE IF EXISTS ${ident(name)}`);
@@ -203,11 +372,11 @@ async function replayLane(root, lane, dir, metadata, secrets, inputs, notify) {
       notify({ lane, phase: 'rebuild_for_incremental_vacuum' });
       db.exec('PRAGMA wal_checkpoint(TRUNCATE); PRAGMA journal_mode=DELETE; PRAGMA auto_vacuum=INCREMENTAL; VACUUM; PRAGMA journal_mode=WAL');
     }
-    integrity(db, lane);
+    integrity(db, lane, { quick: Boolean(resume) });
     const after = metrics(db, lane);
     const check = db.prepare('PRAGMA wal_checkpoint(TRUNCATE)').get();
     if (check.busy || db.prepare('PRAGMA journal_mode').get().journal_mode !== 'wal') throw new Error(`migration_wal_verification_failed:${lane}`);
-    return { queue: { total, scanned, added, alreadyImported: total - added }, queueSHA256, attachments, after };
+    return { queue: counts, queueSHA256, quarantine, firstProxyControllerGapSequence, attachments, after };
   } finally { store.close(); }
 }
 
@@ -219,6 +388,9 @@ export async function migrateHistory(root, credential, { notify = () => {} } = {
   const master = Buffer.from(secrets.master, 'base64');
   const output = path.join(root, MIGRATED_HISTORY), outputManifest = path.join(output, HISTORY_MANIFEST);
   try {
+    if (master.length !== 32 || !crypto.createPublicKey(crypto.createPrivateKey(secrets.privateKey)).equals(crypto.createPublicKey(metadata.publicKey))) {
+      throw new Error('migration_vault_key_mismatch');
+    }
     if (fs.existsSync(output)) {
       const prior = JSON.parse(fs.readFileSync(outputManifest, 'utf8'));
       if (prior.version !== 1 || prior.vaultId !== metadata.id || !prior.verified || JSON.stringify(prior.inputs) !== JSON.stringify(inputs)) {
@@ -236,20 +408,40 @@ export async function migrateHistory(root, credential, { notify = () => {} } = {
     if (fs.realpathSync(stage).toLowerCase() !== stage.toLowerCase()) throw new Error('unsafe_migration_stage');
     const stateFile = path.join(stage, HISTORY_MANIFEST);
     const manifest = fs.existsSync(stateFile) ? JSON.parse(fs.readFileSync(stateFile, 'utf8')) : { version: 1, vaultId: metadata.id, verified: false, inputs, lanes: {} };
-    if (manifest.vaultId !== metadata.id || JSON.stringify(manifest.inputs) !== JSON.stringify(inputs)) throw new Error('migration_input_changed');
+    if (manifest.version !== 1 || manifest.vaultId !== metadata.id || JSON.stringify(manifest.inputs) !== JSON.stringify(inputs)) throw new Error('migration_input_changed');
+    const candidates = [{ directory: stage, manifest }, ...earlierStages(root, stage, metadata.id, notify)];
     for (const lane of HISTORY_LANES) {
       const dir = path.join(stage, lane);
       fs.mkdirSync(dir, { recursive: true });
       if (fs.realpathSync(dir).toLowerCase() !== dir.toLowerCase()) throw new Error('unsafe_migration_lane');
       const target = path.join(dir, historyFilename(lane));
-      if (await matchesVerifiedOutput(target, manifest.lanes[lane]?.outputSHA256)) {
-        notify({ lane, phase: 'resume_verified_lane' }); continue;
+      const previous = await reusableLane(root, lane, inputs, candidates, notify);
+      if (previous && !previous.replay) {
+        const { target: priorTarget, checkpoint, replay, ...verified } = previous;
+        if (priorTarget !== target) {
+          for (const suffix of sidecars) fs.rmSync(target + suffix, { force: true });
+          await copyVerified(priorTarget, target, `${lane}/verified_checkpoint`, verified.outputSHA256);
+          manifest.lanes[lane] = verified;
+          writeJson(stateFile, manifest);
+        }
+        notify({ lane, phase: 'resume_verified_lane', checkpoint, queue: verified.queue });
+        continue;
       }
-      const original = await convertDatabase(root, lane, dir, master, inputs, notify);
-      const result = await replayLane(root, lane, dir, metadata, secrets, inputs, notify);
+      let original, resume;
+      if (previous) {
+        notify({ lane, phase: 'resume_verified_base', checkpoint: previous.checkpoint, previousQueue: previous.queue.total });
+        for (const suffix of sidecars) fs.rmSync(target + suffix, { force: true });
+        await copyVerified(previous.target, target, `${lane}/verified_checkpoint`, previous.outputSHA256);
+        original = { before: previous.before, originals: previous.originals };
+        resume = { master, originals: previous.originals };
+      } else {
+        original = await convertDatabase(root, lane, dir, master, inputs, notify);
+      }
+      const result = await replayLane(root, lane, dir, metadata, secrets, inputs, notify, resume);
       manifest.lanes[lane] = { ...original, ...result, outputSHA256: await sha(target) };
       writeJson(stateFile, manifest);
-      notify({ lane, phase: 'verified', ...result });
+      const { quarantine, ...verified } = result;
+      notify({ lane, phase: 'verified', ...verified });
     }
     if (JSON.stringify(legacyInputs(root)) !== JSON.stringify(inputs)) throw new Error('migration_input_changed_during_run');
     manifest.verified = true;

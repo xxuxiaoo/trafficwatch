@@ -1,6 +1,6 @@
 {
   "name": "trafficwatch",
-  "version": "0.10.16",
+  "version": "0.10.17",
   "private": true,
   "description": "Windows traffic history for all observed applications, Clash/Mihomo proxy traffic and AI coding harnesses.",
   "type": "module",

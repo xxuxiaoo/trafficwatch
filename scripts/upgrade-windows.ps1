@@ -65,10 +65,6 @@ if ($Preflight) {
     exit 0
 }
 if (-not $admin) { throw 'Open Windows PowerShell as administrator and run this same upgrade command. No process has been stopped.' }
-$taskState=@(Get-ScheduledTask -TaskName $taskNames | ForEach-Object {
-    [pscustomobject]@{Name=$_.TaskName;Running=$_.State -eq 'Running';Enabled=$_.Settings.Enabled}
-})
-if ($taskState.Count -ne $taskNames.Count) { throw 'Existing TrafficWatch tasks are incomplete.' }
 
 function Invoke-Migration([Security.SecureString]$Password) {
     $info=[Diagnostics.ProcessStartInfo]::new()
@@ -105,7 +101,7 @@ function Protect-HistoryRoot([Security.Principal.SecurityIdentifier]$Owner) {
 
 function Restore-Tasks {
     $stop=Join-Path $dataRoot 'stop.request'
-    if ($oldStop) { [IO.File]::WriteAllBytes($stop,$oldStop) }
+    if ($null -ne $oldStop) { [IO.File]::WriteAllBytes($stop,$oldStop) }
     elseif (Test-Path -LiteralPath $stop) { Remove-Item -LiteralPath $stop -Force }
     foreach ($task in $taskState) {
         if (-not $task.Running) { continue }
@@ -138,20 +134,33 @@ function Stop-TrafficWatch {
 }
 
 $stopPath=Join-Path $dataRoot 'stop.request'
-$oldStop=if (Test-Path -LiteralPath $stopPath) { [IO.File]::ReadAllBytes($stopPath) } else { $null }
 $stamp=[guid]::NewGuid().ToString('N')
 $newApp=Join-Path $programs ('TrafficWatch.stage.'+$stamp)
 $rollback=Join-Path $programs ('TrafficWatch.rollback.'+$stamp)
 $failed=Join-Path $programs ('TrafficWatch.failed.'+$stamp)
 $manifest=Get-Content -LiteralPath (Join-Path $packageRoot 'release-manifest.json') -Raw -Encoding UTF8 | ConvertFrom-Json
-$originalAcl=Get-Acl -LiteralPath $dataRoot
 $owner=[Security.Principal.SecurityIdentifier]::new([string]$settings.OwnerSid)
-$credential=if ($needsMigration) { Read-Host 'Old TrafficWatch password or recovery code (one time)' -AsSecureString } else { $null }
+$credential=$null
+$upgradeLock=[Threading.Mutex]::new($false,'Global\TrafficWatch.Upgrade')
+$ownsUpgradeLock=$false
 $stopped=$false
 $movedOld=$false
 $movedNew=$false
 $aclChanged=$false
 try {
+    try { $ownsUpgradeLock=$upgradeLock.WaitOne(0) }
+    catch [Threading.AbandonedMutexException] { $ownsUpgradeLock=$true }
+    if (-not $ownsUpgradeLock) { throw 'Another TrafficWatch upgrade is in progress.' }
+    $installed=Get-Content -LiteralPath (Join-Path $installRoot 'package.json') -Raw -Encoding UTF8 | ConvertFrom-Json
+    if ($installed.version -ne $old.version) { throw 'The installed version changed during preflight. Run preflight again.' }
+    $taskState=@(Get-ScheduledTask -TaskName $taskNames | ForEach-Object {
+        [pscustomobject]@{Name=$_.TaskName;Running=$_.State -eq 'Running';Enabled=$_.Settings.Enabled}
+    })
+    if ($taskState.Count -ne $taskNames.Count) { throw 'Existing TrafficWatch tasks are incomplete.' }
+    $oldStop=$null
+    if (Test-Path -LiteralPath $stopPath) { $oldStop=[IO.File]::ReadAllBytes($stopPath) }
+    $originalAcl=Get-Acl -LiteralPath $dataRoot
+    if ($needsMigration) { $credential=Read-Host 'Old TrafficWatch password or recovery code (one time)' -AsSecureString }
     [IO.Directory]::CreateDirectory($newApp) | Out-Null
     foreach ($entry in $manifest.files) {
         $relative=[string]$entry.path
@@ -174,8 +183,18 @@ try {
     Stop-TrafficWatch
     Protect-HistoryRoot $owner
     $aclChanged=$true
-    if ($needsMigration) { Invoke-Migration $credential }
-    if ($needsMigration -and -not (Test-Path -LiteralPath (Join-Path $historyDir 'migration.json') -PathType Leaf)) { throw 'Verified history manifest not found.' }
+    if ($needsMigration) {
+        Invoke-Migration $credential
+        $historyManifest=Join-Path $historyDir 'migration.json'
+        $verifiedHistory=Get-Content -LiteralPath $historyManifest -Raw -Encoding UTF8 | ConvertFrom-Json
+        if ($verifiedHistory.verified -ne $true) { throw 'Verified history manifest not found.' }
+        foreach ($lane in $verifiedHistory.lanes.PSObject.Properties) {
+            $queue=$lane.Value.queue
+            if ($queue.quarantined -or $queue.partial) {
+                Write-Warning "History $($lane.Name) queue: $($queue.quarantined) quarantined packets, $($queue.partial) partially imported packets. Original queue retained. See $historyManifest"
+            }
+        }
+    }
     [IO.Directory]::Move($installRoot,$rollback)
     $movedOld=$true
     [IO.Directory]::Move($newApp,$installRoot)
@@ -232,4 +251,6 @@ try {
     throw "TrafficWatch upgrade did not finish. $problem"
 } finally {
     if ($credential) { $credential.Dispose() }
+    if ($ownsUpgradeLock) { $upgradeLock.ReleaseMutex() }
+    $upgradeLock.Dispose()
 }
