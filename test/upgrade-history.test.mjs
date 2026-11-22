@@ -13,7 +13,8 @@ const laneFiles = { windows: 'monitor.sqlite', clash: 'monitor.sqlite', diagnost
 
 function plan(dir, version) {
   const command = "$ErrorActionPreference='Stop'; . $env:TW_TEST_HISTORY_HELPER; " +
-    'Get-UpgradeHistoryPlan $env:TW_TEST_DATA_ROOT ([version]$env:TW_TEST_INSTALLED_VERSION) | ConvertTo-Json -Compress';
+    'try { Get-UpgradeHistoryPlan $env:TW_TEST_DATA_ROOT ([version]$env:TW_TEST_INSTALLED_VERSION) | ConvertTo-Json -Compress } ' +
+    'catch { [Console]::Error.WriteLine($_.Exception.Message); exit 1 }';
   const result = spawnSync('powershell.exe', ['-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-Command', command], {
     encoding: 'utf8', windowsHide: true, timeout: 8000,
     env: { ...process.env, TW_TEST_HISTORY_HELPER: helper, TW_TEST_DATA_ROOT: dir, TW_TEST_INSTALLED_VERSION: version },
