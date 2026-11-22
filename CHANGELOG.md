@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.10.19
+
+- Use the SQLite WAL health response when opening TrafficWatch from the desktop or tray. Reuse the running viewer and report startup exits, timeouts and unexpected listeners separately.
+- Recognize verified plaintext history before checking for retained encrypted backups. Subsequent upgrades keep the active history in place and skip the old password and migration.
+
 ## 0.10.18
 
 - Keep the collector's HTTP listener responsive while SQLite opens, prepares indexes or writes traffic. Wait for the collector to report readiness before accepting an upgrade, and report startup stages and log tails when a check fails.

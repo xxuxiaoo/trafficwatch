@@ -7,6 +7,8 @@ $systemShell=Join-Path $env:SystemRoot 'System32\WindowsPowerShell\v1.0\powershe
 $taskNames=@('TrafficWatch - Open-source Netwatch','TrafficWatch - Tray','TrafficWatch - AI diagnostics','TrafficWatch - Relay physical bypass')
 $ports=@(43128,43130,43131,43132)
 . (Join-Path $PSScriptRoot 'upgrade-health.ps1')
+. (Join-Path $PSScriptRoot 'upgrade-history.ps1')
+. (Join-Path $PSScriptRoot 'upgrade-program.ps1')
 
 if ($packageRoot -eq $installRoot -or $packageRoot.StartsWith($installRoot+'\',[StringComparison]::OrdinalIgnoreCase)) {
     throw 'Run the upgrade from the extracted new package outside Program Files\TrafficWatch.'
@@ -32,8 +34,8 @@ foreach ($target in @($installRoot,$dataRoot,$packageRoot)) {
 $identity=[Security.Principal.WindowsIdentity]::GetCurrent()
 $principal=[Security.Principal.WindowsPrincipal]::new($identity)
 $admin=$principal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
-$legacyFile=Join-Path $dataRoot 'vault\vault.json'
-$needsMigration=Test-Path -LiteralPath $legacyFile -PathType Leaf
+$historyPlan=Get-UpgradeHistoryPlan $dataRoot ([version]$old.version)
+$needsMigration=$historyPlan.Mode -eq 'legacy-encrypted'
 $historyDir=Join-Path $dataRoot 'history-v2'
 $drive=[IO.DriveInfo]::new([IO.Path]::GetPathRoot($dataRoot))
 $inputBytes=0L
@@ -48,7 +50,7 @@ if ($needsMigration) {
     }
 }
 $migrationSpace=if ($needsMigration) { $inputBytes * 4 + 1GB } else { 0 }
-[ordered]@{installed=$old.version;candidate=$new.version;administrator=$admin;program=$installRoot;history=$dataRoot;legacyPasswordRequired=[bool]$needsMigration;inputBytes=$inputBytes;freeBytes=$drive.AvailableFreeSpace;migrationSpace=$migrationSpace} | ConvertTo-Json
+[ordered]@{installed=$old.version;candidate=$new.version;administrator=$admin;program=$installRoot;history=$dataRoot;historyMode=$historyPlan.Mode;verifiedLanes=$historyPlan.Lanes;legacyPasswordRequired=$needsMigration;inputBytes=$inputBytes;freeBytes=$drive.AvailableFreeSpace;migrationSpace=$migrationSpace} | ConvertTo-Json
 if ($drive.AvailableFreeSpace -lt $migrationSpace) { throw 'Insufficient free space for separately verified history and recovery files.' }
 if ($Preflight) {
     foreach ($name in $taskNames) {
@@ -117,6 +119,12 @@ function Restore-Tasks {
 }
 
 function Write-StartupLogs {
+    $viewerLog=Join-Path ([Environment]::GetFolderPath('LocalApplicationData')) 'TrafficWatch\logs\overview-launch.log'
+    if (Test-Path -LiteralPath $viewerLog -PathType Leaf) {
+        Write-Host 'TrafficWatch overview startup log'
+        try { Get-Content -LiteralPath $viewerLog -Encoding UTF8 -Tail 10 | Write-Host }
+        catch { Write-Warning "Could not read overview startup log - $($_.Exception.Message)" }
+    }
     foreach ($relative in @('supervisor.log','windows\collector.log','windows\collector-error.log',
         'clash\collector.log','clash\collector-error.log','diagnostics\daemon.log','diagnostics\daemon-error.log')) {
         $file=Join-Path $dataRoot $relative
@@ -145,7 +153,6 @@ $stamp=[guid]::NewGuid().ToString('N')
 $newApp=Join-Path $programs ('TrafficWatch.stage.'+$stamp)
 $rollback=Join-Path $programs ('TrafficWatch.rollback.'+$stamp)
 $failed=Join-Path $programs ('TrafficWatch.failed.'+$stamp)
-$manifest=Get-Content -LiteralPath (Join-Path $packageRoot 'release-manifest.json') -Raw -Encoding UTF8 | ConvertFrom-Json
 $owner=[Security.Principal.SecurityIdentifier]::new([string]$settings.OwnerSid)
 $credential=$null
 $upgradeLock=[Threading.Mutex]::new($false,'Global\TrafficWatch.Upgrade')
@@ -160,37 +167,29 @@ try {
     if (-not $ownsUpgradeLock) { throw 'Another TrafficWatch upgrade is in progress.' }
     $installed=Get-Content -LiteralPath (Join-Path $installRoot 'package.json') -Raw -Encoding UTF8 | ConvertFrom-Json
     if ($installed.version -ne $old.version) { throw 'The installed version changed during preflight. Run preflight again.' }
+    $currentHistoryPlan=Get-UpgradeHistoryPlan $dataRoot ([version]$installed.version)
+    if ($currentHistoryPlan.Mode -ne $historyPlan.Mode) { throw 'The history layout changed during preflight. Run preflight again.' }
     $taskState=@(Get-ScheduledTask -TaskName $taskNames | ForEach-Object {
         [pscustomobject]@{Name=$_.TaskName;Running=$_.State -eq 'Running';Enabled=$_.Settings.Enabled}
     })
     if ($taskState.Count -ne $taskNames.Count) { throw 'Existing TrafficWatch tasks are incomplete.' }
     $oldStop=$null
     if (Test-Path -LiteralPath $stopPath) { $oldStop=[IO.File]::ReadAllBytes($stopPath) }
-    $originalAcl=Get-Acl -LiteralPath $dataRoot
-    if ($needsMigration) { $credential=Read-Host 'Old TrafficWatch password or recovery code (one time)' -AsSecureString }
-    [IO.Directory]::CreateDirectory($newApp) | Out-Null
-    foreach ($entry in $manifest.files) {
-        $relative=[string]$entry.path
-        $source=[IO.Path]::GetFullPath((Join-Path $packageRoot $relative))
-        $destination=[IO.Path]::GetFullPath((Join-Path $newApp $relative))
-        if (-not $source.StartsWith($packageRoot+'\',[StringComparison]::OrdinalIgnoreCase) -or
-            -not $destination.StartsWith($newApp+'\',[StringComparison]::OrdinalIgnoreCase)) { throw 'Unsafe manifest path.' }
-        [IO.Directory]::CreateDirectory((Split-Path -Parent $destination)) | Out-Null
-        Copy-Item -LiteralPath $source -Destination $destination
-        if ((Get-FileHash -LiteralPath $destination -Algorithm SHA256).Hash.ToLowerInvariant() -ne $entry.sha256) {
-            throw "Staged file failed hash verification: $relative"
-        }
+    if ($needsMigration) {
+        $originalAcl=Get-Acl -LiteralPath $dataRoot
+        $credential=Read-Host 'Old TrafficWatch password or recovery code (one time)' -AsSecureString
+    } elseif ($historyPlan.Mode -eq 'verified-plain') {
+        Write-Host 'Keeping the verified plaintext history in place. No password or history conversion is needed.'
     }
-    Copy-Item -LiteralPath (Join-Path $packageRoot 'release-manifest.json') -Destination $newApp
-    foreach ($name in @('suite-settings.json','config.local.json')) {
-        $file=Join-Path $installRoot $name
-        if (Test-Path -LiteralPath $file -PathType Leaf) { Copy-Item -LiteralPath $file -Destination $newApp }
-    }
+    $stageTimer=[Diagnostics.Stopwatch]::StartNew()
+    Copy-TrafficWatchUpgradeStage $packageRoot $installRoot $newApp
+    Write-Host "TrafficWatch program staged and verified in $($stageTimer.ElapsedMilliseconds)ms."
+    $restartTimer=[Diagnostics.Stopwatch]::StartNew()
     $stopped=$true
     Stop-TrafficWatch
-    Protect-HistoryRoot $owner
-    $aclChanged=$true
     if ($needsMigration) {
+        Protect-HistoryRoot $owner
+        $aclChanged=$true
         Invoke-Migration $credential
         $historyManifest=Join-Path $historyDir 'migration.json'
         $verifiedHistory=Get-Content -LiteralPath $historyManifest -Raw -Encoding UTF8 | ConvertFrom-Json
@@ -218,6 +217,7 @@ try {
     if ($trayExpected -and -not (Get-Process -Name 'TrafficWatch-Tray' -ErrorAction SilentlyContinue | Where-Object Path -eq (Join-Path $installRoot 'TrafficWatch-Tray.exe'))) {
         throw 'Updated tray process was not found.'
     }
+    if (-not $needsMigration) { Write-Host "TrafficWatch stopped, replaced and checked in $($restartTimer.ElapsedMilliseconds)ms." }
     Write-Host "TrafficWatch $($new.version) installed. Previous program: $rollback. Original history retained at $dataRoot."
 } catch {
     $problem=$_.Exception.Message

@@ -106,11 +106,13 @@ try {
   const viewPort = overviewPort(port);
   step(`start isolated demo on ${port}, overview on ${viewPort}`);
   host = launch();
-  await until(
-    async () => /^[a-f0-9]{64}$/.test((await health())?.desktopInstance || ''),
+  let first;
+  await until(async () => {
+    first = await health();
+    return first?.startupStage === 'ready' && first.state === 'connected' && /^[a-f0-9]{64}$/.test(first.desktopInstance || '');
+  },
     'Desktop collector readiness timeout',
   );
-  const first = await health();
   observedToken = first.desktopInstance;
   assert.equal(first.demo, true);
   assert.equal(first.app, 'codex-flow');
@@ -169,8 +171,10 @@ try {
     6000,
   );
   await command('--start');
-  await until(
-    async () => (await health())?.desktopInstance === first.desktopInstance,
+  await until(async () => {
+    const restarted = await health();
+    return restarted?.startupStage === 'ready' && restarted.state === 'connected' && restarted.desktopInstance === first.desktopInstance;
+  },
     'Tray restart failed',
   );
   step('exit tray and confirm collector stops');

@@ -4,6 +4,7 @@ using System.ComponentModel;
 using System.Diagnostics;
 using System.IO;
 using System.Net;
+using System.Net.NetworkInformation;
 using System.Reflection;
 using System.Runtime.InteropServices;
 using System.Threading;
@@ -26,7 +27,7 @@ internal sealed class ControlSnapshot
 
 internal static class ControlBackend
 {
-    internal static readonly string Root = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.ProgramFiles), "TrafficWatch");
+    internal static readonly string Root = AppDomain.CurrentDomain.BaseDirectory;
     internal const string BackgroundTask = "TrafficWatch - Open-source Netwatch";
     internal const string TrayTask = "TrafficWatch - Tray";
     internal static readonly string PowerShell = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.System), @"WindowsPowerShell\v1.0\powershell.exe");
@@ -168,51 +169,163 @@ internal static class ControlBackend
             { UseShellExecute = false, CreateNoWindow = true, WorkingDirectory = Root, WindowStyle = ProcessWindowStyle.Hidden })) { }
     }
 
-    private static bool OverviewReady()
+    private enum OverviewState { Ready, Unavailable, UnexpectedResponse }
+
+    private static OverviewState ProbeOverview(string url, out string detail)
+    {
+        detail = "HTTP 200";
+        try
+        {
+            HttpWebRequest request = (HttpWebRequest)WebRequest.Create(url + "api/health");
+            request.Proxy = null; request.Timeout = 900; request.ReadWriteTimeout = 900;
+            request.AllowAutoRedirect = false; request.KeepAlive = false;
+            using (new System.Threading.Timer(_ => request.Abort(), null, 1200, Timeout.Infinite))
+            using (HttpWebResponse response = (HttpWebResponse)request.GetResponse())
+            using (StreamReader reader = new StreamReader(response.GetResponseStream()))
+            {
+                if (response.StatusCode != HttpStatusCode.OK)
+                {
+                    detail = "HTTP " + (int)response.StatusCode;
+                    return OverviewState.UnexpectedResponse;
+                }
+                char[] buffer = new char[8193]; int count = reader.ReadBlock(buffer, 0, buffer.Length);
+                if (count > 8192)
+                {
+                    detail = "健康响应过大";
+                    return OverviewState.UnexpectedResponse;
+                }
+                var health = new JavaScriptSerializer().Deserialize<Dictionary<string, object>>(new string(buffer, 0, count));
+                object app, storage, version, pid, singleCollector;
+                if (health != null && health.TryGetValue("app", out app) && Object.Equals(app, "trafficwatch-overview")
+                    && health.TryGetValue("storage", out storage) && Object.Equals(storage, "sqlite-wal")
+                    && health.TryGetValue("version", out version) && !String.IsNullOrWhiteSpace(version as string)
+                    && health.TryGetValue("collectorPid", out pid) && pid is int && (int)pid > 0
+                    && health.TryGetValue("singleCollector", out singleCollector) && singleCollector == null)
+                    return OverviewState.Ready;
+                detail = "健康响应与已安装版 TrafficWatch 不匹配";
+                return OverviewState.UnexpectedResponse;
+            }
+        }
+        catch (WebException error)
+        {
+            using (var response = error.Response as HttpWebResponse)
+            {
+                detail = response == null ? error.Status.ToString() : "HTTP " + (int)response.StatusCode;
+                return response == null ? OverviewState.Unavailable : OverviewState.UnexpectedResponse;
+            }
+        }
+        catch (IOException error)
+        {
+            detail = error.GetBaseException().Message;
+            return OverviewState.Unavailable;
+        }
+        catch (ArgumentException)
+        {
+            detail = "健康响应不是有效的 JSON 对象";
+            return OverviewState.UnexpectedResponse;
+        }
+        catch (InvalidOperationException)
+        {
+            detail = "健康响应不是有效的 JSON 对象";
+            return OverviewState.UnexpectedResponse;
+        }
+    }
+
+    private static bool HasOverviewListener(int port)
+    {
+        foreach (IPEndPoint endpoint in IPGlobalProperties.GetIPGlobalProperties().GetActiveTcpListeners())
+            if (endpoint.Port == port && (endpoint.Address.Equals(IPAddress.Loopback) || endpoint.Address.Equals(IPAddress.Any)
+                || endpoint.Address.Equals(IPAddress.IPv6Any) || endpoint.Address.Equals(IPAddress.Loopback.MapToIPv6()))) return true;
+        return false;
+    }
+
+    private static void WriteOverviewLog(string filename, string message)
     {
         try
         {
-            HttpWebRequest request = (HttpWebRequest)WebRequest.Create("http://127.0.0.1:43131/api/health");
-            request.Proxy = null; request.Timeout = 500; request.ReadWriteTimeout = 500;
-            request.AllowAutoRedirect = false; request.KeepAlive = false;
-            using (WebResponse response = request.GetResponse())
-            using (StreamReader reader = new StreamReader(response.GetResponseStream()))
+            Directory.CreateDirectory(Path.GetDirectoryName(filename));
+            File.AppendAllText(filename, DateTime.UtcNow.ToString("o") + " [launcher] " + message + Environment.NewLine);
+        }
+        catch (Exception error)
+        {
+            Console.Error.WriteLine("Cannot write overview startup log: " + error.Message);
+        }
+    }
+
+    private static void EnsureOverview(string url, int port, string log)
+    {
+        using (Mutex mutex = new Mutex(false, @"Local\TrafficWatch-Overview-Launcher-" + port))
+        {
+            bool owner;
+            try { owner = mutex.WaitOne(20000); } catch (AbandonedMutexException) { owner = true; }
+            if (!owner) throw new TimeoutException("已有请求正在打开流量中心，请稍后重试。日志：" + log);
+            Process child = null;
+            var timer = Stopwatch.StartNew();
+            try
             {
-                char[] buffer = new char[8193]; int count = reader.ReadBlock(buffer, 0, buffer.Length);
-                if (count > 8192) return false;
-                var data = new JavaScriptSerializer().Deserialize<Dictionary<string, object>>(new string(buffer, 0, count));
-                object app, readOnly;
-                return data.TryGetValue("app", out app) && Convert.ToString(app) == "trafficwatch-overview"
-                    && data.TryGetValue("readOnly", out readOnly) && Object.Equals(readOnly, true);
+                string detail = "尚未监听";
+                do
+                {
+                    bool listening = HasOverviewListener(port);
+                    if (listening)
+                    {
+                        var state = ProbeOverview(url, out detail);
+                        if (state == OverviewState.Ready)
+                        {
+                            if (child != null) WriteOverviewLog(log, "ready port=" + port + " elapsedMs=" + timer.ElapsedMilliseconds);
+                            return;
+                        }
+                        if (state == OverviewState.UnexpectedResponse)
+                            throw new InvalidOperationException("端口 " + port + " 上的服务返回了意外响应（" + detail + "）。日志：" + log);
+                    }
+                    if (child != null && child.HasExited)
+                        throw new InvalidOperationException("流量中心启动进程已退出（退出码 " + child.ExitCode + "）。日志：" + log);
+                    if (child == null && !listening)
+                    {
+                        string node = Path.Combine(Root, @"runtime\node.exe");
+                        string script = Path.Combine(Root, @"src\overview-server.mjs");
+                        if (!File.Exists(node) || !File.Exists(script)) throw new FileNotFoundException("流量中心程序文件缺失，请重新安装。");
+                        var info = new ProcessStartInfo(node, "--disable-warning=ExperimentalWarning \"" + script + "\"")
+                            { UseShellExecute = false, CreateNoWindow = true, WorkingDirectory = Root, WindowStyle = ProcessWindowStyle.Hidden };
+                        info.EnvironmentVariables["TRAFFICWATCH_OVERVIEW_PORT"] = port.ToString(System.Globalization.CultureInfo.InvariantCulture);
+                        info.EnvironmentVariables["TRAFFICWATCH_OVERVIEW_LOG"] = log;
+                        WriteOverviewLog(log, "starting viewer port=" + port);
+                        child = Process.Start(info);
+                    }
+                    Thread.Sleep(100);
+                } while (timer.ElapsedMilliseconds < 15000);
+                throw new TimeoutException("流量中心在端口 " + port + " 上等候健康响应超时（" + detail + "）。日志：" + log);
+            }
+            finally
+            {
+                if (child != null) child.Dispose();
+                mutex.ReleaseMutex();
             }
         }
-        catch { return false; }
     }
 
     internal static void OpenOverview(bool openBrowser = true)
     {
-        using (Mutex mutex = new Mutex(false, @"Local\TrafficWatch-Overview-Launcher"))
+        string configuredPort = Environment.GetEnvironmentVariable("TRAFFICWATCH_OVERVIEW_PORT");
+        int port = 43131;
+        if (!String.IsNullOrEmpty(configuredPort) && (!Int32.TryParse(configuredPort, out port) || port < 1024 || port > 65535))
+            throw new ArgumentException("流量中心端口须在 1024 到 65535 之间。");
+        string url = "http://127.0.0.1:" + port + "/";
+        string log = Environment.GetEnvironmentVariable("TRAFFICWATCH_OVERVIEW_LOG");
+        if (String.IsNullOrWhiteSpace(log))
+            log = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), @"TrafficWatch\logs\overview-launch.log");
+        log = Path.GetFullPath(log);
+        try
         {
-            bool owner;
-            try { owner = mutex.WaitOne(6000); } catch (AbandonedMutexException) { owner = true; }
-            if (!owner) throw new TimeoutException("简洁总览正在启动，请稍后重试。");
-            try
-            {
-                if (!OverviewReady())
-                {
-                    string node = Path.Combine(Root, @"runtime\node.exe");
-                    string script = Path.Combine(Root, @"src\overview-server.mjs");
-                    if (!File.Exists(node) || !File.Exists(script)) throw new FileNotFoundException("简洁总览程序文件缺失，请重新安装。");
-                    using (Process child = Process.Start(new ProcessStartInfo(node, "--disable-warning=ExperimentalWarning \"" + script + "\"")
-                        { UseShellExecute = false, CreateNoWindow = true, WorkingDirectory = Root, WindowStyle = ProcessWindowStyle.Hidden })) { }
-                    DateTime deadline = DateTime.UtcNow.AddSeconds(6);
-                    while (!OverviewReady() && DateTime.UtcNow < deadline) Thread.Sleep(120);
-                    if (!OverviewReady()) throw new InvalidOperationException("流量中心未能启动。请检查 43131 端口是否被占用。");
-                }
-            }
-            finally { mutex.ReleaseMutex(); }
+            EnsureOverview(url, port, log);
+            if (openBrowser && Environment.GetEnvironmentVariable("NETWATCH_TEST_SILENT") != "1")
+                using (Process browser = Process.Start(new ProcessStartInfo(url) { UseShellExecute = true })) { }
         }
-        if (openBrowser) Process.Start(new ProcessStartInfo("http://127.0.0.1:43131/") { UseShellExecute = true });
+        catch (Exception error)
+        {
+            WriteOverviewLog(log, "port=" + port + " " + error.Message);
+            throw;
+        }
     }
 
 }
@@ -222,7 +335,8 @@ internal static class ControlEntry
     [STAThread]
     private static int Main(string[] args)
     {
-        bool command = args.Length > 0 && (args[0] == "--action" || args[0] == "--status" || args[0] == "--ensure-overview");
+        bool command = Environment.GetEnvironmentVariable("NETWATCH_TEST_SILENT") == "1" ||
+            args.Length > 0 && (args[0] == "--action" || args[0] == "--status" || args[0] == "--ensure-overview");
         try
         {
             using (Process self = Process.GetCurrentProcess()) if (self.SessionId == 0) return 4;
@@ -245,6 +359,7 @@ internal static class ControlEntry
         {
             if (error.NativeErrorCode == 1223) return 3;
             if (!command) MessageBox.Show(error.Message, "流量中心", MessageBoxButtons.OK, MessageBoxIcon.Error);
+            else Console.Error.WriteLine(error.GetType().Name + ": " + error.Message);
             return 1;
         }
         catch (Exception error)

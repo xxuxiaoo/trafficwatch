@@ -396,10 +396,30 @@ function close() {
   process.removeListener('SIGINT',close);process.removeListener('SIGTERM',close);
   return Promise.all([maintenance.close(), fullReader.close(), quickReader.close(), detailReader.close()]);
 }
-server.on('error', () => {maintenance.close(); fullReader.close(); quickReader.close();detailReader.close(); process.exit(1); });
 server.listen(port, '127.0.0.1', () => { if (settings.DataRoot && !maintenance.worker) maintenance.start(); });
 process.once('SIGINT', close);
 process.once('SIGTERM', close);
 return {server,close};
 }
-if(process.argv[1]&&path.resolve(process.argv[1])===fileURLToPath(import.meta.url))startOverviewServer();
+
+if (process.argv[1] && path.resolve(process.argv[1]) === fileURLToPath(import.meta.url)) {
+  const reportStartupFailure = error => {
+    // JSON parse errors can quote parts of local settings. Log only their type.
+    const detail = error instanceof SyntaxError ? 'invalid settings JSON' : error.message;
+    const message = `TrafficWatch overview startup failed: ${detail}`;
+    console.error(message);
+    process.exitCode = 1;
+    const log = process.env.TRAFFICWATCH_OVERVIEW_LOG;
+    if (log) {
+      try { fs.appendFileSync(log, `${new Date().toISOString()} [viewer] ${message}\n`); }
+      catch (logError) { console.error('Could not write overview startup log:', logError.message); }
+    }
+  };
+  try {
+    const {server, close} = startOverviewServer();
+    server.once('error', error => {
+      reportStartupFailure(error);
+      close().catch(reportStartupFailure);
+    });
+  } catch (error) { reportStartupFailure(error); }
+}

@@ -83,7 +83,7 @@ Copy-Item -LiteralPath (Join-Path $cipherSource 'prebuilds\win32-x64.node') -Des
 [IO.Directory]::CreateDirectory((Join-Path $stage 'node_modules'))|Out-Null
 Copy-Item -LiteralPath (Join-Path $projectRoot 'node_modules\yaml') -Destination (Join-Path $stage 'node_modules') -Recurse
 [IO.Directory]::CreateDirectory((Join-Path $stage 'scripts'))|Out-Null
-foreach($name in @('build-native.ps1','build-diagnostics.ps1','windows-observer.ps1','TrafficWatch-Control.ps1','TrafficWatch-RelayRoutes.ps1','TrafficWatch-PktMon.ps1','TrafficWatch-Resources.ps1','install-windows.ps1','upgrade-windows.ps1','upgrade-health.ps1')){Copy-Item -LiteralPath (Join-Path $projectRoot ('scripts\'+$name)) -Destination (Join-Path $stage 'scripts')}
+foreach($name in @('build-native.ps1','build-diagnostics.ps1','windows-observer.ps1','TrafficWatch-Control.ps1','TrafficWatch-RelayRoutes.ps1','TrafficWatch-PktMon.ps1','TrafficWatch-Resources.ps1','install-windows.ps1','upgrade-windows.ps1','upgrade-health.ps1','upgrade-history.ps1','upgrade-program.ps1')){Copy-Item -LiteralPath (Join-Path $projectRoot ('scripts\'+$name)) -Destination (Join-Path $stage 'scripts')}
 # Windows PowerShell 5.1 needs a BOM for Chinese source strings.
 foreach($name in @('TrafficWatch-Control.ps1','TrafficWatch-RelayRoutes.ps1','TrafficWatch-PktMon.ps1','install-windows.ps1','upgrade-windows.ps1')){
   $scriptPath=Join-Path $stage ('scripts\'+$name)

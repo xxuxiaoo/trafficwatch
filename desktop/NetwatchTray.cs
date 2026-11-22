@@ -211,14 +211,24 @@ internal sealed class NetwatchTray : ApplicationContext
         if (!Compatible(health)) { StartCollector(true); return; }
         ShowDashboard();
     }
-    private void LaunchSuiteControl(string arguments)
+    private async void LaunchSuiteControl(string arguments)
     {
         try {
             string program = Path.Combine(options.Root, "TrafficWatch-Control.exe");
             using (Process process = Process.Start(new ProcessStartInfo(program, arguments)
-                { UseShellExecute = false, CreateNoWindow = true, WindowStyle = ProcessWindowStyle.Hidden, WorkingDirectory = options.Root })) { }
+                { UseShellExecute = false, CreateNoWindow = true, WindowStyle = ProcessWindowStyle.Hidden, WorkingDirectory = options.Root }))
+            {
+                if (arguments != "--ensure-overview") return;
+                int code = await Task.Run(() => { process.WaitForExit(); return process.ExitCode; });
+                if (code != 0 && !exiting)
+                    Log("viewer", "Overview startup exited with code " + code + ". See TrafficWatch/logs/overview-launch.log in Local AppData.");
+            }
         }
-        catch (Exception error) { ShowFailure(error.Message); }
+        catch (Exception error) {
+            if (exiting) return;
+            Log("viewer", error.Message);
+            ShowBalloon(8000, "TrafficWatch", error.Message, ToolTipIcon.Warning);
+        }
     }
     private void ShowDashboard()
     {
