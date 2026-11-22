@@ -1,6 +1,6 @@
 # TrafficWatch
 
-Local Windows network history for observed applications, Clash/Mihomo proxy traffic, and Codex / Claude Code / dsh process families. A unified overview supports time filters, upload/download bars, application and connection drill-down, traffic peaks, and explicit collection gaps.
+Local Windows network history for observed applications, Clash/Mihomo proxy traffic, and the Codex, Claude Code, dsh and Antigravity process families. A unified overview supports time filters, upload/download bars, application and connection drill-down, traffic peaks, and explicit collection gaps.
 
 [中文说明](README.md) · [Build and install](docs/BUILD_WINDOWS.md) · [Architecture](docs/ARCHITECTURE.md) · [Security](SECURITY.md) · [Attribution](NOTICE.md)
 
@@ -35,6 +35,8 @@ The desktop shortcut and tray both open http://127.0.0.1:43131/ . Start or pause
 ## Measurement boundaries
 
 Windows ETW observes process TCP/UDP events, including loopback. Mihomo observes the selected controller's counters and connections. Those are overlapping views and must not be added together as a bill. Harness totals classify observed application traffic; they are not per-chat or token billing. Unknown attribution and collection gaps remain explicit. Offline data cannot be recovered, and no exact agreement with VPN or carrier accounting is promised.
+
+Antigravity recognition uses the application image, the bundled language server's installation layout and verified process ancestry. It uses the same network metadata as the other Harness views. Connections without enough identity evidence retain their original classification.
 
 Ordinary capture reads local observations. Only the explicitly enabled relay-bypass feature changes managed routes, a marked hosts block and the configured Clash enhancement script; it provides its own rollback. TrafficWatch does not decrypt HTTPS or install TLS interception.
 

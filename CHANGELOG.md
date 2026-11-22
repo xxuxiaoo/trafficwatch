@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.10.20
+
+- Add Antigravity to Harness with separate Windows and Clash proxy totals, upload/download bars, and drill-down by time, process, destination or proxy connection.
+- Recognize the Antigravity executable, its bundled language server and verified descendants. Group existing records with a matching process name as they are read, without migrating the database.
+- Support Antigravity process aliases, keyboard navigation between Harness tabs, and compact navigation on narrow screens.
+
 ## 0.10.19
 
 - Use the SQLite WAL health response when opening TrafficWatch from the desktop or tray. Reuse the running viewer and report startup exits, timeouts and unexpected listeners separately.

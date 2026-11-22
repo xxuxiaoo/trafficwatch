@@ -25,6 +25,10 @@
       "dsh.exe",
       "dsh-cli.exe",
       "dsh"
+    ],
+    "antigravity": [
+      "antigravity.exe",
+      "antigravity"
     ]
   }
 }

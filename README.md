@@ -1,6 +1,6 @@
 # TrafficWatch 流量中心
 
-在 Windows 上记录和排查**本机已观测应用流量、Clash / Mihomo 代理流量，以及 Codex、Claude Code、dsh 的网络用量**。数据保存在本地 SQLite，可从一个界面按日期、应用、目标和时间高峰逐层定位。
+在 Windows 上记录和排查**本机已观测应用流量、Clash / Mihomo 代理流量，以及 Codex、Claude Code、dsh 和 Antigravity 的网络用量**。数据保存在本地 SQLite，可从一个界面按日期、应用、目标和时间高峰逐层定位。
 
 [English](README.en.md) · [安装与构建](docs/BUILD_WINDOWS.md) · [统计口径与架构](docs/ARCHITECTURE.md) · [AI 连接诊断](docs/connection-diagnostics.md) · [隐私与安全](SECURITY.md) · [许可证与来源](NOTICE.md)
 
@@ -11,7 +11,7 @@
 - **简洁总览**：先显示总量与上传 / 下载柱状图，再补齐应用归因；查看今天、24 小时、7 天、30 天、指定日期或全部历史。
 - **本机应用**：Windows ETW 采集 TCP / UDP、IPv4 / IPv6 进程网络事件；可搜索应用并下钻到时段、目标和连接。
 - **梯子流量**：单独读取 Clash / Mihomo 兼容控制接口，区分代理、DIRECT 和未知路由，查看应用、目标、节点和规则证据。
-- **Harness**：按进程及有证据的子进程关系归类 Codex、Claude Code 和 dsh；无法确认的历史保持未知或其他应用。
+- **Harness** 支持 Codex、Claude Code、dsh 和 Antigravity，可按时段和进程查看连接。Antigravity 通过主程序名、软件自带语言服务的安装布局或确认过的父子进程关系识别。采集沿用网络元数据，无法确认的旧记录保持原归类。
 - **高峰排查**：点击某一时段的柱子或高峰记录，查看该时段上传、下载最多的程序和连接。
 - **AI 连接诊断**：结合 Magpie、CC Switch、Codex、Claude Code 和 dsh 的错误与重试日志，以及 TraceEvent / PktMon 网络元数据，保留故障和慢请求现场；按日期、中转、客户端、网关和原因筛选，并自动检查采集完整性。
 - **可选物理直连**：明确配置后，为指定中转维护物理 IPv4 网卡路由与 Clash 排除，提供路径验证和撤回；普通采集不自动启用绕行，详见[诊断与绕行说明](docs/connection-diagnostics.md)。

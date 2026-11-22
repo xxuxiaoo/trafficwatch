@@ -4,7 +4,7 @@ import http from 'node:http';
 import { spawn } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 import { HistoryReader } from './history-reader.mjs';
-import { normalizeHarnessApps } from './harness.mjs';
+import { isHarnessFamily, normalizeHarnessApps } from './harness.mjs';
 import { VERSION } from './version.mjs';
 import { diagnosticRoute } from './ai-diagnostic-router.mjs';
 import {readRelayTargetConfig,listRelayTargetBackups,saveRelayTargets,restoreRelayTargets,requestRelayReconcile,relayHostRevision} from './relay-targets.mjs';
@@ -148,9 +148,7 @@ function readJson(req, limit = 4096) {
   });
 }
 
-async function updateHarnessApps(apps) {
-  const current = await harnessApps();
-  const normalized = normalizeHarnessApps(apps, current.codex);
+async function updateHarnessApps(normalized) {
   const targets = singleCollector ? collectorPorts.slice(0,1) : collectorPorts;
   const previous = await Promise.all(targets.map(async (collectorPort) => {
     const response = await fetch(`http://127.0.0.1:${collectorPort}/api/harness-apps`, {
@@ -316,7 +314,11 @@ const server = http.createServer(async (req, res) => {
         return json(200, { apps: await harnessApps() });
       if (req.method === 'POST' && url.pathname === '/api/harness-apps') {
         const request = await readJson(req);
-        try { return json(200, { apps: await updateHarnessApps(request.apps) }); }
+        const current = await harnessApps();
+        let normalized;
+        try { normalized = normalizeHarnessApps(request.apps, current.codex); }
+        catch (error) { return json(400, { error: error.message }); }
+        try { return json(200, { apps: await updateHarnessApps(normalized) }); }
         catch (error) { return json(503, { error: error.message }); }
       }
       if (req.method === 'GET' && url.pathname === '/api/overview') {
@@ -365,7 +367,7 @@ const server = http.createServer(async (req, res) => {
           to: url.searchParams.has('to') ? url.searchParams.get('to') : undefined,
           apps: await harnessApps(),
         };
-        if (options.family && !['codex', 'claude', 'dsh'].includes(options.family)) return json(400, { error: 'invalid_family' });
+        if (options.family && !isHarnessFamily(options.family)) return json(400, { error: 'invalid_family' });
         if(options.client&&!['all','verge','flclash','mihomo','legacy'].includes(options.client))return json(400,{error:'invalid_client'});
         if(!validAirport(options.airport)||options.airport&&lane!=='clash')return json(400,{error:'invalid_airport'});
         if(url.pathname==='/api/harness'&&!options.family)return json(400,{error:'invalid_family'});

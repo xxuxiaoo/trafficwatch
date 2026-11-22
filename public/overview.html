@@ -92,7 +92,7 @@
             <div class="metric-strip" aria-label="选定时段流量">
               <section class="metric-cell machine-metric"><span id="overviewMachineLabel">本机已观测</span><strong id="overviewMachine">—</strong><small id="overviewMachineDirections">↑ —　↓ —</small></section>
               <section class="metric-cell proxy-metric"><span>梯子代理出口</span><strong id="overviewProxy">—</strong><small id="overviewProxyDirections">↑ —　↓ —</small></section>
-              <section class="metric-cell harness-metric"><span>Harness 应用</span><strong id="overviewHarness">—</strong><small id="overviewHarnessBreakdown">Codex / Claude Code / dsh</small></section>
+              <section class="metric-cell harness-metric"><span>Harness 应用</span><strong id="overviewHarness">—</strong><small id="overviewHarnessBreakdown">Codex / Claude Code / dsh / Antigravity</small></section>
               <section class="metric-cell unknown-metric"><span>待识别或未归因</span><strong id="overviewUnknown">—</strong><small id="overviewUnknownNote">不会算进 Harness</small></section>
             </div>
             <p id="measurementNote" class="measurement-note"></p>
@@ -168,12 +168,16 @@
 
           <section class="page-view" data-view="harness" hidden>
             <div class="view-heading">
-              <div><p class="eyebrow">开发工具用量</p><h2>Harness 流量</h2><p>Codex 按已识别的子进程统计；Claude Code 与 dsh 使用精确进程名及其新采集到的子进程归属。</p></div>
+              <div><p class="eyebrow">开发工具用量</p><h2>Harness 流量</h2><p>本机流量包含回环通信。点进程或时段，可查看连接、上传和下载字节。</p></div>
               <button type="button" class="text-button" data-view-button="settings">管理进程识别规则 <span aria-hidden="true">›</span></button>
             </div>
             <div id="harnessTabs" class="segmented-control" role="tablist" aria-label="Harness 应用"></div>
-            <section id="harnessPanel" class="harness-panel">
-              <div class="harness-overview"><div><span id="harnessSelectedName">Codex</span><strong id="harnessTotal">—</strong><small id="harnessDirections">↑ —　↓ —</small></div><div><span>其中通过梯子</span><strong id="harnessProxyTotal">—</strong><small id="harnessProxyShare">代理出口归因</small></div><div><span>本机记录中的占比</span><strong id="harnessShare">—</strong><small id="harnessPeak">峰值时段 —</small></div></div>
+            <section id="harnessPanel" class="harness-panel" role="tabpanel">
+              <div class="harness-overview">
+                <div><span id="harnessSelectedName">Codex</span><strong id="harnessTotal">—</strong><small id="harnessDirections">↑ —　↓ —</small></div>
+                <div><span>Clash 代理出口</span><strong id="harnessProxyTotal">—</strong><small>与本机记录分开统计</small><button id="harnessProxyDetail" class="quiet-button" type="button" hidden>查看代理连接</button></div>
+                <div><span>本机记录中的占比</span><strong id="harnessShare">—</strong><small id="harnessPeak">峰值时段 —</small></div>
+              </div>
               <div class="detail-grid"><section><div class="section-heading"><div><h3>流量变化</h3><p>全机进程记录与代理出口分开显示</p></div></div><div class="chart-wrap short-chart"><canvas id="harnessChart" aria-label="所选 Harness 应用流量变化"></canvas></div></section><section><h3>匹配到的进程</h3><div id="harnessProcessRows" class="compact-list"></div></section></div>
               <div id="harnessNotice" class="warning-list"></div>
             </section>
@@ -189,7 +193,7 @@
             <div class="view-heading"><div><p class="eyebrow">本机偏好</p><h2>设置</h2><p>流量中心、诊断和数据保留。</p></div></div>
 
             <div class="settings-columns">
-              <section class="data-section"><div class="section-heading"><div><h3>Harness 进程识别</h3><p>按实际进程名精确匹配；已记录的直接进程会同步回填分组。</p></div></div><div class="alias-add"><label>已发现或手动输入<input id="aliasProcess" class="control-select" list="detectedProcesses" maxlength="128" placeholder="例如 dsh.exe" autocomplete="off" /><datalist id="detectedProcesses"></datalist></label><label>加入分组 <select id="aliasFamily" class="control-select"><option value="claude">Claude Code</option><option value="dsh">dsh</option></select></label><button id="addAlias" class="command-button" type="button">添加进程名</button></div><div id="aliasGroups" class="alias-groups"></div><p id="aliasStatus" class="muted" role="status"></p></section>
+              <section class="data-section"><div class="section-heading"><div><h3>Harness 进程识别</h3><p>按实际进程名精确匹配；已记录的直接进程会同步回填分组。</p></div></div><div class="alias-add"><label>已发现或手动输入<input id="aliasProcess" class="control-select" list="detectedProcesses" maxlength="128" placeholder="例如 dsh.exe" autocomplete="off" /><datalist id="detectedProcesses"></datalist></label><label>加入分组 <select id="aliasFamily" class="control-select"><option value="claude">Claude Code</option><option value="dsh">dsh</option><option value="antigravity">Antigravity</option></select></label><button id="addAlias" class="command-button" type="button">添加进程名</button></div><div id="aliasGroups" class="alias-groups"></div><p id="aliasStatus" class="muted" role="status"></p></section>
             </div>
             <section class="data-section settings-limits"><div class="section-heading"><div><h3>用量参考线</h3><p>只比较本机记录的参考用量，不代表运营商或机场账单。</p></div></div><div class="limit-controls"><label>本月本机参考上限（GB）<input id="monthlyMachineLimit" type="number" min="0" step="0.1" inputmode="decimal" /></label><label>本月梯子参考上限（GB）<input id="monthlyProxyLimit" type="number" min="0" step="0.1" inputmode="decimal" /></label><button id="saveLimits" type="button" class="command-button">保存参考线</button><label class="notification-setting"><input id="notificationsEnabled" type="checkbox" /> 页面打开时达到参考线，发送本机提醒</label></div><p id="limitsStatus" class="muted" role="status"></p></section>
             <details class="coverage-details"><summary>采集口径</summary><p>本机应用来自 Windows ETW 进程网络事件；Harness 在有进程树证据时会归入对应父进程。梯子流量来自 Mihomo / Clash 连接快照，并拆分代理、DIRECT 和未知出口。代理会造成应用本地连接与代理进程出站重复出现在本机视图，所以这些合计不相加，也不等于网卡或账单。</p><p>所有时间按北京时间显示。数据只包含采集期间实际保存的记录；覆盖率、采集缺口、未知进程和未归因差额会在页面内注明。</p></details>

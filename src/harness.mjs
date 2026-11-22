@@ -8,7 +8,27 @@ export const DEFAULT_CODEX_PROCESS_NAMES = [
 export const DEFAULT_HARNESS_APPS = {
   claude: ['claude.exe', 'claude-code.exe', 'claude'],
   dsh: ['dsh.exe', 'dsh-cli.exe', 'dsh'],
+  antigravity: ['antigravity.exe', 'antigravity'],
 };
+export const SCRIPT_HARNESS_FAMILIES = Object.freeze(['codex', 'claude', 'dsh']);
+export const HARNESS_FAMILIES = Object.freeze([...SCRIPT_HARNESS_FAMILIES, 'antigravity']);
+export const ANTIGRAVITY_BUNDLE_ROOT = 'bundle:antigravity';
+
+export function processImageName(value) {
+  return String(value || '').split(/[\\/]/).at(-1);
+}
+
+function isLanguageServer(name) {
+  return /^language_server(?:_windows_(?:x64|arm64))?(?:\.exe)?$/i.test(name);
+}
+
+export function isAntigravityBundleImage(name, executable) {
+  const observedName = processImageName(name || executable).toLowerCase();
+  if (!executable || !isLanguageServer(observedName)) return false;
+  const image = String(executable || '').replaceAll('\\', '/').toLowerCase();
+  const imageName = processImageName(image);
+  return imageName === `${observedName.replace(/\.exe$/, '')}.exe` && image.endsWith(`/antigravity/resources/bin/${imageName}`);
+}
 
 function cleanNames(value, label) {
   if (!Array.isArray(value) || value.length > 32) throw new Error(`Invalid ${label} process names`);
@@ -30,11 +50,17 @@ export function normalizeHarnessApps(value, codexNames) {
     claude: cleanNames(apps.claude ?? DEFAULT_HARNESS_APPS.claude, 'Claude Code'),
     dsh: cleanNames(apps.dsh ?? DEFAULT_HARNESS_APPS.dsh, 'dsh'),
   };
+  // Respect explicit name assignments already present in older settings.
+  const occupied = new Set(Object.values(result).flat());
+  const defaults = DEFAULT_HARNESS_APPS.antigravity.filter(name => !occupied.has(name));
+  result.antigravity = cleanNames(apps.antigravity ?? defaults, 'Antigravity');
   const owners = new Map();
   for (const [family, names] of Object.entries(result)) {
     for (const name of names) {
       if (family !== 'codex' && ['node.exe','node','python.exe','python','powershell.exe','pwsh.exe','cmd.exe'].includes(name))
         throw new Error('Shared runtimes require a verified script or parent process, not a global name rule');
+      if (family === 'antigravity' && isLanguageServer(name))
+        throw new Error('Antigravity language servers require the Antigravity installation path or a verified parent');
       const owner = owners.get(name);
       if (owner && owner !== family) throw new Error('A process name cannot belong to two Harness apps');
       owners.set(name, family);
@@ -50,10 +76,10 @@ export function processFamilyMap(apps) {
 }
 
 export function familyForProcess(name, families) {
-  const base = String(name || '').replaceAll('\\', '/').split('/').at(-1).toLowerCase();
+  const base = processImageName(name).toLowerCase();
   return families.get(base) || (base ? 'other' : 'unknown');
 }
 
 export function isHarnessFamily(value) {
-  return ['codex', 'claude', 'dsh'].includes(value);
+  return HARNESS_FAMILIES.includes(value);
 }

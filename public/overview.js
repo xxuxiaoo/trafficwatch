@@ -8,7 +8,10 @@ const pageNames = {
   investigate: '高峰与采集缺口',
   settings: '设置',
 };
-const familyNames = { codex: 'Codex', claude: 'Claude Code', dsh: 'dsh', other: '其他应用', unknown: '待识别' };
+const harnessNames = { codex: 'Codex', claude: 'Claude Code', dsh: 'dsh', antigravity: 'Antigravity' };
+const harnessFamilies = Object.keys(harnessNames);
+const editableHarnessFamilies = harnessFamilies.filter(family => family !== 'codex');
+const familyNames = { ...harnessNames, other: '其他应用', unknown: '待识别' };
 const evidenceNames = {
   process: '进程信息',
   descendant: '父子进程',
@@ -552,9 +555,11 @@ function renderOverview() {
   $('overviewProxy').textContent = clash.available ? bytes(total(clash.groups?.proxy)) : '不可用';
   $('overviewProxyDirections').textContent = `↑ ${bytes(clash.groups?.proxy?.up)}　↓ ${bytes(clash.groups?.proxy?.down)}`;
   const familyTotals = machine.familyTotals || {};
-  const harnessBytes = ['codex', 'claude', 'dsh'].reduce((n, key) => n + total(familyTotals[key]), 0);
-  $('overviewHarness').textContent = machine.available?bytes(harnessBytes):'不可用';
-  $('overviewHarnessBreakdown').textContent = ['codex', 'claude', 'dsh'].map((key) => `${familyNames[key]} ${bytes(total(familyTotals[key]))}`).join('　');
+  const harnessBytes = harnessFamilies.reduce((n, key) => n + total(familyTotals[key]), 0);
+  const harnessReady = machine.available && machine.detailReady !== false;
+  $('overviewHarness').textContent = harnessReady ? bytes(harnessBytes) : machine.available ? '统计中' : '不可用';
+  $('overviewHarnessBreakdown').textContent = harnessFamilies.map(key =>
+    harnessReady ? `${familyNames[key]} ${bytes(total(familyTotals[key]))}` : familyNames[key]).join('　');
   const unknownBytes = total(familyTotals.unknown) + total(machine.unassigned);
   $('overviewUnknown').textContent = machine.available?bytes(unknownBytes):'不可用';
   $('overviewUnknownNote').textContent = `待识别进程 ${bytes(total(familyTotals.unknown))} · 未归因差额 ${bytes(total(machine.unassigned))}`;
@@ -948,13 +953,33 @@ function renderLadderDetail(selection, result) {
   renderPager('ladderPager', result.pagination, (page) => loadLadderDetail({ ...selection, page }));
 }
 function renderHarnessTabs() {
-  const target = $('harnessTabs'); target.replaceChildren();
-  for (const family of ['codex', 'claude', 'dsh']) {
-    const button = node('button', familyNames[family]); button.type = 'button'; button.setAttribute('role', 'tab');
-    button.setAttribute('aria-selected', String(activeFamily === family));
-    button.addEventListener('click', () => { activeFamily = family; renderHarnessTabs(); loadHarness(family); });
-    target.append(button);
+  const target = $('harnessTabs');
+  if (!target.children.length) {
+    for (const [index, family] of harnessFamilies.entries()) {
+      const button = node('button', familyNames[family]);
+      button.type = 'button';
+      button.id = `harness-tab-${family}`;
+      button.setAttribute('role', 'tab');
+      button.setAttribute('aria-controls', 'harnessPanel');
+      button.addEventListener('click', () => { activeFamily = family; renderHarnessTabs(); loadHarness(family); });
+      button.addEventListener('keydown', event => {
+        const offset = { ArrowLeft: -1, ArrowRight: 1 }[event.key];
+        if (!offset && event.key !== 'Home' && event.key !== 'End') return;
+        event.preventDefault();
+        const next = event.key === 'Home' ? 0 : event.key === 'End' ? harnessFamilies.length - 1
+          : (index + offset + harnessFamilies.length) % harnessFamilies.length;
+        target.children[next].focus();
+        target.children[next].click();
+      });
+      target.append(button);
+    }
   }
+  harnessFamilies.forEach((family, index) => {
+    const button = target.children[index];
+    button.setAttribute('aria-selected', String(activeFamily === family));
+    button.tabIndex = activeFamily === family ? 0 : -1;
+  });
+  $('harnessPanel').setAttribute('aria-labelledby', `harness-tab-${activeFamily}`);
 }
 async function loadHarness(family, force = false) {
   activeFamily = family;
@@ -967,6 +992,7 @@ async function loadHarness(family, force = false) {
   $('harnessSelectedName').textContent = familyNames[family];
   if (harnessResultKey!==key) {
     harnessResult=null;
+    $('harnessProxyDetail').hidden = true;
     const preview=dataKey===rangeKey&&data?.machine?.detailReady!==false?data?.machine?.familyTotals?.[family]:null;
     $('harnessTotal').textContent = preview?bytes(total(preview)):'读取中'; $('harnessProxyTotal').textContent = '读取中';
     $('harnessShare').textContent=preview&&total(data?.machine?.totals)?percent(total(preview)/total(data.machine.totals)*100):'—';$('harnessPeak').textContent='正在读取时段分布…';
@@ -998,7 +1024,7 @@ function renderHarness(family, machine, proxy) {
   $('harnessTotal').textContent = machineSummary?bytes(machineBytes):machine?'暂不可用':'读取中';
   $('harnessDirections').textContent = machineSummary?`↑ ${bytes(machineSummary.up)}　↓ ${bytes(machineSummary.down)}${machineReady?'':' · 总览已统计'}`:machine?'本机记录读取失败':'正在读取所选分组…';
   $('harnessProxyTotal').textContent = proxyReady?bytes(proxyBytes):proxy?'暂不可用':'读取中';
-  $('harnessProxyShare').textContent = 'Clash 代理连接独立计数，与左侧不相加';
+  $('harnessProxyDetail').hidden = !proxyReady || !proxyBytes;
   $('harnessShare').textContent = machineSummary&&systemBytes ? percent((machineBytes / systemBytes) * 100) : '—';
   $('harnessPeak').textContent = machineReady?`最高时段 ${peakFrom(machine.series)}`:machine?'时段分布暂不可用':'正在读取时段分布…';
   const series=[];if(machineReady)series.push(chartSeries('本机进程记录',machine.series,machine.observation));if(proxyReady)series.push(chartSeries('梯子代理出口',proxy.series,proxy.observation,'proxy'));
@@ -1008,14 +1034,16 @@ function renderHarness(family, machine, proxy) {
   const notice = $('harnessNotice'); notice.replaceChildren();
   if(machine&&!machineReady||proxy&&!proxyReady){notice.className='warning-list has-warning';for(const [name,value]of [['本机',machine],['梯子',proxy]])if(value&&!value.available)notice.append(node('p',`${name}：${value.error==='missing_database'?'尚未建立记录':value.error||'暂不可读'}。再次点击分组可重试。`));}
   else if(!machine||!proxy){notice.className='warning-list';notice.append(node('p',`${!machine?'本机':'梯子'}时段分布正在读取，已完成的来源先行显示。`));}
-  else if (!machineBytes) {
+  else if (!machineBytes && !proxyBytes) {
     notice.className = 'warning-list has-warning';
-    notice.append(node('p', family === 'dsh'
+    const message = family === 'dsh'
       ? '所选时段没有可归入 dsh 的记录。已支持通过 dsh 的 Node 启动脚本识别及其子进程；旧记录缺少这项证据时保留为其他应用。'
-      : '所选时段没有匹配到此 Harness 的连接记录。'));
+      : family === 'antigravity' ? '所选时段没有可归入 Antigravity 的连接。通用语言服务的旧记录需要足够的进程归因证据。'
+        : '所选时段没有匹配到此 Harness 的连接记录。';
+    notice.append(node('p', message));
   } else {
     notice.className = 'warning-list';
-    if (family !== 'codex') notice.append(node('p', '既有历史按已有进程证据归组；新版本启用后额外记录脚本与父子进程归属。'));
+    if (family !== 'codex' && family !== 'antigravity') notice.append(node('p', '既有历史按已有进程证据归组；新版本启用后额外记录脚本与父子进程归属。'));
   }
 }
 function peakFrom(rows) {
@@ -1060,7 +1088,7 @@ function renderSettings() {
 function renderAliases() {
   if (!apps) return;
   const target = $('aliasGroups'); target.replaceChildren();
-  for (const family of ['claude', 'dsh']) {
+  for (const family of editableHarnessFamilies) {
     const section = node('section', undefined, 'alias-family');
     section.append(node('h4', familyNames[family]));
     const list = node('div', undefined, 'alias-list');
@@ -1078,14 +1106,14 @@ function renderAliases() {
   codex.append(node('h4', 'Codex · 由采集配置识别'));
   codex.append(node('div', (apps.codex || []).join(' · ') || '没有 Codex 进程名', 'locked-aliases'));
   target.append(codex);
-  target.append(node('p', '自动识别：Codex / Claude Code / dsh 的官方 Node 启动脚本及其子进程。通用 node.exe、PowerShell 不能整体加入某个分组。', 'fine-print'));
+  target.append(node('p', 'Codex、Claude Code 和 dsh 可通过官方启动脚本识别。Antigravity 自带语言服务按安装布局或父进程识别。请为别名填写专用进程名。', 'fine-print'));
 }
 async function updateAlias(family, process, add) {
   const status = $('aliasStatus'); status.textContent = '正在同步到两路采集…';
-  const next = { codex: apps.codex, claude: [...apps.claude], dsh: [...apps.dsh] };
+  const next = Object.fromEntries(harnessFamilies.map(key => [key, [...(apps[key] || [])]]));
   const name = process.trim().split(/[\\/]/).at(-1).toLowerCase();
   next[family] = add ? [...new Set([...next[family], name])] : next[family].filter((item) => item !== name);
-  if (['codex', 'claude', 'dsh'].some((key) => key !== family && next[key].includes(name))) {
+  if (harnessFamilies.some(key => key !== family && next[key].includes(name))) {
     status.textContent = '这个进程名已经属于其他分组。'; return;
   }
   try {
@@ -1329,6 +1357,15 @@ $('controlStart').addEventListener('click',()=>performControlAction('Start'));
 $('controlStop').addEventListener('click',()=>performControlAction('PauseCapture'));
 $('advancedControls').addEventListener('toggle',()=>{if($('advancedControls').open)refreshControlStatus();else{clearTimeout(controlStatusTimer);controlStatusAbort?.abort();}});
 $('showAirportConnections').addEventListener('click',()=>loadLadderDetail({title:`${$('activeAirportTitle').textContent} · 连接明细`}));
+$('harnessProxyDetail').addEventListener('click', () => {
+  const family = activeFamily;
+  $('proxyAirportFilter').value = 'all';
+  $('proxyClientFilter').value = 'all';
+  $('routeFilter').value = 'proxy';
+  clearLadderDetail();
+  setView('ladder', { resumeDetails: false });
+  loadLadderDetail({ family, title: `${familyNames[family]} · 代理连接` });
+});
 for(const button of document.querySelectorAll('[data-control-action]'))button.addEventListener('click',()=>performControlAction(button.dataset.controlAction));
 let searchTimer;
 $('appSearch').addEventListener('input',()=>{clearTimeout(searchTimer);searchTimer=setTimeout(()=>{appPage=0;renderApps();},120);});

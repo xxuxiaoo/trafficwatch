@@ -1,14 +1,21 @@
 import { spawn } from 'node:child_process';
 import { createInterface } from 'node:readline';
 import path from 'node:path';
-import { familyForProcess, normalizeHarnessApps, processFamilyMap } from './harness.mjs';
+import {
+  ANTIGRAVITY_BUNDLE_ROOT, SCRIPT_HARNESS_FAMILIES, familyForProcess, isAntigravityBundleImage,
+  isHarnessFamily, normalizeHarnessApps, processFamilyMap, processImageName,
+} from './harness.mjs';
 
-const normalizedName = (x) =>
-  String(x || '')
-    .replaceAll('\\', '/')
-    .split('/')
-    .at(-1)
-    .toLowerCase();
+const normalizedName = value => processImageName(value).toLowerCase();
+
+function imageFamily(name, executable, families) {
+  const root = normalizedName(name || executable);
+  const named = familyForProcess(root, families);
+  if (!isHarnessFamily(named) && isAntigravityBundleImage(name, executable)) {
+    return { family: 'antigravity', familyRoot: ANTIGRAVITY_BUNDLE_ROOT };
+  }
+  return { family: named, familyRoot: root };
+}
 export function classifyProcess(
   pid,
   processes,
@@ -18,17 +25,19 @@ export function classifyProcess(
   let p = processes.get(Number(pid));
   const origin = p;
   const visited = new Set();
+  let verifiedAncestry = true;
   while (p && !visited.has(p.pid)) {
     visited.add(p.pid);
-    const family = ['codex', 'claude', 'dsh'].includes(p.familyHint)
-      ? p.familyHint : familyForProcess(p.name || p.path, families);
-    if (family !== 'other' && family !== 'unknown') {
+    const identity = SCRIPT_HARNESS_FAMILIES.includes(p.familyHint)
+      ? { family: p.familyHint, familyRoot: `script:${p.familyHint}` }
+      : imageFamily(p.name, p.path, families);
+    if (isHarnessFamily(identity.family)) {
+      if (identity.family === 'antigravity' && p !== origin && !verifiedAncestry) break;
       return {
-        scope: family === 'codex' ? 'codex' : 'other',
-        family,
-        familyRoot: p.familyHint ? `script:${p.familyHint}` : normalizedName(p.name || p.path),
+        scope: identity.family === 'codex' ? 'codex' : 'other',
+        ...identity,
         evidence: p === origin ? 'process' : 'descendant',
-        process: origin.name,
+        process: processImageName(origin.name || origin.path),
         pid: origin.pid,
       };
     }
@@ -36,10 +45,11 @@ export function classifyProcess(
     const parent = processes.get(p.ppid);
     // Prevent PID reuse from creating a false ancestry edge.
     if (parent?.born && p.born && parent.born > p.born) break;
+    if (!(p.born > 0 && parent?.born > 0)) verifiedAncestry = false;
     p = parent;
   }
   return origin
-    ? { scope: 'other', family: 'other', evidence: 'process', process: origin.name, pid: origin.pid }
+    ? { scope: 'other', family: 'other', evidence: 'process', process: processImageName(origin.name || origin.path), pid: origin.pid }
     : null;
 }
 
@@ -120,33 +130,34 @@ export class ProcessObserver {
   classify(metadata, now = Date.now()) {
     if (metadata.native) {
       const pid = Number(metadata.processId), owner = this.processes.get(pid);
+      const name = processImageName(metadata.process);
       // ETW supplies a PID even for a connection that closes between socket polls.
       // Verify process creation time before using cached ancestry after PID reuse.
       let p = owner;
       const visited = new Set();
       while (p && !visited.has(p.pid)) {
         visited.add(p.pid);
-        if (this.config.excludePids?.includes(p.pid)) return { scope: 'other', family: 'other', evidence: 'etw', process: metadata.process || '', pid };
+        if (this.config.excludePids?.includes(p.pid)) return { scope: 'other', family: 'other', evidence: 'etw', process: name, pid };
         p = this.processes.get(p.ppid);
       }
-      if (this.config.excludePids?.includes(pid)) return { scope: 'other', family: 'other', evidence: 'etw', process: metadata.process || '', pid };
+      if (this.config.excludePids?.includes(pid)) return { scope: 'other', family: 'other', evidence: 'etw', process: name, pid };
       const age = now - this.at;
       if (owner && age >= 0 && age <= 6000 && metadata.processBorn > 0 && Math.abs(owner.born - metadata.processBorn) < 2) {
         const result = classifyProcess(pid, this.processes, this.config, this.families);
         if (result) return { ...result, evidence: result.evidence === 'descendant' ? 'etw_descendant' : 'etw' };
       }
-      const family = familyForProcess(metadata.process, this.families);
-      return metadata.process ? { scope: family === 'codex' ? 'codex' : 'other', family, familyRoot: normalizedName(metadata.process), evidence: 'etw', process: metadata.process, pid }
+      const family = familyForProcess(name, this.families);
+      return name ? { scope: family === 'codex' ? 'codex' : 'other', family, familyRoot: normalizedName(name), evidence: 'etw', process: name, pid }
         : { scope: 'unknown', family: 'unknown', evidence: 'none', process: '', pid: null };
     }
     // Prefer kernel connection metadata when present. An unrecognised named process
     // must remain "other", even if its hostname happens to be chatgpt.com.
     let named = null;
     if (metadata.process || metadata.processPath) {
-      const name = metadata.process || normalizedName(metadata.processPath);
-      const family = familyForProcess(name, this.families);
-      named = { scope: family === 'codex' ? 'codex' : 'other', family, familyRoot: normalizedName(name), evidence: 'mihomo', process: name, pid: null };
-      if (family !== 'other' && family !== 'unknown') return named;
+      const name = metadata.process ? processImageName(metadata.process) : normalizedName(metadata.processPath);
+      const identity = imageFamily(name, metadata.processPath || metadata.process, this.families);
+      named = { scope: identity.family === 'codex' ? 'codex' : 'other', ...identity, evidence: 'mihomo', process: name, pid: null };
+      if (isHarnessFamily(identity.family)) return named;
     }
     const age = now - this.at;
     if (!this.at || age < 0 || age > 6000) return named;

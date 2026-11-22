@@ -1,3 +1,5 @@
+import { ANTIGRAVITY_BUNDLE_ROOT } from './harness.mjs';
+
 export const finiteBytes = (x) =>
   Number.isFinite(Number(x)) && Number(x) >= 0 ? Math.floor(Number(x)) : 0;
 export function counterDelta(current, previous) {
@@ -64,11 +66,14 @@ export class Accounting {
           family: attribution.scope === 'codex' ? 'codex' : attribution.scope === 'unknown' ? 'unknown' : 'other',
         };
       }
+      const verifiedRoot = attribution.familyRoot?.startsWith('script:') || attribution.familyRoot === ANTIGRAVITY_BUNDLE_ROOT ||
+        (attribution.family === 'antigravity' && ['descendant', 'etw_descendant'].includes(attribution.evidence));
       if (identified && attribution.process === identified.process &&
           (!attribution.pid || !identified.pid || attribution.pid === identified.pid) &&
-          !(attribution.familyRoot?.startsWith('script:') && identified.family === 'other')) {
+          !(verifiedRoot && identified.family === 'other')) {
         attribution = { ...attribution, family: identified.family || attribution.family,
-          familyRoot: identified.familyRoot || '' };
+          familyRoot: identified.familyRoot || '',
+          ...(identified.family === 'antigravity' ? { evidence: identified.evidence, pid: attribution.pid ?? identified.pid } : {}) };
       }
       this.previous.set(key, { up: rawUp, down: rawDown, at: now, attribution });
       if (attribution.scope === 'codex') {

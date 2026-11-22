@@ -3,7 +3,9 @@ import path from 'node:path';
 import { DatabaseSync } from './database.mjs';
 import { historyDirectory, historyFilename } from './history-paths.mjs';
 import { parentPort, workerData } from 'node:worker_threads';
-import { DEFAULT_CODEX_PROCESS_NAMES, normalizeHarnessApps } from './harness.mjs';
+import {
+  ANTIGRAVITY_BUNDLE_ROOT, DEFAULT_CODEX_PROCESS_NAMES, HARNESS_FAMILIES, isHarnessFamily, normalizeHarnessApps,
+} from './harness.mjs';
 import { programRollup } from './history-rollup.mjs';
 import { attachArchiveViews, setArchiveWindows, historyBounds } from './history-archive.mjs';
 import { airportGroupKey, normalizeAirportLabel } from './proxy-airports.mjs';
@@ -66,12 +68,12 @@ function definitions(db, apps) {
   const hasFamily = Boolean(db.prepare("SELECT 1 FROM sqlite_master WHERE name='connection_families' AND type='table'").get());
   const name = "CASE WHEN b.scope='unknown' THEN '' ELSE c.process END";
   const familyCases = ["WHEN b.scope='unknown' THEN 'unknown'", "WHEN b.scope='codex' THEN 'codex'"];
-  for (const family of ['codex', 'claude', 'dsh']) {
+  for (const family of HARNESS_FAMILIES) {
     if (apps[family].length) familyCases.push(`WHEN lower(c.process) IN (${apps[family].map(literal).join(',')}) THEN '${family}'`);
   }
   if (hasFamily) {
-    for (const family of ['codex', 'claude', 'dsh']) {
-      const roots = [`script:${family}`, ...apps[family]];
+    for (const family of HARNESS_FAMILIES) {
+      const roots = [family === 'antigravity' ? ANTIGRAVITY_BUNDLE_ROOT : `script:${family}`, ...apps[family]];
       familyCases.push(`WHEN f.family='${family}' AND f.root_process IN (${roots.map(literal).join(',')}) THEN '${family}'`);
     }
   }
@@ -376,7 +378,7 @@ export function readDetail(dataRoot, lane, rangeName, now = Date.now(), options 
 // connection pages. Keep the Windows join inside the covering
 // index, even when the lifetime dictionary contains multi-kilobyte rules.
 export function readHarness(dataRoot,lane,rangeName,now=Date.now(),options={}){
-  if(!['codex','claude','dsh'].includes(options.family))throw new RangeError('Invalid family');
+  if (!isHarnessFamily(options.family)) throw new RangeError('Invalid family');
   const began=performance.now(),db=openLane(dataRoot,lane,options);
   if(!db)return {available:false,error:'missing_database'};
   const report=value=>options.report?.({lane,...value});
