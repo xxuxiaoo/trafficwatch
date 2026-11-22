@@ -8,10 +8,11 @@ import { DEFAULT_BUDGET, validateBudget } from './budgets.mjs';
 import { normalizeHarnessApps } from './harness.mjs';
 
 export class Monitor {
-  constructor(config, store, { now = Date.now } = {}) {
+  constructor(config, store, { now = Date.now, onState = () => {} } = {}) {
     this.config = config;
     this.store = store;
     this.now = now;
+    this.onState = onState;
     this.harnessApps = normalizeHarnessApps(store.get('harnessApps', config.harnessApps), config.processNames);
     this.config.harnessApps = this.harnessApps;
     this.store.setHarnessApps?.(this.harnessApps, this.now());
@@ -24,7 +25,7 @@ export class Monitor {
     this.startedAt = this.now();
     this.lastAt = 0;
     this.lastSessionRefresh = 0;
-    this.lastPrune = 0;
+    this.nextPruneAt = this.startedAt + 60000;
     this.lastAlert = 0;
     this.recent = [];
     this.detector = new AnomalyDetector();
@@ -62,10 +63,15 @@ export class Monitor {
     this.detector.reset();
     this.recent = [];
   }
+  setState(state) {
+    if (this.state === state) return;
+    this.state = state;
+    this.onState(state);
+  }
   start() {
     this.stopping = false;
     if (!this.config.demo) this.observer.start();
-    this.tick();
+    return this.tick();
   }
   async tick() {
     if (this.stopping) return;
@@ -171,7 +177,7 @@ export class Monitor {
       const inserted = this.store.record(sample);
       this.latest = sample;
       this.lastAt = now;
-      this.state = 'connected';
+      this.setState('connected');
       if (inserted !== false) this.store.checkBudgets?.(now, this.budgetSettings);
       this.controllerIssue = null;
       this.error = '';
@@ -191,12 +197,13 @@ export class Monitor {
         );
         this.lastAlert = now;
       }
-      if (now - this.lastPrune >= 3600000) {
+      if (this.retentionDays && now >= this.nextPruneAt) {
+        this.nextPruneAt = now + 3600000;
         this.store.prune(this.retentionDays, now);
-        this.lastPrune = now;
       }
     } catch (error) {
-      this.state = 'disconnected';
+      if (this.stopping) return;
+      this.setState('disconnected');
       this.controllerIssue =
         operation === 'source' ? this.source.issue || 'unreachable' : 'collection';
       this.error = /未连接|接口需要/.test(error.message)
@@ -286,7 +293,7 @@ export class Monitor {
     this.store.set('retentionDays', value);
     this.retentionDays = value;
     // Apply the new window on the next successful poll without restarting capture.
-    this.lastPrune = -Infinity;
+    this.nextPruneAt = -Infinity;
   }
   async setCapture(mode, authorize = false) {
     if (this.config.demo || !this.source.setMode) throw new Error('capture_unavailable');

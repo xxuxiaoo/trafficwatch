@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.10.18
+
+- Keep the collector's HTTP listener responsive while SQLite opens, prepares indexes or writes traffic. Wait for the collector to report readiness before accepting an upgrade, and report startup stages and log tails when a check fails.
+- Remove the first sample's full SQLite optimization, defer retention cleanup, and seek directly to the first and last sample when looking up history bounds.
+- Inspect checkpoints from rolled back upgrades. Reuse a verified lane when its source files still match, and apply only new packets when the earlier queue prefix and its replay state can be verified. Preserve the source and rollback files.
+
 ## 0.10.17
 
 - Accept the legacy Clash controller gap reason. Report damaged queue packets or operations and continue applying valid capture records in order.

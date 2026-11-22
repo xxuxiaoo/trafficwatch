@@ -196,6 +196,8 @@ test('after a Clash SQL failure, reuse the verified Windows base with a newer qu
   delete prior.lanes.windows.quarantine;
   delete prior.lanes.windows.queue.quarantined;
   delete prior.lanes.windows.queue.partial;
+  delete prior.lanes.windows.queuePrefixSHA256;
+  delete prior.lanes.windows.replayStateSHA256;
   fs.writeFileSync(stateFile, JSON.stringify(prior));
 
   clash.queue.prepare('DELETE FROM envelopes WHERE id=?').run('failed-write');
@@ -245,6 +247,73 @@ test('a verified Windows checkpoint is ignored when its source history WAL chang
   const db = new DatabaseSync(path.join(historyDirectory(root, 'windows'), historyFilename('windows')), { readOnly: true });
   try { assert.equal(db.prepare('SELECT v FROM old_data').get().v, 19); }
   finally { db.close(); }
+});
+
+test('a clean rollback resumes all three lanes from verified packet prefixes without double-counting', { timeout: 30000 }, async t => {
+  const { root, lanes } = await legacy(t);
+  const gapAt = next + MINUTE;
+  lanes.windows.append('before-rollback', [
+    { method: 'alert', args: [gapAt, 'queued alert'] },
+    { method: 'saveSession', args: [{ id: 'queued-session', title: 'Queued', activity: gapAt, total: 30 }, 12] },
+    { method: 'openGap', args: ['spans-retry', 'source_unavailable', gapAt] },
+    { method: 'openGap', args: ['bad-start', 'source_unavailable', null] },
+  ]);
+  const prior = await migrateHistory(root, password);
+  const recovery = path.join(root, `history-v2-rollback-${'a'.repeat(32)}`);
+  fs.renameSync(path.join(root, 'history-v2'), recovery);
+  const later = gapAt + MINUTE;
+  lanes.windows.append('after-rollback', [
+    { method: 'closeGap', args: ['spans-retry', later] },
+    { method: 'record', args: [sample(later, 17, 29)] },
+  ]);
+  lanes.clash.append('after-rollback', [{ method: 'record', args: [sample(later, 5, 8)] }]);
+  lanes.diagnostics.append('after-rollback', [{ at: later, id: 'another-request', kind: 'request', provider: 'fixture.test', category: 'success' }]);
+  const phases = [];
+  const migrated = await migrateHistory(root, password, { notify: phase => phases.push(phase) });
+  assert.deepEqual(phases.filter(row => row.phase === 'resume_verified_queue_prefix').map(row => row.lane), HISTORY_LANES);
+  assert.ok(!phases.some(row => row.phase === 'convert'));
+  assert.deepEqual(migrated.lanes.windows.queue, { total: 4, scanned: 4, added: 1, alreadyImported: 3, quarantined: 0, partial: 1 });
+  assert.deepEqual(migrated.lanes.windows.quarantine, prior.lanes.windows.quarantine);
+  const detail = readDetail(root, 'windows', 'all', later + MINUTE);
+  assert.deepEqual([detail.summary.up, detail.summary.down], [55, 83]);
+  const db = new DatabaseSync(path.join(historyDirectory(root, 'windows'), historyFilename('windows')), { readOnly: true });
+  try {
+    assert.equal(db.prepare("SELECT COUNT(*) n FROM alerts WHERE message='queued alert'").get().n, 1);
+    assert.equal(db.prepare("SELECT observed_tokens FROM sessions WHERE id='queued-session'").get().observed_tokens, 12);
+    assert.equal(db.prepare("SELECT ended_at FROM collection_gaps WHERE started_at=?").get(gapAt).ended_at, later);
+  } finally { db.close(); }
+  const diag = new DiagnosticHistory(root);
+  try {
+    assert.equal(diag.query({ windows: [{ from: 0, to: later + MINUTE }] }).rows.length, 3);
+    assert.equal(diag.attachment(uuid).from, at);
+  } finally { diag.close(); }
+  assert.equal(JSON.parse(fs.readFileSync(path.join(recovery, 'migration.json'))).lanes.windows.outputSHA256, prior.lanes.windows.outputSHA256);
+});
+
+test('a rollback with a rewritten queue prefix, edited output or unverified WAL rebuilds only the affected lanes', { timeout: 30000 }, async t => {
+  const { root, lanes } = await legacy(t);
+  await migrateHistory(root, password);
+  const recovery = path.join(root, `history-v2-rollback-${'b'.repeat(32)}`);
+  fs.renameSync(path.join(root, 'history-v2'), recovery);
+  lanes.windows.queue.prepare('DELETE FROM envelopes WHERE id=?').run('pending');
+  lanes.windows.append('replacement', [{ method: 'record', args: [sample(next, 19, 23)] }]);
+  const clash = new DatabaseSync(path.join(recovery, 'clash', 'monitor.sqlite'));
+  clash.exec('UPDATE old_data SET v=999');
+  clash.close();
+  const diagnostic = new DatabaseSync(path.join(recovery, 'diagnostics', 'history.sqlite'));
+  const phases = [];
+  try {
+    diagnostic.exec('UPDATE old_data SET v=999');
+    await migrateHistory(root, password, { notify: phase => phases.push(phase) });
+  } finally { diagnostic.close(); }
+  assert.deepEqual(phases.filter(row => row.phase === 'checkpoint_ignored').map(row => [row.lane, row.reason]), [
+    ['windows', 'queue_prefix_changed'], ['clash', 'output_checksum_changed'], ['diagnostics', 'output_has_unverified_journal'],
+  ]);
+  const detail = readDetail(root, 'windows', 'all', next + MINUTE);
+  assert.deepEqual([detail.summary.up, detail.summary.down], [52, 67]);
+  const original = new DatabaseSync(path.join(recovery, 'clash', 'monitor.sqlite'), { readOnly: true });
+  try { assert.equal(original.prepare('SELECT v FROM old_data').get().v, 999); }
+  finally { original.close(); }
 });
 
 test('migration CLI reads the old password through stdin and writes a verified manifest', { timeout: 30000 }, async t => {

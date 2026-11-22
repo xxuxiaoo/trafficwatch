@@ -6,6 +6,7 @@ $installRoot=Join-Path $programs 'TrafficWatch'
 $systemShell=Join-Path $env:SystemRoot 'System32\WindowsPowerShell\v1.0\powershell.exe'
 $taskNames=@('TrafficWatch - Open-source Netwatch','TrafficWatch - Tray','TrafficWatch - AI diagnostics','TrafficWatch - Relay physical bypass')
 $ports=@(43128,43130,43131,43132)
+. (Join-Path $PSScriptRoot 'upgrade-health.ps1')
 
 if ($packageRoot -eq $installRoot -or $packageRoot.StartsWith($installRoot+'\',[StringComparison]::OrdinalIgnoreCase)) {
     throw 'Run the upgrade from the extracted new package outside Program Files\TrafficWatch.'
@@ -62,6 +63,10 @@ if ($Preflight) {
         Write-Host "Task query exit $code - $name"
         if ($code -ne 0) { foreach ($line in $output) { Write-Host ([string]$line) } }
     }
+    if ($needsMigration) {
+        & (Join-Path $packageRoot 'runtime\node.exe') --disable-warning=ExperimentalWarning (Join-Path $packageRoot 'migration\migrate-history.mjs') --inspect-checkpoints $dataRoot
+        if ($LASTEXITCODE -ne 0) { throw "History checkpoint inspection failed, exit $LASTEXITCODE." }
+    }
     exit 0
 }
 if (-not $admin) { throw 'Open Windows PowerShell as administrator and run this same upgrade command. No process has been stopped.' }
@@ -111,26 +116,28 @@ function Restore-Tasks {
     }
 }
 
-function Read-LocalHealth([int]$Port) {
-    try {
-        $request=[Net.HttpWebRequest]::Create("http://127.0.0.1:$Port/api/health")
-        $request.Proxy=$null; $request.AllowAutoRedirect=$false; $request.Timeout=1300; $request.ReadWriteTimeout=1300
-        $response=$request.GetResponse()
-        try {
-            $reader=[IO.StreamReader]::new($response.GetResponseStream())
-            try { return ($reader.ReadToEnd() | ConvertFrom-Json) } finally { $reader.Dispose() }
-        } finally { $response.Dispose() }
-    } catch { return [pscustomobject]@{Error=$_.Exception.Message} }
+function Write-StartupLogs {
+    foreach ($relative in @('supervisor.log','windows\collector.log','windows\collector-error.log',
+        'clash\collector.log','clash\collector-error.log','diagnostics\daemon.log','diagnostics\daemon-error.log')) {
+        $file=Join-Path $dataRoot $relative
+        if (-not (Test-Path -LiteralPath $file -PathType Leaf)) { continue }
+        Write-Host "TrafficWatch startup log ($relative)"
+        try { Get-Content -LiteralPath $file -Encoding UTF8 -Tail 10 | Write-Host }
+        catch { Write-Warning "Could not read $relative - $($_.Exception.Message)" }
+    }
 }
 
 function Stop-TrafficWatch {
     & $systemShell -NoProfile -NonInteractive -ExecutionPolicy Bypass -File (Join-Path $installRoot 'scripts\TrafficWatch-Control.ps1') -Action Stop
     if ($LASTEXITCODE -ne 0) { throw "TrafficWatch could not stop safely, exit $LASTEXITCODE." }
-    foreach ($port in $ports) {
-        if (Get-NetTCPConnection -LocalPort $port -LocalAddress '127.0.0.1' -State Listen -ErrorAction SilentlyContinue) {
-            throw "Port $port is still in use after the scoped TrafficWatch stop."
-        }
-    }
+    $wait=[Diagnostics.Stopwatch]::StartNew()
+    do {
+        $remaining=@([Net.NetworkInformation.IPGlobalProperties]::GetIPGlobalProperties().GetActiveTcpListeners() |
+            Where-Object { $_.Port -in $ports -and $_.Address.ToString() -in @('127.0.0.1','0.0.0.0','::','::ffff:127.0.0.1') })
+        if (-not $remaining.Count) { return }
+        Start-Sleep -Milliseconds 250
+    } while ($wait.ElapsedMilliseconds -lt 5000)
+    throw ('Listeners remain after the scoped TrafficWatch stop: '+($remaining -join ', '))
 }
 
 $stopPath=Join-Path $dataRoot 'stop.request'
@@ -201,21 +208,13 @@ try {
     $movedNew=$true
     Restore-Tasks
     $expected=@()
-    if (($taskState | Where-Object Name -eq $taskNames[0]).Running -and -not (Test-Path -LiteralPath (Join-Path $dataRoot 'capture-paused'))) { $expected+=43128; $expected+=43130 }
+    if (($taskState | Where-Object Name -eq $taskNames[0]).Running -and -not (Test-Path -LiteralPath (Join-Path $dataRoot 'capture-paused'))) {
+        $expected+=@{Port=43128;App='codex-flow';Collector=$true},@{Port=43130;App='codex-flow';Collector=$true}
+    }
     $trayExpected=($taskState | Where-Object Name -eq $taskNames[1]).Running
-    if ($trayExpected) { $expected+=43131 }
-    if (($taskState | Where-Object Name -eq $taskNames[2]).Running) { $expected+=43132 }
-    $deadline=[DateTime]::UtcNow.AddSeconds(45)
-    do {
-        $remaining=@(foreach ($port in $expected) {
-            $health=Read-LocalHealth $port
-            if (($port -eq 43132 -and ($health.app -ne 'trafficwatch-ai-diagnostics' -or $health.storage -ne 'sqlite-wal')) -or
-               ($port -ne 43132 -and $health.version -ne $new.version)) { "$port $($health.Error)" }
-        })
-        if (-not $remaining.Count) { break }
-        Start-Sleep -Milliseconds 400
-    } while ([DateTime]::UtcNow -lt $deadline)
-    if ($remaining.Count) { throw ('New version health checks failed: '+($remaining -join ', ')) }
+    if ($trayExpected) { $expected+=@{Port=43131;App='trafficwatch-overview';Storage='sqlite-wal'} }
+    if (($taskState | Where-Object Name -eq $taskNames[2]).Running) { $expected+=@{Port=43132;App='trafficwatch-ai-diagnostics';Storage='sqlite-wal'} }
+    Wait-TrafficWatchHealth -Checks $expected -Version $new.version
     if ($trayExpected -and -not (Get-Process -Name 'TrafficWatch-Tray' -ErrorAction SilentlyContinue | Where-Object Path -eq (Join-Path $installRoot 'TrafficWatch-Tray.exe'))) {
         throw 'Updated tray process was not found.'
     }
@@ -223,6 +222,7 @@ try {
 } catch {
     $problem=$_.Exception.Message
     if ($movedNew) {
+        Write-StartupLogs
         Stop-TrafficWatch
         [IO.Directory]::Move($installRoot,$failed)
     }

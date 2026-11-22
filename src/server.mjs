@@ -71,7 +71,7 @@ function readBody(req, limit = 4096) {
     req.once('error', reject);
   });
 }
-export function createServer(config, store, monitor, shutdown) {
+export function createCollectorApi(config, store, monitor) {
   const updater = new UpdateManager(config);
   let insightCache = null;
   let budgetCache = null;
@@ -87,6 +87,158 @@ export function createServer(config, store, monitor, shutdown) {
       insightCache = { key, at: Date.now(), value: store.insights?.(range.from, range.to) || null };
     return insightCache.value;
   };
+  const json = (status, data, headers) => ({ status, data, headers });
+  return async ({ method, target, body, desktopAuthorized }) => {
+    const url = new URL(target);
+    if (method === 'POST') {
+      if (url.pathname === '/api/update/install') {
+        if (!desktopAuthorized)
+          return json(403, { error: 'Desktop instance marker required' });
+        const request = JSON.parse(body || '{}');
+        try { return json(202, updater.install(request.version)); }
+        catch (error) { return json(409, { ...updater.status(), error: error.code || 'install_failed' }); }
+      }
+      if (url.pathname === '/api/capture') {
+        const request = JSON.parse(body || '{}');
+        if (!['auto', 'native', 'mihomo'].includes(request.mode) || typeof request.authorize !== 'boolean')
+          return json(400, { error: 'Invalid capture mode' });
+        try {
+          await monitor.setCapture(request.mode, request.authorize);
+          return json(200, { ok: true });
+        } catch {
+          return json(409, { error: '原生采集未启动，请检查 Windows 授权或采集诊断。' });
+        }
+      }
+      if (url.pathname === '/api/harness-apps') {
+        const request = JSON.parse(body || '{}');
+        try {
+          return json(200, { apps: monitor.setHarnessApps(request.apps) });
+        } catch {
+          return json(400, { error: 'Invalid Harness process names' });
+        }
+      }
+      if (url.pathname === '/api/settings') {
+        const request = JSON.parse(body || '{}');
+        const value = request.alertMBPerMinute;
+        if (!Number.isFinite(value) || value < 0.1 || value > 1000000)
+          return json(400, { error: '阈值应为 0.1–1000000 MB/分钟' });
+        if (request.retentionDays !== undefined &&
+          (!Number.isInteger(request.retentionDays) || request.retentionDays < 0 || request.retentionDays > 365))
+          return json(400, { error: '保留天数应为 0（无限保留）或 1–365 的整数' });
+        let budget;
+        if (request.budget !== undefined) {
+          try { budget = validateBudget(request.budget); }
+          catch (error) { return json(400, { error: error.message }); }
+        }
+        if (budget) monitor.setBudgetSettings(budget);
+        if (request.retentionDays !== undefined) monitor.setRetentionDays(request.retentionDays);
+        monitor.setThreshold(value);
+        return json(200, { ok: true });
+      }
+      return json(404, { error: 'Not found' });
+    }
+    if (method !== 'GET') return json(405, { error: 'Method not allowed' });
+    if (url.pathname === '/api/update')
+      return json(200, url.searchParams.get('check') === '1' ? await updater.check() : updater.status());
+    if (url.pathname === '/api/overview-live') {
+      const status = monitor.status();
+      const live = {
+        app: 'trafficwatch-live',
+        state: status.state, capture: status.capture, lastAt: status.lastAt,
+        intervalMs: status.intervalMs,
+        allUpRate: status.allUpRate, allDownRate: status.allDownRate,
+        routeRates: trafficRates(monitor.latest, Number.isFinite(status.allUpRate)),
+      };
+      return json(200,live);
+    }
+    if (url.pathname === '/api/harness-apps') return json(200, { apps: monitor.harnessApps });
+    if (url.pathname === '/api/calendar' || url.pathname === '/api/report') {
+      const scope = url.searchParams.get('scope') || 'codex';
+      if (!['codex', 'all'].includes(scope)) return json(400, { error: 'Invalid scope' });
+      try {
+        if (url.pathname === '/api/calendar') return json(200, store.calendarSummary(url.searchParams.get('month'), scope));
+        return json(200, store.reportSummary({ kind: url.searchParams.get('kind'), date: url.searchParams.get('date'), scope }));
+      } catch (error) {
+        if (error instanceof RangeError || error instanceof TypeError || /Invalid|Future|has not started|does not exist/i.test(error.message))
+          return json(400, { error: 'Invalid calendar or report period' });
+        throw error;
+      }
+    }
+    if (url.pathname === '/api/budget-notifications') {
+      if (!desktopAuthorized)
+        return json(403, { error: 'Desktop instance marker required' });
+      const alert = store.alerts().find((row) => {
+        try { return JSON.parse(row.message).type === 'budget'; } catch { return false; }
+      });
+      return json(200, { enabled: monitor.budgetSettings?.desktopNotify !== false,
+        latest: alert ? { id: alert.id, at: alert.at, ...JSON.parse(alert.message) } : null });
+    }
+    if (url.pathname === '/api/diagnostics') {
+      return json(200, createDiagnostics(config, store, monitor),
+        { 'Content-Disposition': 'attachment; filename="codex-netwatch-diagnostics.json"' });
+    }
+    const range = parseRange(url, Date.now(), store.firstAt());
+    const scope = ['codex', 'unknown', 'other', 'all'].includes(url.searchParams.get('scope'))
+      ? url.searchParams.get('scope')
+      : 'codex';
+    if (url.pathname === '/api/dashboard') {
+      return json(200, {
+        status: monitor.status(),
+        budget: budget(),
+        range,
+        totals: store.totals(range.from, range.to),
+        trend: store.trend(range.from, range.to),
+        connections: store.connections(range.from, range.to, scope),
+        domains: store.domains(range.from, range.to, scope),
+        sessions: store.sessions(),
+        alerts: store.alerts(),
+        insights: insights(range),
+      });
+    }
+    if (url.pathname === '/api/correlation') {
+      const id = (url.searchParams.get('id') || '').slice(0, 128);
+      return json(200, {
+        ...store.correlation(id, range.from, range.to),
+        attribution: 'activity_only',
+        message: '仅表示日志活动与网络采样时间重合，不代表该会话产生这些字节。',
+      });
+    }
+    if (url.pathname === '/api/export') {
+      const rows = store.connections(range.from, range.to, scope, 10000);
+      const columns = [
+        'host',
+        'process',
+        'pid',
+        'scope',
+        'evidence',
+        'network',
+        'up',
+        'down',
+        'last_seen',
+      ];
+      return {
+        status: 200,
+        headers: {
+          'Content-Type': 'text/csv; charset=utf-8',
+          'Content-Disposition': 'attachment; filename="codex-netwatch-connections.csv"',
+        },
+        text: '\uFEFF' + [
+          '# Observed process bytes (Windows ETW or Mihomo); not VPN billing. Sessions are not byte-attributed.',
+          columns.join(','),
+          ...rows.map((row) => columns.map((k) => csvCell(row[k])).join(',')),
+        ].join('\r\n'),
+      };
+    }
+    return json(404, { error: 'Not found' });
+  };
+}
+
+export function createServer(config, store, monitor, shutdown, collector = {
+  startupStage: 'ready',
+  get state() { return monitor.state; },
+  request: createCollectorApi(config, store, monitor),
+}) {
+  const defaultLocale = Intl.DateTimeFormat().resolvedOptions().locale;
   const assets = new Map(
     ['/icon.svg'].map((route) => [route, path.join(config.root, 'public', route.slice(1))]),
   );
@@ -121,165 +273,27 @@ export function createServer(config, store, monitor, shutdown) {
           version: VERSION,
           collectorPid: process.pid,
           ...(config.desktopToken ? { desktopInstance: config.desktopToken } : {}),
-          systemLocale: config.systemLocale || Intl.DateTimeFormat().resolvedOptions().locale,
-          state: monitor.state,
+          systemLocale: collector.systemLocale || config.systemLocale || defaultLocale,
+          state: collector.state,
+          startupStage: collector.startupStage,
           demo: config.demo,
         });
       if (url.pathname.startsWith('/api/')) {
         if (req.headers['x-codex-flow'] !== '1')
           return json(403, { error: 'Missing local client header' });
-        if (req.method === 'POST') {
-          const body = await readBody(req);
-          if (url.pathname === '/api/update/install') {
-            if (!config.desktopToken || req.headers['x-codex-desktop-token'] !== config.desktopToken)
-              return json(403, { error: 'Desktop instance marker required' });
-            const request = JSON.parse(body || '{}');
-            try { return json(202, updater.install(request.version)); }
-            catch (error) { return json(409, { ...updater.status(), error: error.code || 'install_failed' }); }
-          }
-          if (url.pathname === '/api/capture') {
-            const request = JSON.parse(body || '{}');
-            if (!['auto', 'native', 'mihomo'].includes(request.mode) || typeof request.authorize !== 'boolean')
-              return json(400, { error: 'Invalid capture mode' });
-            try {
-              await monitor.setCapture(request.mode, request.authorize);
-              return json(200, { ok: true });
-            } catch {
-              return json(409, { error: '原生采集未启动，请检查 Windows 授权或采集诊断。' });
-            }
-          }
-          if (url.pathname === '/api/harness-apps') {
-            const request = JSON.parse(body || '{}');
-            try {
-              return json(200, { apps: monitor.setHarnessApps(request.apps) });
-            } catch {
-              return json(400, { error: 'Invalid Harness process names' });
-            }
-          }
-          if (url.pathname === '/api/settings') {
-            const request = JSON.parse(body || '{}');
-            const value = request.alertMBPerMinute;
-            if (!Number.isFinite(value) || value < 0.1 || value > 1000000)
-              return json(400, { error: '阈值应为 0.1–1000000 MB/分钟' });
-            if (request.retentionDays !== undefined &&
-              (!Number.isInteger(request.retentionDays) || request.retentionDays < 0 || request.retentionDays > 365))
-              return json(400, { error: '保留天数应为 0（无限保留）或 1–365 的整数' });
-            let budget;
-            if (request.budget !== undefined) {
-              try { budget = validateBudget(request.budget); }
-              catch (error) { return json(400, { error: error.message }); }
-            }
-            if (budget) monitor.setBudgetSettings(budget);
-            if (request.retentionDays !== undefined) monitor.setRetentionDays(request.retentionDays);
-            monitor.setThreshold(value);
-            return json(200, { ok: true });
-          }
-          if (url.pathname === '/api/stop') {
-            if (config.desktopToken && req.headers['x-codex-desktop-token'] !== config.desktopToken)
-              return json(403, { error: 'Desktop instance marker required' });
-            json(200, { ok: true });
-            setTimeout(shutdown, 100);
-            return;
-          }
-          return json(404, { error: 'Not found' });
-        }
-        if (req.method !== 'GET') return json(405, { error: 'Method not allowed' });
-        if (url.pathname === '/api/update')
-          return json(200, url.searchParams.get('check') === '1' ? await updater.check() : updater.status());
-        if (url.pathname === '/api/overview-live') {
-          const status = monitor.status();
-          const live = {
-            app: 'trafficwatch-live',
-            state: status.state, capture: status.capture, lastAt: status.lastAt,
-            intervalMs: status.intervalMs,
-            allUpRate: status.allUpRate, allDownRate: status.allDownRate,
-            routeRates: trafficRates(monitor.latest, Number.isFinite(status.allUpRate)),
-          };
-          return json(200,live);
-        }
-        if (url.pathname === '/api/harness-apps') return json(200, { apps: monitor.harnessApps });
-        if (url.pathname === '/api/calendar' || url.pathname === '/api/report') {
-          const scope = url.searchParams.get('scope') || 'codex';
-          if (!['codex', 'all'].includes(scope)) return json(400, { error: 'Invalid scope' });
-          try {
-            if (url.pathname === '/api/calendar') return json(200, store.calendarSummary(url.searchParams.get('month'), scope));
-            return json(200, store.reportSummary({ kind: url.searchParams.get('kind'), date: url.searchParams.get('date'), scope }));
-          } catch (error) {
-            if (error instanceof RangeError || error instanceof TypeError || /Invalid|Future|has not started|does not exist/i.test(error.message))
-              return json(400, { error: 'Invalid calendar or report period' });
-            throw error;
-          }
-        }
-        if (url.pathname === '/api/budget-notifications') {
-          if (!config.desktopToken || req.headers['x-codex-desktop-token'] !== config.desktopToken)
-            return json(403, { error: 'Desktop instance marker required' });
-          const alert = store.alerts().find((row) => {
-            try { return JSON.parse(row.message).type === 'budget'; } catch { return false; }
-          });
-          return json(200, { enabled: monitor.budgetSettings?.desktopNotify !== false,
-            latest: alert ? { id: alert.id, at: alert.at, ...JSON.parse(alert.message) } : null });
-        }
-        if (url.pathname === '/api/diagnostics') {
-          res.setHeader(
-            'Content-Disposition',
-            'attachment; filename="codex-netwatch-diagnostics.json"',
-          );
-          return json(200, createDiagnostics(config, store, monitor));
-        }
-        const range = parseRange(url, Date.now(), store.firstAt());
-        const scope = ['codex', 'unknown', 'other', 'all'].includes(url.searchParams.get('scope'))
-          ? url.searchParams.get('scope')
-          : 'codex';
-        if (url.pathname === '/api/dashboard') {
-          return json(200, {
-            status: monitor.status(),
-            budget: budget(),
-            range,
-            totals: store.totals(range.from, range.to),
-            trend: store.trend(range.from, range.to),
-            connections: store.connections(range.from, range.to, scope),
-            domains: store.domains(range.from, range.to, scope),
-            sessions: store.sessions(),
-            alerts: store.alerts(),
-            insights: insights(range),
-          });
-        }
-        if (url.pathname === '/api/correlation') {
-          const id = (url.searchParams.get('id') || '').slice(0, 128);
-          return json(200, {
-            ...store.correlation(id, range.from, range.to),
-            attribution: 'activity_only',
-            message: '仅表示日志活动与网络采样时间重合，不代表该会话产生这些字节。',
-          });
-        }
-        if (url.pathname === '/api/export') {
-          const rows = store.connections(range.from, range.to, scope, 10000);
-          const columns = [
-            'host',
-            'process',
-            'pid',
-            'scope',
-            'evidence',
-            'network',
-            'up',
-            'down',
-            'last_seen',
-          ];
-          res.writeHead(200, {
-            'Content-Type': 'text/csv; charset=utf-8',
-            'Content-Disposition': 'attachment; filename="codex-netwatch-connections.csv"',
-          });
-          res.end(
-            '\uFEFF' +
-              [
-                '# Observed process bytes (Windows ETW or Mihomo); not VPN billing. Sessions are not byte-attributed.',
-                columns.join(','),
-                ...rows.map((row) => columns.map((k) => csvCell(row[k])).join(',')),
-              ].join('\r\n'),
-          );
+        const desktopAuthorized = Boolean(config.desktopToken && req.headers['x-codex-desktop-token'] === config.desktopToken);
+        const body = req.method === 'POST' ? await readBody(req) : undefined;
+        if (req.method === 'POST' && url.pathname === '/api/stop') {
+          if (config.desktopToken && !desktopAuthorized) return json(403, { error: 'Desktop instance marker required' });
+          json(200, { ok: true });
+          setTimeout(shutdown, 100);
           return;
         }
-        return json(404, { error: 'Not found' });
+        if (collector.startupStage !== 'ready') return json(503, { error: 'collector_starting', startupStage: collector.startupStage });
+        const result = await collector.request({ method: req.method, target: url.href, body, desktopAuthorized });
+        res.writeHead(result.status, { 'Content-Type': 'application/json; charset=utf-8', ...result.headers });
+        res.end(result.text ?? JSON.stringify(result.data));
+        return;
       }
       if (req.method !== 'GET' || !assets.has(url.pathname))
         return json(404, { error: 'Not found' });

@@ -210,7 +210,13 @@ export function historyBounds(db, windows) {
   const condition = column => windows?.length ? ' WHERE '+windows.map(w=>`(${column}>=${w.from} AND ${column}<${w.to})`).join(' OR ') : '';
   // Unscoped bounds use block extrema without decoding old data. Scoped bounds
   // must inspect only intersecting blocks; using month extrema would leak dates.
-  const live=db.prepare(`SELECT MIN(at) firstAt,MAX(at) lastAt FROM main.samples${condition('at')}`).get();
+  // SQLite walks the entire table to answer a combined MIN/MAX query. An
+  // unscoped lookup can read each end of the primary key independently.
+  const live = windows?.length
+    ? db.prepare(`SELECT MIN(at) firstAt,MAX(at) lastAt FROM main.samples${condition('at')}`).get()
+    : db.prepare(`SELECT
+      (SELECT at FROM main.samples ORDER BY at LIMIT 1) firstAt,
+      (SELECT at FROM main.samples ORDER BY at DESC LIMIT 1) lastAt`).get();
   if (!hasArchives(db)) return live;
   if (windows) {
     let firstAt=live.firstAt??Infinity,lastAt=live.lastAt??-Infinity;
@@ -222,7 +228,9 @@ export function historyBounds(db, windows) {
     }
     return {firstAt:Number.isFinite(firstAt)?firstAt:null,lastAt:Number.isFinite(lastAt)?lastAt:null};
   }
-  const old=db.prepare("SELECT MIN(start_at) firstAt,MAX(end_at)-1 lastAt FROM main.vault_archive_chunks WHERE kind='samples'").get();
+  const old = db.prepare(`SELECT
+    (SELECT MIN(start_at) FROM main.vault_archive_chunks WHERE kind='samples') firstAt,
+    (SELECT MAX(end_at)-1 FROM main.vault_archive_chunks WHERE kind='samples') lastAt`).get();
   return {firstAt:Math.min(...[live.firstAt,old.firstAt].filter(x=>x!==null))===Infinity?null:Math.min(...[live.firstAt,old.firstAt].filter(x=>x!==null)),
     lastAt:Math.max(...[live.lastAt,old.lastAt].filter(x=>x!==null))===-Infinity?null:Math.max(...[live.lastAt,old.lastAt].filter(x=>x!==null))};
 }

@@ -17,6 +17,7 @@ import {DiagnosticLogSources} from './ai-log-sources.mjs';
 import {requestCoverage,collectionSnapshot} from './ai-diagnostic-quality.mjs';
 import {buildProviderTargets,mappedProviderHost} from './ai-provider-targets.mjs';
 import {normalizeTcpEvent} from './ai-tcp-events.mjs';
+import {VERSION} from './version.mjs';
 
 export async function startAiDiagnostics({settings=readSettings()}={}){
   const baseSettings=settings;settings={...settings,RelayHosts:activeRelayHosts(settings)};
@@ -183,7 +184,7 @@ export async function startAiDiagnostics({settings=readSettings()}={}){
     const snapshot=collectionSnapshot({sources:[magpie,...logSources.snapshot()],traceState,lastTraceAt,pktmonState,pktmonCheckedAt,metrics,writePending:pending.length>1024});
     observe(snapshot);flush();logSources.resetCounters();magpieParseFailures=0;metrics.unknownLogTimes=0;lastCollectionCheck=Date.now();
   }
-  const health=()=>({app:'trafficwatch-ai-diagnostics',pid:process.pid,state:stopping?'stopped':'recording',at:Date.now(),trace:traceState,pktmon:pktmonState,metrics:{traceEventsLost:metrics.traceEventsLost,boundedDrops:metrics.boundedDrops,unknownLogTimes:metrics.unknownLogTimes||0},resources:{rssBytes:process.memoryUsage().rss,ringBytes:engine.ring.bytes},features:{magpie:'incremental_files',requestFeed:feedState,traceEvent:'2.0.77',pktmonPayload:false,eventSchema:DIAGNOSTIC_SCHEMA_VERSION,slowRequestCapture:true,logAdapters:['magpie','cc-switch','codex','claude','dsh'],collectionChecks:true,providerTargetMapping:2,tcpConnectRetry:true},storage:'sqlite-wal'});
+  const health=()=>({app:'trafficwatch-ai-diagnostics',version:VERSION,pid:process.pid,state:stopping?'stopped':'recording',at:Date.now(),trace:traceState,pktmon:pktmonState,metrics:{traceEventsLost:metrics.traceEventsLost,boundedDrops:metrics.boundedDrops,unknownLogTimes:metrics.unknownLogTimes||0},resources:{rssBytes:process.memoryUsage().rss,ringBytes:engine.ring.bytes},features:{magpie:'incremental_files',requestFeed:feedState,traceEvent:'2.0.77',pktmonPayload:false,eventSchema:DIAGNOSTIC_SCHEMA_VERSION,slowRequestCapture:true,logAdapters:['magpie','cc-switch','codex','claude','dsh'],collectionChecks:true,providerTargetMapping:2,tcpConnectRetry:true},storage:'sqlite-wal'});
   const server=http.createServer(async(req,res)=>{
     const json=(code,data)=>{res.writeHead(code,{'content-type':'application/json','cache-control':'no-store'});res.end(JSON.stringify(data));};
     if(req.headers.host!=='127.0.0.1:43132'||req.headers.origin&&req.headers.origin!=='http://127.0.0.1:43132')return json(403,{error:'local_origin_required'});

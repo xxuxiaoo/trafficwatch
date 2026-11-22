@@ -87,6 +87,7 @@ export class Store {
       .all()
       .map((x) => x.name);
     if (!bucketColumns.includes('last_at')) {
+      onProgress({ stage: 'bucket_timestamps' });
       this.db.exec(`BEGIN;
         ALTER TABLE buckets ADD COLUMN last_at INTEGER NOT NULL DEFAULT 0;
         UPDATE buckets SET last_at=MIN(minute+59999, (SELECT last_seen FROM connections WHERE id=connection_id));
@@ -114,6 +115,7 @@ export class Store {
       all_up=all_up+excluded.all_up, all_down=all_down+excluded.all_down,
       first_at=MIN(first_at,excluded.first_at),last_at=MAX(last_at,excluded.last_at)`);
     if (!this.get('budgetLedgerReady', false)) {
+      onProgress({ stage: 'budget_ledger' });
       this.db.exec('BEGIN');
       try {
         const days = new Map();
@@ -423,10 +425,9 @@ export class Store {
   }
   prune(days, now = Date.now()) {
     // Zero means retain every detail indefinitely, including gaps and alerts.
-    if (days === 0) {
-      this.db.exec('PRAGMA optimize; PRAGMA wal_checkpoint(PASSIVE)');
-      return;
-    }
+    // Leave checkpoints to SQLite's WAL autocheckpoint. PRAGMA optimize can
+    // ANALYZE millions of rows and is not part of enforcing retention.
+    if (days === 0) return;
     const cutoff = now - days * 86400000;
     this.db.exec('BEGIN');
     try {
@@ -445,7 +446,6 @@ export class Store {
       this.db.exec('ROLLBACK');
       throw error;
     }
-    this.db.exec('PRAGMA optimize; PRAGMA wal_checkpoint(PASSIVE)');
   }
   close() {
     this.db.close();
