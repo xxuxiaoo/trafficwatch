@@ -16,19 +16,22 @@ function defaultInspectPid(pid) {
   if (!Number.isSafeInteger(pid) || pid < 1) return null;
   if (process.platform === 'win32') {
     const command = [
+      "$env:PSModulePath = $PSHOME + '\\Modules'",
       "$ErrorActionPreference='Stop'",
       'try {',
-      `  $p = Get-CimInstance Win32_Process -Filter 'ProcessId=${pid}'`,
-      '  if (-not $p) { \'{"alive":false}\'; exit 0 }',
+      `  $p = [wmi]"Win32_Process.Handle='${pid}'"`,
       '  $s = $null',
-      '  if ($p.CreationDate) { $s = ([DateTimeOffset]$p.CreationDate).ToUnixTimeMilliseconds() }',
+      '  if ($p.CreationDate) { $s = ([DateTimeOffset][Management.ManagementDateTimeConverter]::ToDateTime($p.CreationDate)).ToUnixTimeMilliseconds() }',
       '  @{ alive = $true; startedAt = $s; commandLine = $p.CommandLine; executablePath = $p.ExecutablePath } | ConvertTo-Json -Compress',
+      '} catch [System.Management.ManagementException] {',
+      "  if ($_.Exception.ErrorCode -eq 'NotFound') { @{ alive = $false } | ConvertTo-Json -Compress; exit 0 }",
+      '  exit 1',
       '} catch { exit 1 }',
     ].join('; ');
     const result = spawnSync(
       'powershell.exe',
       ['-NoLogo', '-NoProfile', '-NonInteractive', '-Command', command],
-      { encoding: 'utf8', timeout: 5000, windowsHide: true },
+      { encoding: 'utf8', timeout: 15000, windowsHide: true },
     );
     if (result.error || result.status !== 0) return null;
     try {
