@@ -7,7 +7,7 @@ import {
   ANTIGRAVITY_BUNDLE_ROOT, DEFAULT_CODEX_PROCESS_NAMES, HARNESS_FAMILIES, isHarnessFamily, normalizeHarnessApps,
 } from './harness.mjs';
 import { programRollup } from './history-rollup.mjs';
-import { attachArchiveViews, setArchiveWindows, historyBounds } from './history-archive.mjs';
+import { attachArchiveViews, archiveIntersects, setArchiveWindows, historyBounds } from './history-archive.mjs';
 import { airportGroupKey, normalizeAirportLabel } from './proxy-airports.mjs';
 
 const MINUTE = 60000, DAY = 86400000;
@@ -374,6 +374,55 @@ export function readDetail(dataRoot, lane, rangeName, now = Date.now(), options 
   } finally { db.close(); }
 }
 
+function hasMainIndex(db, name) {
+  return Boolean(db.prepare("SELECT 1 FROM main.sqlite_master WHERE type='index' AND name=?").get(name));
+}
+
+function selectWindowsHarnessFast(db, defs, range, family) {
+  const names = defs.apps[family] || [];
+  if (!names.every((name) => /^[\x20-\x7e]+$/.test(name))) return false;
+  if (!hasMainIndex(db, 'connections_process_name')) return false;
+  if (defs.hasFamily && !hasMainIndex(db, 'connection_families_family')) return false;
+  db.exec('PRAGMA query_only=OFF;DROP TABLE IF EXISTS temp.family_candidates;DROP TABLE IF EXISTS temp.family_buckets;DROP TABLE IF EXISTS temp.selected_usage');
+  db.exec('CREATE TEMP TABLE family_candidates(id TEXT PRIMARY KEY) WITHOUT ROWID');
+  if (names.length) {
+    db.exec(`INSERT OR IGNORE INTO temp.family_candidates(id) SELECT id FROM main.connections WHERE process COLLATE NOCASE IN (${names.map(literal).join(',')})`);
+  }
+  if (defs.hasFamily) {
+    db.prepare('INSERT OR IGNORE INTO temp.family_candidates(id) SELECT connection_id FROM main.connection_families WHERE family=?').run(family);
+  }
+  const candidates = db.prepare('SELECT COUNT(*) count FROM temp.family_candidates').get().count;
+  const byConnection = family !== 'codex' && !archiveIntersects(db, range) && candidates <= 20000
+    && (range.to - range.from) > 2 * DAY && hasMainIndex(db, 'buckets_connection');
+  if (byConnection) {
+    db.prepare(`CREATE TEMP TABLE family_buckets AS
+      SELECT b.minute,b.connection_id,b.scope,b.up,b.down,b.last_at
+      FROM temp.family_candidates fc
+      CROSS JOIN main.buckets b INDEXED BY buckets_connection ON b.connection_id=fc.id
+      WHERE b.minute>=? AND b.minute<? AND b.scope<>'unknown' AND b.scope<>'codex'`).run(range.from, range.to);
+  } else {
+    const scopeFilter = family === 'codex'
+      ? "(b.scope='codex' OR (b.scope<>'unknown' AND EXISTS(SELECT 1 FROM temp.family_candidates fc WHERE fc.id=b.connection_id)))"
+      : "(b.scope<>'unknown' AND b.scope<>'codex' AND EXISTS(SELECT 1 FROM temp.family_candidates fc WHERE fc.id=b.connection_id))";
+    db.prepare(`CREATE TEMP TABLE family_buckets AS
+      SELECT b.minute,b.connection_id,b.scope,b.up,b.down,b.last_at
+      FROM buckets b
+      WHERE b.minute>=? AND b.minute<? AND ${scopeFilter}`).run(range.from, range.to);
+  }
+  const covering = hasMainIndex(db, 'connections_programs');
+  db.prepare(`CREATE TEMP TABLE selected_usage AS
+    SELECT c.id,${defs.name} process,b.scope,${defs.evidence} evidence,${defs.family} family,
+      'unknown' route,'legacy' client,'' airport,NULL airport_name,
+      b.up,b.down,b.up+b.down amount,b.minute firstAt,b.last_at lastAt,b.minutes,0 _lifetime_inside
+    FROM (SELECT connection_id,scope,SUM(up) up,SUM(down) down,MIN(minute) minute,MAX(last_at) last_at,COUNT(*) minutes
+      FROM temp.family_buckets GROUP BY connection_id,scope) b
+    CROSS JOIN connections c ${covering ? 'INDEXED BY connections_programs ' : ''}ON c.id=b.connection_id
+    ${defs.hasFamily ? 'LEFT JOIN connection_families f ON f.connection_id=c.id' : ''}
+    WHERE ${defs.family}=?`).run(family);
+  db.exec('CREATE UNIQUE INDEX selected_identity ON selected_usage(id,scope);DROP TABLE temp.family_candidates');
+  return true;
+}
+
 // Harness needs a chart and a process list, not destinations, rule payloads or
 // connection pages. Keep the Windows join inside the covering
 // index, even when the lifetime dictionary contains multi-kilobyte rules.
@@ -385,14 +434,25 @@ export function readHarness(dataRoot,lane,rangeName,now=Date.now(),options={}){
   try{
     const apps=harnessApps(db,options),{range}=resolveRange(db,rangeName,now,options),width=widthFor(range),defs=definitions(db,apps);
     setArchiveWindows(db,[{from:range.from,to:range.to}]);report({stage:'program_buckets'});
-    selectUsage(db,defs,range,{...options,lane,route:lane==='clash'?'proxy':'all'},false,true);
+    const singlePass = lane === 'windows' && selectWindowsHarnessFast(db, defs, range, options.family);
+    if (!singlePass) selectUsage(db,defs,range,{...options,lane,route:lane==='clash'?'proxy':'all'},false,true);
     // SQL counts identities rather than retaining a JS Set per connection and
     // chart bucket. Long date ranges therefore do not grow the worker's heap
     // with every distinct connection in a selected family.
     report({stage:'summary'});
     const summary=db.prepare('SELECT COALESCE(SUM(up),0) up,COALESCE(SUM(down),0) down,COUNT(DISTINCT id) connections,MIN(firstAt) firstAt,MAX(lastAt) lastAt FROM selected_usage').get();
     const processes=selectedPrograms(db),routeTotals=lane==='clash'?selectedRoutes(db):{proxy:zero(),direct:zero(),unknown:zero()};
-    report({stage:'timeline'});const series=selectedSeries(db,range,width,'',{empty:!summary.connections});
+    report({stage:'timeline'});
+    let series;
+    if (singlePass) {
+      series = !summary.connections ? [] : db.prepare(`SELECT CAST(b.minute / ? AS INTEGER)*? at,SUM(b.up) up,SUM(b.down) down
+        FROM temp.family_buckets b JOIN temp.selected_usage u ON u.id=b.connection_id AND u.scope=b.scope
+        GROUP BY 1 ORDER BY 1`).all(width, width)
+        .map(row => ({ at: row.at, up: row.up, down: row.down, proxy: zero(), direct: zero(), unknown: { up: row.up, down: row.down } }));
+      db.exec('DROP TABLE temp.family_buckets');
+    } else {
+      series=selectedSeries(db,range,width,'',{empty:!summary.connections});
+    }
     const observationTimeline=db.prepare('SELECT CAST(at / ? AS INTEGER)*? at,COUNT(*) samples FROM samples WHERE at>=? AND at<? GROUP BY 1 ORDER BY 1').all(width,width,range.from,range.to);
     const gapDetails=db.prepare('SELECT reason,MAX(started_at,?) gapFrom,MIN(COALESCE(ended_at,?),?) gapTo,ended_at IS NULL ongoing FROM collection_gaps WHERE started_at<? AND COALESCE(ended_at,?)>? ORDER BY started_at DESC LIMIT 100').all(range.from,range.to,range.to,range.to,range.to,range.from);
     db.exec('COMMIT');

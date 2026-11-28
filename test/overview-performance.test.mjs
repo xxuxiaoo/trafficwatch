@@ -21,15 +21,26 @@ test('lightweight harness queries exactly match full details for aliases, scoped
       connection('script',3,4,{process:'node.exe',family:'dsh',familyRoot:'script:dsh',rule:rule()}),
       connection('alias',5,6,{process:'my-claude.exe',rule:rule(['DIRECT'])}),
       connection('unknown',7,8,{process:'codex.exe',scope:'unknown',rule:rule()}),
+      connection('ag-bundle',9,10,{process:'language_server.exe',family:'antigravity',familyRoot:'bundle:antigravity',rule:rule()}),
+      connection('ag-override',11,12,{process:'Antigravity.exe',family:'antigravity',familyRoot:'antigravity.exe',rule:rule()}),
     ]);
-    const now=BASE+3*HOUR,options={from:BASE+2*MINUTE,to:now,apps:{codex:['codex.exe'],claude:['my-claude.exe'],dsh:['dsh.exe']}};
-    for(const family of ['codex','claude','dsh']){
+    const now=BASE+3*HOUR,options={from:BASE+2*MINUTE,to:now,apps:{codex:['codex.exe'],claude:['my-claude.exe'],dsh:['dsh.exe','antigravity.exe'],antigravity:['antigravity']}};
+    for(const family of ['codex','claude','dsh','antigravity']){
       const request={...options,family,...(lane==='clash'?{route:'proxy'}:{})};
       const full=readDetail(f.root,lane,'all',now,request),light=readHarness(f.root,lane,'all',now,request);
       assert.deepEqual({...light.summary},{...full.summary});assert.deepEqual(light.series.map(({at,up,down})=>({at,up,down})),full.series.map(({at,up,down})=>({at,up,down})));
       assert.deepEqual(normalize(light.processes),normalize(full.processes));assert.deepEqual(light.observation,full.observation);
       if(lane==='clash')assert.deepEqual(light.routeTotals,full.routeTotals);
       assert.equal(Object.hasOwn(light,'connections'),false);assert.equal(Object.hasOwn(light,'destinations'),false);
+    }
+    // Also exercise multi-day (>48h) candidate-index lookup path on Windows.
+    const multiDayNow = BASE + 4 * 24 * HOUR;
+    for(const family of ['codex','claude','dsh','antigravity']){
+      const request={from:BASE,to:multiDayNow,apps:options.apps,family,...(lane==='clash'?{route:'proxy'}:{})};
+      const full=readDetail(f.root,lane,'all',multiDayNow,request),light=readHarness(f.root,lane,'all',multiDayNow,request);
+      assert.deepEqual({...light.summary},{...full.summary});
+      assert.deepEqual(light.series.map(({at,up,down})=>({at,up,down})),full.series.map(({at,up,down})=>({at,up,down})));
+      assert.deepEqual(normalize(light.processes),normalize(full.processes));
     }
   }
 });

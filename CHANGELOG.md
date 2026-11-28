@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.10.21
+
+- Verify live process creation time and command line before treating an existing `collector.lock` PID as active, so stale locks left across a Windows reboot are reclaimed automatically when the OS reuses the PID for an unrelated process while unreadable locks still fail closed.
+- Speed up Windows `/api/harness` queries by pre-filtering candidate connections through covering indexes and scanning range buckets in a single pass.
+- Aggregate high-churn LAN discovery UDP traffic (mDNS/SSDP/LLMNR/NetBIOS) and local loopback ephemeral connections per process instance in Windows ETW capture without changing observed byte totals or external connection tuples.
+
 ## 0.10.20
 
 - Add Antigravity to Harness with separate Windows and Clash proxy totals, upload/download bars, and drill-down by time, process, destination or proxy connection.

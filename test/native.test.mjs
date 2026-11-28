@@ -37,6 +37,46 @@ test('native adapter rejects malformed counters, destinations and duplicate iden
   assert.throws(() => nativeSnapshot({ ...packet(), rows: [...packet().rows, ...packet().rows] }));
 });
 
+test('native adapter aggregates LAN discovery UDP and loopback bursts without losing bytes or external tuples', () => {
+  const gen = 'a'.repeat(32);
+  const start1 = new Date(9000).toISOString();
+  const start2 = new Date(9500).toISOString();
+  const snap = nativeSnapshot({
+    type: 'snapshot', generation: gen, sequence: 1, at: 10000, duration: 1000, eventsLost: 0,
+    rows: [
+      // Local LAN mDNS discovery from 3 peers -> 1 aggregated row for browser.exe
+      { id: `${gen}:10:100:udp:10.0.0.5:5353:10.0.0.21:5353`, start: start2, network: 'udp', sourceIP: '10.0.0.5', sourcePort: 5353, destinationIP: '10.0.0.21', destinationPort: 5353, processId: 10, processBorn: 100, process: 'browser.exe', upload: 0, download: 300 },
+      { id: `${gen}:10:100:udp:10.0.0.5:5353:10.0.0.22:5353`, start: start1, network: 'udp', sourceIP: '10.0.0.5', sourcePort: 5353, destinationIP: '10.0.0.22', destinationPort: 5353, processId: 10, processBorn: 100, process: 'browser.exe', upload: 100, download: 400 },
+      { id: `${gen}:10:100:udp:10.0.0.5:5353:224.0.0.251:5353`, start: start2, network: 'udp', sourceIP: '10.0.0.5', sourcePort: 5353, destinationIP: '224.0.0.251', destinationPort: 5353, processId: 10, processBorn: 100, process: 'browser.exe', upload: 50, download: 500 },
+      // Local LAN SSDP discovery on port 1900 -> 1 aggregated row for svchost.exe
+      { id: `${gen}:20:200:udp:10.0.0.5:1900:10.0.0.31:49001`, start: start1, network: 'udp', sourceIP: '10.0.0.5', sourcePort: 1900, destinationIP: '10.0.0.31', destinationPort: 49001, processId: 20, processBorn: 200, process: 'svchost.exe', upload: 0, download: 120 },
+      { id: `${gen}:20:200:udp:10.0.0.5:1900:10.0.0.32:49002`, start: start2, network: 'udp', sourceIP: '10.0.0.5', sourcePort: 1900, destinationIP: '10.0.0.32', destinationPort: 49002, processId: 20, processBorn: 200, process: 'svchost.exe', upload: 0, download: 180 },
+      // TrafficWatch-Tray polling 127.0.0.1:43128 across ephemeral source ports -> 1 row keeping port 43128
+      { id: `${gen}:30:300:tcp:127.0.0.1:51001:127.0.0.1:43128`, start: start1, network: 'tcp', sourceIP: '127.0.0.1', sourcePort: 51001, destinationIP: '127.0.0.1', destinationPort: 43128, processId: 30, processBorn: 300, process: 'TrafficWatch-Tray.exe', upload: 80, download: 220 },
+      { id: `${gen}:30:300:tcp:127.0.0.1:51002:127.0.0.1:43128`, start: start2, network: 'tcp', sourceIP: '127.0.0.1', sourcePort: 51002, destinationIP: '127.0.0.1', destinationPort: 43128, processId: 30, processBorn: 300, process: 'TrafficWatch-Tray.exe', upload: 90, download: 210 },
+      // Antigravity loopback IPC across dynamic ports -> 1 row preserving pid/born/bytes
+      { id: `${gen}:40:400:tcp:127.0.0.1:52001:127.0.0.1:54321`, start: start1, network: 'tcp', sourceIP: '127.0.0.1', sourcePort: 52001, destinationIP: '127.0.0.1', destinationPort: 54321, processId: 40, processBorn: 400, process: 'Antigravity.exe', upload: 500, download: 1500 },
+      { id: `${gen}:40:400:tcp:127.0.0.1:52002:127.0.0.1:54322`, start: start2, network: 'tcp', sourceIP: '127.0.0.1', sourcePort: 52002, destinationIP: '127.0.0.1', destinationPort: 54322, processId: 40, processBorn: 400, process: 'Antigravity.exe', upload: 700, download: 2500 },
+      // Public UDP on port 5353 MUST NOT be collapsed as LAN discovery; external TCP stays per-socket
+      { id: `${gen}:50:500:udp:192.0.2.1:5353:203.0.113.9:5353`, start: start1, network: 'udp', sourceIP: '192.0.2.1', sourcePort: 5353, destinationIP: '203.0.113.9', destinationPort: 5353, processId: 50, processBorn: 500, process: 'app.exe', upload: 11, download: 22 },
+      { id: `${gen}:50:500:tcp:192.0.2.1:50001:203.0.113.9:443`, start: start1, network: 'tcp', sourceIP: '192.0.2.1', sourcePort: 50001, destinationIP: '203.0.113.9', destinationPort: 443, processId: 50, processBorn: 500, process: 'app.exe', upload: 33, download: 44 },
+      { id: `${gen}:50:500:tcp:192.0.2.1:50002:203.0.113.9:443`, start: start2, network: 'tcp', sourceIP: '192.0.2.1', sourcePort: 50002, destinationIP: '203.0.113.9', destinationPort: 443, processId: 50, processBorn: 500, process: 'app.exe', upload: 55, download: 66 },
+    ],
+  });
+  assert.equal(snap.connections.length, 7);
+  assert.equal(snap.uploadTotal, 100 + 50 + 80 + 90 + 500 + 700 + 11 + 33 + 55);
+  assert.equal(snap.downloadTotal, 300 + 400 + 500 + 120 + 180 + 220 + 210 + 1500 + 2500 + 22 + 44 + 66);
+  const mdns = snap.connections.find((c) => c.id === `etw:${gen}:10:100:udp:discovery:5353`);
+  assert.deepEqual([mdns.upload, mdns.download, mdns.start, mdns.metadata.host, mdns.metadata.destinationIP], [150, 1200, start1, 'lan-mdns:5353', '224.0.0.251']);
+  const ssdp = snap.connections.find((c) => c.id === `etw:${gen}:20:200:udp:discovery:1900`);
+  assert.deepEqual([ssdp.upload, ssdp.download, ssdp.metadata.host, ssdp.metadata.destinationIP], [0, 300, 'lan-ssdp:1900', '239.255.255.250']);
+  const tray = snap.connections.find((c) => c.id === `etw:${gen}:30:300:tcp:loopback:127.0.0.1:43128`);
+  assert.deepEqual([tray.upload, tray.download, tray.metadata.destinationPort, tray.metadata.sourcePort], [170, 430, 43128, 0]);
+  const ag = snap.connections.find((c) => c.id === `etw:${gen}:40:400:tcp:loopback:127.0.0.1`);
+  assert.deepEqual([ag.upload, ag.download, ag.metadata.processId, ag.metadata.processBorn], [1200, 4000, 40, 400]);
+  assert.equal(snap.connections.filter((c) => c.metadata.processId === 50).length, 3);
+});
+
 test('native process evidence validates creation times before using ancestor snapshots', () => {
   const observer = new ProcessObserver({ processNames: ['codex.exe'], includeDescendants: true, excludePids: [88] });
   observer.at = 10000;

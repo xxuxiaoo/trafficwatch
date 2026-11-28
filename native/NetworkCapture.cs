@@ -79,6 +79,62 @@ internal static class NetworkCapture
             upload=send?size:0, download=receive?size:0
         };
     }
+    static bool IsDiscoveryPort(int port) { return port==5353 || port==1900 || port==5355 || port==137 || port==138; }
+    static bool IsKnownLocalPort(int port) { return port==43128 || port==43130 || port==43131 || port==43132 || port==3425 || port==7890 || port==7897 || port==10808 || port==10809; }
+    static string NormalizeIp(string ip) {
+        if (string.IsNullOrEmpty(ip)) return "";
+        string lower=ip.ToLowerInvariant();
+        return lower.StartsWith("::ffff:")?lower.Substring(7):lower;
+    }
+    static bool IsLoopbackIp(string ip) { string v=NormalizeIp(ip); return v=="::1" || v.StartsWith("127."); }
+    static bool IsLocalOrMulticastIp(string ip) {
+        string v=NormalizeIp(ip);
+        if (string.IsNullOrEmpty(v)) return false;
+        if (IsLoopbackIp(v) || v=="255.255.255.255" || v=="0.0.0.0" || v=="::") return true;
+        if (v.IndexOf('.')>=0) {
+            var p=v.Split('.');
+            int a,b;
+            if (p.Length!=4 || !Int32.TryParse(p[0],out a) || !Int32.TryParse(p[1],out b)) return false;
+            return a==10 || (a==172 && b>=16 && b<=31) || (a==192 && b==168) || (a==169 && b==254) || (a>=224 && a<=239) || (a==100 && b>=64 && b<=127);
+        }
+        return v.StartsWith("fe80:") || v.StartsWith("fc") || v.StartsWith("fd") || v.StartsWith("ff");
+    }
+    static string DiscoveryCanonicalIp(int port, string ip) {
+        bool v6=!string.IsNullOrEmpty(ip) && ip.IndexOf(':')>=0 && !ip.ToLowerInvariant().StartsWith("::ffff:");
+        if (port==5353) return v6?"ff02::fb":"224.0.0.251";
+        if (port==1900) return v6?"ff02::c":"239.255.255.250";
+        if (port==5355) return v6?"ff02::1:3":"224.0.0.252";
+        return v6?"ff02::1":"255.255.255.255";
+    }
+    internal static void AssignFlowId(Flow flow, string gen) {
+        string prefix=gen+":"+flow.processId+":"+flow.processBorn;
+        if (flow.network=="udp") {
+            int dp=IsDiscoveryPort(flow.sourcePort)?flow.sourcePort:(IsDiscoveryPort(flow.destinationPort)?flow.destinationPort:0);
+            if (dp>0 && IsLocalOrMulticastIp(flow.destinationIP)) {
+                flow.sourcePort=dp; flow.destinationPort=dp; flow.destinationIP=DiscoveryCanonicalIp(dp,flow.destinationIP);
+                flow.id=prefix+":udp:discovery:"+dp;
+                return;
+            }
+        }
+        if (IsLoopbackIp(flow.sourceIP) && IsLoopbackIp(flow.destinationIP)) {
+            string dst=NormalizeIp(flow.destinationIP), src=NormalizeIp(flow.sourceIP);
+            if (IsKnownLocalPort(flow.destinationPort)) {
+                flow.sourcePort=0; flow.destinationIP=dst;
+                flow.id=prefix+":"+flow.network+":loopback:"+dst+":"+flow.destinationPort;
+                return;
+            }
+            if (IsKnownLocalPort(flow.sourcePort)) {
+                flow.destinationPort=0; flow.destinationIP=dst;
+                flow.id=prefix+":"+flow.network+":loopback-srv:"+src+":"+flow.sourcePort;
+                return;
+            }
+            flow.sourcePort=0; flow.destinationPort=0; flow.destinationIP=dst;
+            flow.id=prefix+":"+flow.network+":loopback:"+dst;
+            return;
+        }
+        flow.id=prefix+":"+flow.network+":"+flow.sourceIP+":"+flow.sourcePort+":"+flow.destinationIP+":"+flow.destinationPort;
+    }
+
     static void OnEvent(IntPtr record)
     {
         try {
@@ -106,7 +162,7 @@ internal static class NetworkCapture
                 if(identity.born>eventAt+1) throw new InvalidDataException("PID was reused after event");
                 flow.process=identity.name; flow.processBorn=identity.born;
             } catch { flow.process=""; flow.processBorn=0; }
-            flow.id=Generation+":"+flow.processId+":"+flow.processBorn+":"+flow.network+":"+flow.sourceIP+":"+flow.sourcePort+":"+flow.destinationIP+":"+flow.destinationPort;
+            AssignFlowId(flow, Generation);
             lock(Gate) {
                 Flow row;
                 if(Rows.TryGetValue(flow.id,out row)) { row.upload+=flow.upload; row.download+=flow.download; }
@@ -177,7 +233,15 @@ internal static class NetworkCapture
         Array.Clear(bytes,8,36); bytes[23]=1; bytes[39]=2; bytes[40]=1; bytes[41]=187; bytes[42]=195; bytes[43]=80;
         if(Decode(Tcp,26,2,bytes).destinationIP!="::1" || Decode(Udp,27,2,bytes).destinationIP!="::2" || Decode(Tcp,14,2,bytes)!=null) throw new Exception("IPv6/parser filtering failed");
         if(Decode(Tcp,27,2,bytes).destinationIP!="::1" || Decode(Tcp,27,2,bytes).destinationPort!=443) throw new Exception("IPv6 TCP receive tuple failed");
-        Console.WriteLine("Native ETW parser self-test passed (TCP/UDP, IPv4/IPv6, receive PID, retransmit excluded).");
+        var mdns=new Flow { network="udp", processId=10, processBorn=100, sourceIP="10.0.0.5", sourcePort=5353, destinationIP="10.0.0.21", destinationPort=5353 };
+        AssignFlowId(mdns,"gen"); if(mdns.id!="gen:10:100:udp:discovery:5353" || mdns.destinationIP!="224.0.0.251") throw new Exception("LAN discovery aggregation failed");
+        var tray=new Flow { network="tcp", processId=20, processBorn=200, sourceIP="127.0.0.1", sourcePort=51001, destinationIP="127.0.0.1", destinationPort=43128 };
+        AssignFlowId(tray,"gen"); if(tray.id!="gen:20:200:tcp:loopback:127.0.0.1:43128" || tray.sourcePort!=0) throw new Exception("Known loopback aggregation failed");
+        var ipc=new Flow { network="tcp", processId=30, processBorn=300, sourceIP="127.0.0.1", sourcePort=51002, destinationIP="127.0.0.1", destinationPort=54321 };
+        AssignFlowId(ipc,"gen"); if(ipc.id!="gen:30:300:tcp:loopback:127.0.0.1" || ipc.destinationPort!=0) throw new Exception("Ephemeral loopback aggregation failed");
+        var pub=new Flow { network="udp", processId=40, processBorn=400, sourceIP="192.0.2.1", sourcePort=5353, destinationIP="203.0.113.9", destinationPort=5353 };
+        AssignFlowId(pub,"gen"); if(pub.id!="gen:40:400:udp:192.0.2.1:5353:203.0.113.9:5353") throw new Exception("Public UDP tuple must stay intact");
+        Console.WriteLine("Native ETW parser self-test passed (TCP/UDP, IPv4/IPv6, receive PID, retransmit excluded, LAN/loopback aggregated).");
     }
     static int Main(string[] args)
     {
